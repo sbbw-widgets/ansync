@@ -190,7 +190,7 @@ ansync/
 ## Roadmap
 
 - [x] **Step 1** — Skeleton workspace + flake + crates con traits + Cargo wiring + docs
-- [ ] **Step 2** — `proto` + `crypto` + `transport` QUIC echo end-to-end con pinning Ed25519
+- [x] **Step 2** — `proto` + `crypto` + `transport` QUIC echo end-to-end con pinning Ed25519
 - [ ] **Step 3** — `discovery` mDNS + `pairing` cable bootstrap → llave Ed25519 persistida en `$XDG_DATA_HOME/ansync/peers/`
 - [ ] **Step 4** — `permissions` storage + `dbus` Manager + Device + Permissions interfaces + systemd user unit + journald
 - [ ] **Step 5** — Extender `ferricast-encoder/decoder` con HEVC (NVENC + VAAPI)
@@ -266,9 +266,26 @@ Al retomar en una sesión nueva:
 - `.gitignore`
 - `CLAUDE.md`, `README.md`, `PLAN.md`
 
-### Step 2 — arranque
+### Step 2 — cerrado
 
-- Definir esquema `proto::v1::Envelope` y framing length-prefixed sobre QUIC.
-- Generar `ansyncctl identity init` para producir Ed25519 long-term en `$XDG_DATA_HOME/ansync/identity.key`.
-- Implementar `ansync_transport::quic` con `quinn` + `rustls` + custom `ServerCertVerifier` / `ClientCertVerifier` que pinea al pubkey Ed25519 esperado.
-- Test e2e: dos procesos en localhost, handshake Noise XX, eco de mensaje encriptado.
+Entregables:
+
+- `proto::frame` — length-prefixed postcard framing (`write_frame`/`read_frame` + typed helpers + `MAX_FRAME_SIZE = 16 MiB`).
+- `crypto`:
+  - `IdentityKeypair::load_or_generate(path)` persistencia 0600 sobre seed Ed25519 de 32 bytes.
+  - `PeerIdentity::device_id()` = primeros 16 bytes del pubkey Ed25519.
+  - `NoiseXxSession` (`Noise_XX_25519_ChaChaPoly_BLAKE2s`) con `into_transport()` → `NoiseTransport` AEAD.
+- `transport::quic`:
+  - `QuicTransport::new(identity)` genera cert self-signed Ed25519 vía rcgen al construir bind/connect.
+  - `pinning::Ed25519ServerVerifier` / `Ed25519ClientVerifier` parsean el SPKI con `x509-parser` y comparan contra el pubkey esperado.
+  - Streams etiquetados por `StreamKind` (1 byte al inicio del stream).
+  - TLS 1.3 only, ALPN `ansync/1`, mutual auth obligatorio.
+- `ansyncctl identity {init|show}` lee/escribe `$XDG_DATA_HOME/ansync/identity.key`.
+- Test e2e `crates/transport/tests/echo.rs`: dos endpoints en `127.0.0.1`, pinning Ed25519, Noise XX 3-way handshake sobre el control stream, hello cifrado + echo.
+
+### Step 3 — arranque
+
+- `ansync_discovery::Discovery` impl mDNS-SD anunciando `_ansync._udp.local.` con TXT (`id=`, `name=`, `caps=`).
+- `ansync_pairing` flujo cable ADB: detectar device vía `adb devices`, abrir socket vía `adb reverse`, intercambiar Ed25519 pubkeys + PIN, persistir el peer en `$XDG_DATA_HOME/ansync/peers/{device_id}.toml`.
+- `PeerStore` con load/save por device id (toml + bitflags `Capabilities`).
+- `ansyncctl pair` que conduce el flujo end-to-end.
