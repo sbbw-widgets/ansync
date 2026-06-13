@@ -15,3 +15,4 @@ snow.workspace = true
 rand_core.workspace = true
 serde.workspace = true
 thiserror.workspace = true
+tracing.workspace = true
