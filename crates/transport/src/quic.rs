@@ -225,6 +225,14 @@ pub struct QuicConnection {
     _endpoint: Option<quinn::Endpoint>,
 }
 
+impl QuicConnection {
+    /// Resolves once the connection has been fully torn down by either
+    /// side. Useful as a "flush" point in tests and shutdown paths.
+    pub async fn closed(&self) {
+        self.inner.closed().await;
+    }
+}
+
 #[async_trait]
 impl Connection for QuicConnection {
     type Stream = QuicStream;
