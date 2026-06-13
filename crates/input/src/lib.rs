@@ -8,8 +8,14 @@
 
 use async_trait::async_trait;
 
+pub mod session;
+
 #[cfg(feature = "uinput")]
 pub mod uinput;
+
+pub use session::{InputDeviceFactory, InputSession, SessionError};
+#[cfg(feature = "uinput")]
+pub use session::UinputFactory;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputKind {

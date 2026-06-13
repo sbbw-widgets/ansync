@@ -48,7 +48,8 @@ El `flake.nix` pinea `nixpkgs` a `549bd84d6279f9852cae6225e372cc67fb91a4c1` para
 
 **Step 7 en progreso**:
 - **7a cerrado** — `ansync_input::uinput` con `Keyboard`, `Mouse`, `Touchscreen` (MT-B), `Stylus` (pen + tilt), `Gamepad` (XInput-like). Cada uno abre `/dev/uinput` en `create()`, advertiza evbits/keybits/absbits, y traduce `crate::InputEvent` → `input_linux::sys::input_event`. Feature `uinput` activa la pieza. Bus virtual + pid.codes vendor + product id por kind para que `udevadm` distinga el tipo. Ship-ready: `bins/ansyncd/contrib/60-ansync-uinput.rules` + `nix/uinput.nix` (kernel module + udev rule) — Step 14 los wirea al módulo NixOS final.
-- **Próximo (7b)** — Stream input en `ansync_proto` + QUIC kind dedicado + dispatch desde `daemon-core` con permission gate `input_from_device`.
+- **7b-1 cerrado** — `ansync_input::InputSession` orquesta los 5 uinput devices por peer. Lazy construction (primer event del kind dispara `create()`), permission gate per-event contra `Permission::InputFromDevice` (revoke mid-session corta el siguiente event sin tirar el stream QUIC). `InputDeviceFactory` trait + `UinputFactory` impl detrás del feature `uinput`. `wire_to_event` mapea `proto::InputMessage → input::InputEvent`.
+- **Próximo (7b-2)** — Bind QUIC server en `daemon-core`, accept loop con peer auth contra `PeerStore`, demux por `StreamKind`; el stream `Input` se loopea contra `InputSession::dispatch`.
 - Después (7c–e) arranca companion Android en `android/`.
 
 Ver `PLAN.md` § Roadmap para la lista completa.

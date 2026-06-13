@@ -198,6 +198,8 @@ ansync/
 - [ ] **Step 7** — `input` uinput — Android como kbd/touch/stylus para PC + reverse para controlar Android vía AccessibilityService
   - [x] **7a** — Host `ansync_input::uinput` impls (Keyboard / Mouse / Touchscreen MT-B / Stylus / Gamepad XInput-like) detrás del feature `uinput`. Ships `bins/ansyncd/contrib/60-ansync-uinput.rules` + `nix/uinput.nix` partial module — Step 14 lo importa al módulo NixOS consolidado para que el install sea plug-and-play (kernel module + udev rule + nota de group `input`).
   - [ ] **7b** — Mensajes input en `ansync_proto` + stream QUIC dedicado + dispatch en `daemon-core` (permission `input_from_device` check antes de cualquier `send`)
+    - [x] **7b-1** — `InputSession` orchestrator en `ansync_input` (lazy device construction, permission gate per-event, `InputDeviceFactory` trait + `UinputFactory` impl, `proto::InputMessage → InputEvent` mapping).
+    - [ ] **7b-2** — QUIC server bind en `daemon-core` + accept loop + peer auth contra `PeerStore` + stream demux para `StreamKind::Input` → `InputSession::dispatch`.
   - [ ] **7c** — Companion Android scaffold (`android/`, Gradle KTS, AGP/Kotlin pin, manifest, MainActivity stub)
   - [ ] **7d** — Companion: MediaProjection capture → MediaCodec H.264 → QUIC client (cliente quinn-equivalente en Kotlin vía `java.net.DatagramChannel` o JNI a `quinn`?)
   - [ ] **7e** — Companion: AccessibilityService + `dispatchGesture` para recibir input reverso del host

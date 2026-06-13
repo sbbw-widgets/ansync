@@ -9,6 +9,8 @@ description = "ansync — virtual input devices (uinput default, BT-HID secondar
 
 [dependencies]
 ansync-core.workspace = true
+ansync-permissions.workspace = true
+ansync-proto.workspace = true
 async-trait.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
