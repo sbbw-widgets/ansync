@@ -119,6 +119,7 @@ El `flake.nix` pinea `nixpkgs` a `549bd84d6279f9852cae6225e372cc67fb91a4c1` para
   - `query_installed_version` parsea `dumpsys package` por `versionName=`.
   - `ansyncctl pair` ahora: si no hay --apk/env/path Y companion missing → auto-fetch + install. Override sigue funcionando.
 - **Roadmap completo.** Ver `PLAN.md` para tabla final.
+- **Retoques finales abiertos (post-roadmap)**: 12 items listados en `PLAN.md § Retoques finales`. Bloqueantes para v1: R1 (APK upgrade prompt), R2 (audio mid-session revoke), R4 (notifications wire), R9 (validar `nix build`). Resto son known limitations o UX polish aceptables como v1 ship.
 
 Ver `PLAN.md` § Roadmap para la lista completa.
 

@@ -280,6 +280,85 @@ ansync/
   - `query_installed_version(serial, package)` parsea `dumpsys package` por `versionName=`.
   - `ansyncctl pair` ahora: si no hay `--apk` / `$ANSYNC_COMPANION_APK` / `/usr/share/ansync/companion.apk` Y el companion no está instalado → auto-fetch + install. Override `--apk` sigue funcionando para CI / nightlies.
 
+## Retoques finales (post-roadmap)
+
+Gaps identificados al cerrar el roadmap. Ordenados por severidad. Cada uno es bounded y aislado — buen material para sesiones cortas.
+
+### Bloqueantes para v1 stable
+
+- [ ] **R1 — APK outdated upgrade flow (cerrar Step 17 spec)**
+  - `query_installed_version` existe pero no se usa. Comparar `versionName` del device con `tag_name` del release fetched.
+  - Si companion presente + outdated:
+    - Default: prompt CLI `"upgrade companion {old} → {new}? (y/N)"` en `ansyncctl pair`.
+    - Flag `--auto-upgrade` skip prompt + install.
+    - Flag `--skip-upgrade-check` skip net call si user quiere offline.
+  - Actualmente solo install-when-missing está wirado.
+  - Files: `bins/ansyncctl/src/main.rs::pair`.
+
+- [ ] **R2 — Audio mid-session permission revoke**
+  - `daemon-core::audio_inbound_loop` lleva `_permissions` (unused). Toggle `audio_in` off mid-stream no corta el flujo.
+  - Mirror el patrón de `input_stream_loop`: re-check perm per-chunk, surface clean cuando flip to off (drop frame + return).
+  - Mismo para `audio_pump_loop` re `audio_out`.
+  - Files: `crates/daemon-core/src/lib.rs`.
+
+- [ ] **R4 — Notifications wire (Step 4 leftover surfaced)**
+  - `proto::NotificationMessage` + `Capabilities::NOTIFICATIONS` existen pero sin `StreamKind::Notifications` ni handlers.
+  - Add tag 0x09. Daemon-core accept loop demux + gate `Permission::Notifications`. Surface via D-Bus signal `Device.NotificationPosted(app, title, body)`.
+  - Companion side: `NotificationListenerService` (Android) + JNI bridge similar al clipboard pattern.
+  - Files: `crates/transport/src/{lib,quic}.rs`, `crates/daemon-core/src/lib.rs`, `android/src/lib.rs`, nueva `android/app/src/main/java/.../NotificationForwarder.kt`.
+
+- [ ] **R9 — Validar `nix build .#default`**
+  - `nix/package.nix` escrito pero nunca ejecutado. Posibles issues: `lib.cleanSourceWith` filter incompleto, missing buildInput (ferricast path deps), `LIBCLANG_PATH` no propagado al `buildPackage` (solo está en commonArgs).
+  - Correr `nix build .#default` desde `/home/s4rch/Public/rust/GamerOS/ansync`. Fix lo que rompa.
+  - Validar también `nix build .#ansyncd .#ansyncctl` (apps).
+  - Verificar que `nixosModules.default` no rompe `nix flake check` (sin entrar al config de un host real).
+
+### v1 known-limitations aceptables (UX polish)
+
+- [ ] **R3 — Botón "Push clipboard to host" en MainActivity**
+  - `ClipboardBridge.pushToHost()` callable pero sin caller. Add botón en `MainActivity` Compose que invoque + muestre Toast con resultado.
+  - Files: `android/app/src/main/java/.../MainActivity.kt`.
+
+- [ ] **R5 — SAF FS mutaciones (cerrar Step 9e)**
+  - `AnsyncFsServer` retorna ENOSYS para `write/create/unlink/rename/truncate/chmod`. Implementar usando `DocumentsContract.createDocument` / `deleteDocument` / `renameDocument` / `OutputStream` via `openOutputStream(uri, "w" | "wa" | "rwt")`. `chmod` deja `ENOSYS` (SAF no expone modes — limitación intencional).
+  - Files: `android/app/src/main/java/.../AnsyncFsServer.kt`.
+
+- [ ] **R6 — BT-HID full profile registration (cerrar Step 13)**
+  - `BtHidDevice::send` loguea sin transmitir. Wirea:
+    - SDP record con HID descriptor (keyboard / mouse / gamepad reports).
+    - L2CAP PSM 0x11 (control) + 0x13 (interrupt) sockets via `bluer::l2cap::Socket`.
+    - HID Boot protocol report frames matching `InputEvent` → 6+2 byte keyboard reports / 3-byte mouse reports / etc.
+  - `daemon-core::DaemonConfig` gana `input_backend: InputBackend{Uinput|BtHid}` enum. `Daemon::run` construye `BtHidFactory` si elegido.
+  - Files: `crates/input/src/bt_hid.rs`, `crates/daemon-core/src/lib.rs`.
+
+- [ ] **R7 — Android MediaSession widget para audio route**
+  - Cuando `AudioRouter` start, registrar `MediaSession` + post notification con play/pause/stop actions. Tap stop → broadcast a `AnsyncCompanionService` → `AudioRouter.stop()`. Mejora UX para cortar mic share sin abrir app.
+  - Files: `android/app/src/main/java/.../AudioRouter.kt`, nueva `AudioRouteNotification.kt`.
+
+- [ ] **R8 — v4l2loopback card_label per-peer** (limitación upstream, no fixable host-side)
+  - Documentado en README. Opciones futuras: feature request a v4l2loopback upstream, o switch a PipeWire-camera backend cuando madure el API (alternative implementation behind `pipewire-camera` feature flag, future trait impl en `ansync_camera`).
+  - No action item hasta upstream cambio.
+
+- [ ] **R10 — Sensors wire**
+  - `Capabilities::SENSORS` + `Permission::Sensors` existen sin proto/handlers. Bajo prioridad (no es feature core scrcpy-equivalent).
+  - Posible: stream kind 0x0a, proto `SensorMessage::{Accelerometer{x,y,z}, Gyro{...}, etc.}`. Companion `SensorManager.registerListener`. Útil para casos como game controllers (gyro aim).
+
+- [ ] **R11 — Clipboard blob bidi**
+  - Companion descarta `ClipboardMessage::Blob` silenciosamente. Wirea image MIMEs (`image/png`, `image/jpeg`) via `ClipData.newUri` + `MediaStore`. Text-only en Step 12 ship.
+  - Files: `android/src/lib.rs::clipboard_in_loop`, `android/app/src/main/java/.../ClipboardBridge.kt`.
+
+- [ ] **R12 — Cleanup `audio_inbound_loop` permissions param**
+  - `_permissions: Arc<dyn PermissionsStore>` es noise. O lo usa (R2) o sale del signature.
+  - Resuelto automáticamente cuando R2 cierra.
+
+### Notas para retomar
+
+- Empezar por R1, R2, R4, R9 (bloqueantes). Cada uno cierra en <1h.
+- R5 + R6 son medias jornadas individuales por la complejidad del wire format (SAF mutations) / BT stack.
+- R7, R11 son cosmética: dejan para post-v1.
+- R8 documentar como upstream limitation en README + cerrar como WONTFIX.
+- R10 evaluar demanda: si nadie lo pide, dropear del scope.
+
 ## Dependencias Cargo (workspace)
 
 Centralizadas en `[workspace.dependencies]`. Cada crate referencia con `dep.workspace = true`.
