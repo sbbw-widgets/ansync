@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">ansync companion</string>
+    <string name="accessibility_service_label">ansync — remote input</string>
+    <string name="accessibility_service_description">
+        Receives keyboard, touch, and gesture commands from a paired host
+        running the ansync daemon. Required for the host to control this
+        device while screen-mirrored.
+    </string>
+</resources>

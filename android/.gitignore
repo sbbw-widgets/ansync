@@ -1,0 +1,13 @@
+# Gradle / IDE artifacts
+.gradle/
+build/
+local.properties
+.idea/
+*.iml
+captures/
+.cxx/
+
+# Wrapper jars get fetched at first `gradle wrapper` run; committing
+# them inflates the repo. Step 14 will add signature verification +
+# wrapper jar via the binary release pipeline.
+gradle/wrapper/gradle-wrapper.jar
