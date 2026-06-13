@@ -1,0 +1,15 @@
+[package]
+name = "ansync-dbus"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "ansync — D-Bus service org.gameros.Ansync1 (zbus 5)"
+
+[dependencies]
+ansync-core.workspace = true
+zbus.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true

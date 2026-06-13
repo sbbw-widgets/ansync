@@ -1,0 +1,16 @@
+/target
+**/*.rs.bk
+.direnv/
+.claude/
+result
+result-*
+.envrc.local
+.idea/
+.vscode/
+*.swp
+*.swo
+android/build/
+android/.gradle/
+android/.idea/
+android/local.properties
+android/captures/

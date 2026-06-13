@@ -1,0 +1,127 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+    "crates/proto",
+    "crates/crypto",
+    "crates/discovery",
+    "crates/transport",
+    "crates/pairing",
+    "crates/video",
+    "crates/audio",
+    "crates/camera",
+    "crates/input",
+    "crates/files",
+    "crates/clipboard",
+    "crates/permissions",
+    "crates/dbus",
+    "crates/daemon-core",
+    "bins/ansyncd",
+    "bins/ansyncctl",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+authors = ["Sergio Ribera <sergioalejandroriberacosta@gmail.com>"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/SergioRibera/ansync"
+rust-version = "1.85"
+
+[workspace.dependencies]
+# Internal crates
+ansync-core = { path = "crates/core" }
+ansync-proto = { path = "crates/proto" }
+ansync-crypto = { path = "crates/crypto" }
+ansync-discovery = { path = "crates/discovery" }
+ansync-transport = { path = "crates/transport" }
+ansync-pairing = { path = "crates/pairing" }
+ansync-video = { path = "crates/video" }
+ansync-audio = { path = "crates/audio" }
+ansync-camera = { path = "crates/camera" }
+ansync-input = { path = "crates/input" }
+ansync-files = { path = "crates/files" }
+ansync-clipboard = { path = "crates/clipboard" }
+ansync-permissions = { path = "crates/permissions" }
+ansync-dbus = { path = "crates/dbus" }
+ansync-daemon-core = { path = "crates/daemon-core" }
+
+# Async runtime
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "fs", "signal"] }
+futures = "0.3"
+async-trait = "0.1"
+
+# Serde
+serde = { version = "1", features = ["derive"] }
+postcard = { version = "1", features = ["alloc"] }
+
+# Errors
+thiserror = "2"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-journald = "0.3"
+
+# Utils
+bytes = "1"
+bitflags = { version = "2", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+directories = "5"
+toml = "0.8"
+
+# Crypto
+ed25519-dalek = { version = "2", features = ["rand_core", "serde"] }
+x25519-dalek = { version = "2", features = ["serde", "static_secrets"] }
+snow = "0.9"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-pemfile = "2"
+rand_core = "0.6"
+
+# Transport
+quinn = { version = "0.11", default-features = false, features = ["rustls", "runtime-tokio", "ring"] }
+
+# Discovery
+mdns-sd = "0.13"
+
+# D-Bus
+zbus = { version = "5", default-features = false, features = ["tokio"] }
+
+# GUI (consumed in Step 6)
+eframe = { version = "0.31", default-features = false, features = ["wgpu", "wayland", "x11"] }
+egui = "0.31"
+wgpu = "24"
+
+# Audio (consumed in Step 11)
+pipewire = "0.8"
+
+# Camera (consumed in Step 10)
+v4l = "0.14"
+
+# Input (consumed in Steps 7 / 13)
+input-linux = "0.7"
+bluer = "0.17"
+
+# Filesystem (consumed in Step 9)
+fuser = "0.15"
+
+# Clipboard (consumed in Step 12)
+wl-clipboard-rs = "0.9"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Ferricast — sibling project at ../../ferricast. Path deps; wired in Steps 5 / 6.
+# Uncomment when those steps land.
+# ferricast-core = { path = "../../ferricast/crates/core" }
+# ferricast-encoder = { path = "../../ferricast/crates/encoder", default-features = false }
+# ferricast-decoder = { path = "../../ferricast/crates/decoder", default-features = false }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+
+[profile.dev]
+opt-level = 0
+debug = "limited"

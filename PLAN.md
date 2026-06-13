@@ -1,0 +1,274 @@
+# ansync — Plan & Roadmap
+
+Documento canónico de decisiones y próximos pasos. Actualizar al cerrar cada step.
+
+## Objetivo
+
+Reescritura moderna de scrcpy en Rust con scope ampliado:
+
+1. Mirror de pantalla Android → Linux con baja latencia
+2. Control bidireccional (PC ↔ Android): teclado, mouse, touch, stylus, gamepad
+3. Transferencia de archivos bidireccional + FUSE mount del FS Android
+4. Cámara y micrófono virtuales en Linux usando el hardware del Android
+5. Audio bidireccional con widgets de control en la barra de notificaciones Android
+6. Clipboard sync configurable por dispositivo
+7. Descubrimiento mDNS en LAN, sin cable
+8. Pairing seguro: cable ADB one-shot → llave Ed25519 long-term
+9. Cifrado E2E con QUIC + rustls + pinning a Ed25519 peer key
+
+## Decisiones cerradas
+
+| Tema | Decisión |
+|---|---|
+| Workspace root | `ansync` |
+| Binarios | `ansyncd` (daemon + GUI unificados), `ansyncctl` (CLI) |
+| Lenguaje host | Rust stable, edition 2024 |
+| Lenguaje Android | Kotlin, Gradle KTS últimas versiones |
+| Build | Nix flake, crane, rust-overlay |
+| Nixpkgs pin | `549bd84d6279f9852cae6225e372cc67fb91a4c1` (igual al sistema → cache compartido) |
+| IPC | D-Bus session bus `org.gameros.Ansync1` vía `zbus` 5 |
+| Service activation | systemd user unit (creado en Step 14) |
+| Transporte | QUIC (`quinn`) + `rustls` (sin native roots), pinning a Ed25519 peer key |
+| Discovery | mDNS (`mdns-sd`) |
+| NAT traversal | NO MVP. Trait `Transport` abstrae para futuro relay/WireGuard |
+| Pairing primario | Cable ADB one-shot (intercambio Ed25519). Después Wi-Fi puro |
+| Pairing secundario | BT-HID para input-only (más adelante) |
+| Crypto handshake | Noise XX vía `snow` |
+| Identity | Ed25519 long-term, X25519 sessions |
+| Proto | `postcard` + `serde`, versionado por `Envelope.version` |
+| Codec video | H.264 default + H.265 cuando ambos peers tengan HW. NVENC → VAAPI → openh264 SW fallback |
+| Codec audio | AAC (fdk-aac o symphonia SW fallback) + Opus opcional |
+| AV1 | NO |
+| ffmpeg | NUNCA — extender `ferricast` en su lugar |
+| OpenSSL | NUNCA — rustls puro |
+| GUI | `eframe` + `egui` + `wgpu` (parte del binario `ansyncd`) |
+| Cámara virtual | trait `VirtualCameraSink`, impl inicial v4l2loopback con nombre = nombre del device |
+| Audio | trait `AudioBackend`, impl inicial PipeWire (`pipewire-rs`) |
+| Input host | trait `VirtualInputDevice`, impl inicial uinput (`input-linux`) |
+| Input BT HID | crate `bluer`, perfil HID Device — secundario, no MVP |
+| FS mount | trait `RemoteFsBackend`, impl FUSE3 (`fuser`) |
+| Clipboard | trait `ClipboardBackend`, impl wayland (`wl-clipboard-rs`) + X11 fallback |
+| Permisos | `DevicePermissions` por device, persistido en `$XDG_CONFIG_HOME/ansync/devices/{id}.toml` |
+| Auto-mount | Sí, condicional a flag `files_mount` |
+| Logs | `tracing` + `tracing-journald` |
+
+## Permisos por dispositivo
+
+Flags en `ansync_core::DevicePermissions`:
+
+```
+screen_mirror     camera_video      camera_audio      mic
+audio_in          audio_out         files_send        files_receive
+files_mount       clipboard_in      clipboard_out     input_from_device
+input_to_device   notifications     sensors
+```
+
+Defaults al pairing:
+
+- `screen_mirror`, `files_send`, `files_receive`, `notifications` → **on**
+- `clipboard_in`, `clipboard_out` → **prompt**
+- resto → **off** (usuario habilita explícito vía D-Bus / `ansyncctl perm`)
+
+Cada syscall del daemon chequea el flag relevante antes de proceder. Sin flag → `Error::PermissionDenied(Permission::*)`.
+
+## D-Bus surface
+
+```
+Service: org.gameros.Ansync1
+
+Object /org/gameros/Ansync1/Manager
+  Methods:
+    ListDevices() → a(s)                       // device ids
+    StartPairing(method: s) → o                // returns pairing session path
+    ForgetDevice(id: s)
+  Signals:
+    DeviceAdded(id: s)
+    DeviceRemoved(id: s)
+
+Object /org/gameros/Ansync1/Device/{id}
+  Properties (read-only):
+    Id: s, Name: s, State: s, Capabilities: as,
+    BatteryLevel: y, Address: s
+  Methods:
+    ShowScreen(), HideScreen()
+    StartCamera(), StopCamera()
+    StartMicrophone(), StopMicrophone()
+    StartAudioRoute(direction: s)              // host-to-device | device-to-host | both
+    SendFile(path: s) → o
+    Mount(mountpoint: s), Unmount()
+  Signals:
+    StateChanged(state: s)
+    BatteryChanged(level: y)
+    IncomingFile(name: s, size: t)
+    ClipboardRequest(content_preview: s)       // responder vía Permissions
+
+Object /org/gameros/Ansync1/Permissions/{id}
+  Methods:
+    Get(flag: s) → b
+    Set(flag: s, value: b)
+    Reset()                                    // restaurar defaults
+  Signals:
+    PermissionChanged(flag: s, value: b)
+
+Object /org/gameros/Ansync1/PairingPrompt
+  Signals:
+    PromptRequested(session_id: s, pin: s, qr_data: ay)
+  Methods:
+    Respond(session_id: s, accept: b)
+  Fallback: si no hay listener al signal en 1500 ms → ansyncd spawnea diálogo egui local.
+```
+
+## Plan de inputs virtuales
+
+**Host recibe input desde Android** (Android como teclado/touchpad/stylus/gamepad para PC):
+
+- Crate `ansync-input` crea devices vía `uinput` con `input-linux`.
+- Devices con nombre `Ansync {DeviceName} Keyboard/Stylus/...` para identificarlos en `libinput list-devices`.
+- Tipos: Keyboard (evdev keymap full), Mouse (REL_X/Y + wheel + buttons), Touchscreen (MT-B multitouch hasta 10 dedos), Stylus (BTN_TOOL_PEN + ABS_X/Y/PRESSURE/TILT_X/TILT_Y), Gamepad (layout XInput-like).
+- Capabilities negociadas en handshake — solo se crean devices que el peer soporta.
+
+**Android recibe input desde host** (controlar pantalla espejeada):
+
+- Companion app expone `AccessibilityService` (one-time grant) → `dispatchGesture()` para touch, `performGlobalAction()` para back/home, `InputConnection` para texto.
+- Fallback con shell uid vía ADB para casos sin accessibility.
+
+**Modo secundario BT-HID**:
+
+- Crate `bluer`, perfil HID Device. Permite Android-as-keyboard/stylus sin companion en PC.
+- No MVP — Step 13.
+
+## Plan FUSE mount
+
+- Crate `fuser` (FUSE3 puro Rust).
+- Mount default: `$XDG_RUNTIME_DIR/ansync/mounts/{device-name}/`.
+- Backend RPC sobre stream QUIC dedicado (`FsOp` en `ansync-proto`): `stat`, `readdir`, `open`, `read`, `write`, `create`, `unlink`, `rename`, `truncate`, `chmod`.
+- Caches: dirent (TTL 5 s), inode metadata (TTL 5 s), readahead 256 KB. Writeback opcional (off por default).
+- Anti-saturación:
+  - Throttle: máx 4 requests in-flight por device (configurable).
+  - Backpressure: batería <20 % o térmica alta → reduce a 1 in-flight + bloquea writes.
+  - Companion Android usa SAF (Storage Access Framework) — usuario otorga acceso a carpetas específicas, no al FS completo.
+- Privacy: primer acceso del host dispara prompt en Android. Permisos persistentes por carpeta.
+- Auto-mount: al reconnect, si `files_mount=true` → monta. Si `false` → solo CLI explícito puede pedirlo (y aún así respeta el flag).
+
+## Workspace layout
+
+```
+ansync/
+├── flake.nix
+├── flake.lock                  (generado al primer build)
+├── Cargo.toml                  workspace
+├── rust-toolchain.toml
+├── CLAUDE.md
+├── README.md
+├── PLAN.md                     (este archivo)
+├── crates/
+│   ├── core/                   DeviceId, Capabilities, Permissions, Error
+│   ├── proto/                  mensajes postcard + versionado
+│   ├── crypto/                 Ed25519 identity + Noise XX handshake
+│   ├── discovery/              trait Discovery + mdns-sd impl
+│   ├── transport/              trait Transport + quinn/rustls impl
+│   ├── pairing/                cable ADB bootstrap + Wi-Fi + BT
+│   ├── video/                  wrap ferricast-decoder, render a wgpu texture
+│   ├── audio/                  trait AudioBackend + PipeWire impl
+│   ├── camera/                 trait VirtualCameraSink + v4l2loopback impl
+│   ├── input/                  trait VirtualInputDevice + uinput + BT HID impls
+│   ├── files/                  transfer protocol + trait RemoteFsBackend + FUSE impl
+│   ├── clipboard/              trait ClipboardBackend + wayland/X11 impls
+│   ├── permissions/            DevicePermissions store + D-Bus surface
+│   ├── dbus/                   interfaces zbus + servidor + cliente lib
+│   └── daemon-core/            orchestrator compartido entre bins
+├── bins/
+│   ├── ansyncd/                daemon + GUI eframe/wgpu
+│   └── ansyncctl/              CLI control
+├── android/                    companion Kotlin (Gradle KTS) — futuro
+└── nix/
+    ├── package.nix             build vía crane
+    ├── module.nix              NixOS module
+    └── hm-module.nix           home-manager module
+```
+
+## Roadmap
+
+- [x] **Step 1** — Skeleton workspace + flake + crates con traits + Cargo wiring + docs
+- [ ] **Step 2** — `proto` + `crypto` + `transport` QUIC echo end-to-end con pinning Ed25519
+- [ ] **Step 3** — `discovery` mDNS + `pairing` cable bootstrap → llave Ed25519 persistida en `$XDG_DATA_HOME/ansync/peers/`
+- [ ] **Step 4** — `permissions` storage + `dbus` Manager + Device + Permissions interfaces + systemd user unit + journald
+- [ ] **Step 5** — Extender `ferricast-encoder/decoder` con HEVC (NVENC + VAAPI)
+- [ ] **Step 6** — `video` decode + `ansyncd` egui window — screen mirror end-to-end H.264 → wgpu texture
+- [ ] **Step 7** — `input` uinput — Android como kbd/touch/stylus para PC + reverse para controlar Android vía AccessibilityService
+- [ ] **Step 8** — `files` transfer push/pull (sin mount)
+- [ ] **Step 9** — `files` FUSE mount + SAF integration Android side
+- [ ] **Step 10** — `camera` v4l2loopback con device name = nombre del Android
+- [ ] **Step 11** — `audio` PipeWire bidireccional + notification widget Android (MediaSession)
+- [ ] **Step 12** — `clipboard` con privacy gates por device
+- [ ] **Step 13** — `input` BT HID secundario vía `bluer`
+- [ ] **Step 14** — Nix module (NixOS + home-manager) + `nix-bundle-app` integration + crane build derivation
+- [ ] **Step 15** — README detallado + docs site + binary releases
+
+## Dependencias Cargo (workspace)
+
+Centralizadas en `[workspace.dependencies]`. Cada crate referencia con `dep.workspace = true`.
+
+Categorías:
+
+- **runtime**: tokio, futures, async-trait
+- **serde**: serde, postcard
+- **error**: thiserror
+- **logs**: tracing, tracing-subscriber, tracing-journald
+- **utils**: bytes, bitflags, uuid, directories, toml
+- **crypto**: ed25519-dalek, x25519-dalek, snow, rustls, rustls-pemfile, rand_core
+- **transport**: quinn
+- **discovery**: mdns-sd
+- **ipc**: zbus
+- **ui**: eframe, egui, wgpu (consumidos en Step 6)
+- **audio**: pipewire (consumido en Step 11)
+- **camera**: v4l (consumido en Step 10)
+- **input**: input-linux, bluer (consumidos en Steps 7 / 13)
+- **fs**: fuser (consumido en Step 9)
+- **clipboard**: wl-clipboard-rs (consumido en Step 12)
+- **cli**: clap
+- **ferricast** (path deps `../../ferricast/crates/...`): ferricast-core, ferricast-encoder, ferricast-decoder — wired en Steps 5/6
+
+## Convenciones de código
+
+- Rust edition 2024
+- `clippy::all` + `clippy::pedantic` deny en CI (excepciones puntuales con justificación)
+- Newtypes para IDs (`DeviceId`, `SessionId`, `TransferId`, etc.)
+- `Result<T, ansync_core::Error>` global, errores por crate envueltos en variantes
+- `?` antes que `unwrap`/`expect` fuera de tests
+- Traits sealed para sets cerrados
+- Typestate cuando convenga (e.g., conexión `Disconnected` → `Handshaking` → `Authenticated` → `Active`)
+- Sin `#[allow(unused_*)]` — eliminar el código muerto
+- Sin ffmpeg, sin OpenSSL
+
+## Convenciones de commits
+
+- Single-line conventional (`feat:`, `fix:`, `chore:`, `refactor:`, `docs:`, `build:`, `ci:`)
+- Sin Co-Authored-By trailer
+- Sin body salvo pedido explícito
+
+## Notas de continuidad
+
+Al retomar en una sesión nueva:
+
+1. Leer `PLAN.md` y `CLAUDE.md`.
+2. Identificar el primer step sin `[x]`.
+3. Confirmar con el usuario antes de empezar pasos de implementación.
+4. Al terminar un step, marcarlo `[x]` acá, actualizar "Estado actual" en `CLAUDE.md`, commitear single-line.
+
+### Step 1 — entregables (este commit)
+
+- `flake.nix` con pin compartido
+- `Cargo.toml` workspace con todos los miembros + `[workspace.dependencies]` centralizadas
+- `rust-toolchain.toml` stable
+- 15 crates en `crates/` con `Cargo.toml` + `src/lib.rs` (traits + types core, sin impls)
+- 2 binarios en `bins/` con `Cargo.toml` + `src/main.rs` mínimo
+- `.gitignore`
+- `CLAUDE.md`, `README.md`, `PLAN.md`
+
+### Step 2 — arranque
+
+- Definir esquema `proto::v1::Envelope` y framing length-prefixed sobre QUIC.
+- Generar `ansyncctl identity init` para producir Ed25519 long-term en `$XDG_DATA_HOME/ansync/identity.key`.
+- Implementar `ansync_transport::quic` con `quinn` + `rustls` + custom `ServerCertVerifier` / `ClientCertVerifier` que pinea al pubkey Ed25519 esperado.
+- Test e2e: dos procesos en localhost, handshake Noise XX, eco de mensaje encriptado.

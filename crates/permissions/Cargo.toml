@@ -1,0 +1,16 @@
+[package]
+name = "ansync-permissions"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "ansync — per-device permission storage and enforcement"
+
+[dependencies]
+ansync-core.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+toml.workspace = true
+directories.workspace = true
+thiserror.workspace = true

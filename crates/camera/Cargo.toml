@@ -1,0 +1,20 @@
+[package]
+name = "ansync-camera"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "ansync — virtual camera sinks (v4l2loopback default)"
+
+[dependencies]
+ansync-core.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+thiserror.workspace = true
+
+v4l = { workspace = true, optional = true }
+
+[features]
+default = []
+v4l2loopback = ["dep:v4l"]

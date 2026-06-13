@@ -1,0 +1,20 @@
+[package]
+name = "ansync-audio"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "ansync — virtual audio sources / sinks (PipeWire default, ALSA/JACK future)"
+
+[dependencies]
+ansync-core.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+thiserror.workspace = true
+
+pipewire = { workspace = true, optional = true }
+
+[features]
+default = []
+pipewire-backend = ["dep:pipewire"]

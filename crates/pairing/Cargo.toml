@@ -1,0 +1,16 @@
+[package]
+name = "ansync-pairing"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "ansync — pairing flows (cable ADB bootstrap, Wi-Fi PIN, BT-HID)"
+
+[dependencies]
+ansync-core.workspace = true
+ansync-crypto.workspace = true
+ansync-proto.workspace = true
+async-trait.workspace = true
+thiserror.workspace = true
+serde.workspace = true

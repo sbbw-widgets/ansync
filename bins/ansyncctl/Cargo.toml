@@ -1,0 +1,20 @@
+[package]
+name = "ansyncctl"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "ansync CLI — D-Bus client for the ansync daemon"
+
+[[bin]]
+name = "ansyncctl"
+path = "src/main.rs"
+
+[dependencies]
+ansync-core.workspace = true
+ansync-dbus.workspace = true
+clap.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

@@ -1,0 +1,21 @@
+[package]
+name = "ansync-video"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "ansync — video decode pipeline (ferricast-decoder + wgpu sink)"
+
+[dependencies]
+ansync-core.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+thiserror.workspace = true
+
+# Wired in Step 6 once HEVC support lands in ferricast.
+# ferricast-decoder = { workspace = true, optional = true }
+
+[features]
+default = []
+# ferricast = ["dep:ferricast-decoder"]

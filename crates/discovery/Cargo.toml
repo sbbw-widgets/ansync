@@ -1,0 +1,22 @@
+[package]
+name = "ansync-discovery"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "ansync — LAN device discovery (mDNS)"
+
+[dependencies]
+ansync-core.workspace = true
+ansync-crypto.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+futures.workspace = true
+
+mdns-sd = { workspace = true, optional = true }
+
+[features]
+default = []
+mdns = ["dep:mdns-sd"]

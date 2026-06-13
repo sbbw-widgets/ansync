@@ -1,0 +1,21 @@
+[package]
+name = "ansync-files"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "ansync — file transfer + remote filesystem (FUSE3)"
+
+[dependencies]
+ansync-core.workspace = true
+ansync-proto.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+thiserror.workspace = true
+
+fuser = { workspace = true, optional = true }
+
+[features]
+default = []
+fuse = ["dep:fuser"]

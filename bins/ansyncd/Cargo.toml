@@ -1,0 +1,22 @@
+[package]
+name = "ansyncd"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "ansync daemon — D-Bus surface, QUIC transport, screen mirror GUI"
+
+[[bin]]
+name = "ansyncd"
+path = "src/main.rs"
+
+[dependencies]
+ansync-core.workspace = true
+ansync-daemon-core.workspace = true
+ansync-dbus.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-journald.workspace = true
+clap.workspace = true

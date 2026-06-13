@@ -1,0 +1,21 @@
+[package]
+name = "ansync-daemon-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "ansync — daemon orchestrator (registry, sessions, lifecycle)"
+
+[dependencies]
+ansync-core.workspace = true
+ansync-crypto.workspace = true
+ansync-discovery.workspace = true
+ansync-transport.workspace = true
+ansync-pairing.workspace = true
+ansync-permissions.workspace = true
+ansync-dbus.workspace = true
+ansync-proto.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+thiserror.workspace = true

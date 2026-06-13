@@ -1,0 +1,19 @@
+[package]
+name = "ansync-clipboard"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "ansync — clipboard backend abstraction (wayland default, X11 follows)"
+
+[dependencies]
+ansync-core.workspace = true
+async-trait.workspace = true
+thiserror.workspace = true
+
+wl-clipboard-rs = { workspace = true, optional = true }
+
+[features]
+default = []
+wayland = ["dep:wl-clipboard-rs"]

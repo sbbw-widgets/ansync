@@ -1,0 +1,24 @@
+[package]
+name = "ansync-transport"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "ansync — transport abstraction with QUIC + rustls Ed25519-pinned default"
+
+[dependencies]
+ansync-core.workspace = true
+ansync-crypto.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+quinn = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
+rustls-pemfile = { workspace = true, optional = true }
+
+[features]
+default = []
+quic = ["dep:quinn", "dep:rustls", "dep:rustls-pemfile"]
