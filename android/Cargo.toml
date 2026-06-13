@@ -1,3 +1,8 @@
+# Empty `[workspace]` declares this crate as its own workspace root so
+# the top-level ansync `Cargo.toml` (which targets host) does not try
+# to absorb it.
+[workspace]
+
 # Native (Rust) half of the ansync companion. Compiled by the
 # Mozilla `rust-android-gradle` plugin into `lib<name>.so` for each
 # Android ABI and bundled into the APK's `jniLibs/<abi>/`.
@@ -29,8 +34,10 @@ crate-type = ["cdylib"]
 jni = "0.21"
 
 # Shared wire format + pinning helpers from the host workspace.
+ansync-core = { path = "../crates/core" }
 ansync-proto = { path = "../crates/proto" }
 ansync-crypto = { path = "../crates/crypto" }
+ansync-transport = { path = "../crates/transport" }
 
 # QUIC client mirrors the host's `quinn` + `rustls` stack — same
 # wire bytes, zero compat work. `default-features = false` keeps

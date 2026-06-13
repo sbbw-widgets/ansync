@@ -25,7 +25,7 @@ class AnsyncCompanionService : Service() {
     override fun onCreate() {
         super.onCreate()
         ensureChannel(this)
-        NativeBridge.nativeInit()
+        NativeBridge.nativeInit(filesDir.absolutePath)
     }
 
     override fun onDestroy() {
