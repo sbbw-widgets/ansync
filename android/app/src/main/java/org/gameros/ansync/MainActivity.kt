@@ -34,6 +34,7 @@ import androidx.compose.ui.unit.dp
 
 const val PREFS = "ansync_prefs"
 const val PREF_TREE_URI = "shared_tree_uri"
+const val PREF_HOST_ADDR = "host_addr"
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -55,9 +56,20 @@ private fun StatusScreen() {
     var pubkey by remember { mutableStateOf<String?>(null) }
     var status by remember { mutableStateOf("idle") }
     var sharedFolder by remember { mutableStateOf(loadTreeUri(ctx)) }
+    val prefs = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+    var pairedHostHex by remember {
+        mutableStateOf(prefs.getString(PairingReceiver.PREF_HOST_PUBKEY_HEX, null))
+    }
+    var pairedHostName by remember {
+        mutableStateOf(prefs.getString(PairingReceiver.PREF_HOST_NAME, null))
+    }
 
     LaunchedEffect(Unit) {
         pubkey = NativeBridge.nativeOurPubkeyHex()
+        // Re-read on resume in case PairingReceiver wrote while
+        // MainActivity was backgrounded.
+        pairedHostHex = prefs.getString(PairingReceiver.PREF_HOST_PUBKEY_HEX, null)
+        pairedHostName = prefs.getString(PairingReceiver.PREF_HOST_NAME, null)
     }
 
     val captureLauncher = rememberLauncherForActivityResult(
@@ -123,6 +135,19 @@ private fun StatusScreen() {
             text = sharedFolder?.let { "shared: ${it.lastPathSegment ?: it}" } ?: "no shared folder",
             style = MaterialTheme.typography.bodySmall,
         )
+        Spacer(modifier = Modifier.height(12.dp))
+        val hex = pairedHostHex
+        if (hex != null) {
+            Text(
+                text = "paired host: ${pairedHostName ?: "?"} (${hex.take(8)}…)",
+                style = MaterialTheme.typography.bodySmall,
+            )
+        } else {
+            Text(
+                text = "no paired host — run `ansyncctl pair` on the host",
+                style = MaterialTheme.typography.bodySmall,
+            )
+        }
         Spacer(modifier = Modifier.height(12.dp))
         Text(text = "status: $status", style = MaterialTheme.typography.bodyMedium)
     }

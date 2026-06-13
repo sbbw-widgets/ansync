@@ -64,7 +64,8 @@ El `flake.nix` pinea `nixpkgs` a `549bd84d6279f9852cae6225e372cc67fb91a4c1` para
   - **9.5b cerrado** — `DaemonAction::{ShowScreen,HideScreen}` enum + `UnboundedSender` en `DaemonState`. D-Bus `Device.ShowScreen` envía action; `action_loop` spawnea thread con `sink_egui::run(title, slot)`. Window thread separado del tokio runtime. Ya se puede probar: pairing manual + `dbus-send` para ShowScreen + companion empujando Video.
   - **9.5c cerrado** — Companion `streams_accept_loop` maneja Input inbound → mpsc → AccessibilityService. Convención: opener escribe, accepter lee. `nativeOpenConnection` ya no pre-abre Input.
   - **9.5d cerrado** — `ShowScreen` action handler abre Input outbound; `MirrorApp` mapea pointer egui → `InputMessage::TouchSlot` con coords absolutas; `input_writer_loop` postcard + write_frame.
-  - **Pendiente (9.5e/f)**: device→host input (Android overlay capture) + companion pairing cable accept side.
+  - **9.5f cerrado** — Cable pairing companion side: `pair_host_via_adb` dispara `adb shell am broadcast` post-reverse → `PairingReceiver` extrae port → `nativePairOverCable(port, name)` → `bootstrap_companion` sobre TCP 127.0.0.1:port → persist `host_pubkey_hex` + `host_name` en SharedPreferences. Sin AlertDialog: cable es security guarantee. `MainActivity` muestra paired host.
+  - **Pendiente (9.5e)**: device→host input (Android overlay capture transparente).
 - **Próximo (Step 10)** — camera + D-Bus control (camera_id, w/h, fps, bitrate, codec, aspect, stabilization).
 - Después (7c–e) arranca companion Android en `android/`.
 

@@ -228,7 +228,12 @@ ansync/
   - [x] **9.5c** — Companion `streams_accept_loop` ahora maneja `StreamKind::Input` inbound del daemon → spawn `input_recv_loop` que pushea encoded events al mismo mpsc que consume `nativePollInputMessage` → AccessibilityService.dispatchGesture (7e). Convención clarificada en comentario: opener escribe, accepter lee. `nativeOpenConnection` ya no pre-abre Input stream.
   - [x] **9.5d** — Daemon `action_loop::ShowScreen` ahora abre `StreamKind::Input` outbound antes de spawn-ear el window thread. Wirea `UnboundedSender<InputMessage>` al `MirrorApp`. `input_writer_loop` consume del channel y postcard + write_frame al stream. `MirrorApp` emite `InputMessage::TouchSlot` mapeando pointer egui → coordenadas remotas (`fw × fh` desde último frame). Press/release/move/hover-exit emiten tracking_id 1/-1 standard MT-B.
   - [ ] **9.5e** — Companion Activity overlay transparente (SYSTEM_ALERT_WINDOW post-projection grant) captura `MotionEvent` + encodea `InputMessage` → `nativeSendInputMessage` → daemon `input_stream_loop`.
-  - [ ] **9.5f** — Companion side de pairing cable (TCP listener post-`adb reverse` desde host) + `AlertDialog` accept fingerprint + persist daemon pubkey local.
+  - [x] **9.5f** — Cable pairing companion side:
+    - `pair_host_via_adb` ahora dispara `adb shell am broadcast -a org.gameros.ansync.action.PAIR -n org.gameros.ansync/.PairingReceiver --ei port $PORT --es name $HOST` después del `adb reverse`. Auto-wake del companion — no requiere abrir app primero.
+    - `PairingReceiver` (manifest `<receiver exported=true>`) extrae port, llama `nativeInit + nativePairOverCable(port, deviceName)`.
+    - Native `nativePairOverCable`: TCP connect 127.0.0.1:port + `bootstrap_companion` + return `"hex|name"`.
+    - `PairingReceiver` persiste host pubkey + name en SharedPreferences (`PREF_HOST_PUBKEY_HEX` + `PREF_HOST_NAME`). Sin AlertDialog: cable es security guarantee (per cable.rs design intent).
+    - `MainActivity` muestra "paired host: X (hex…)" si está pareado.
 - [ ] **Step 10** — `camera` v4l2loopback con device name = nombre del Android + D-Bus control (camera_id, w/h, fps, bitrate, codec, aspect, stabilization)
 - [ ] **Step 11** — `audio` PipeWire bidireccional + notification widget Android (MediaSession)
 - [ ] **Step 12** — `clipboard` con privacy gates por device

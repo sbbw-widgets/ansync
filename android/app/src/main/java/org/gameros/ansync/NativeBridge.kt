@@ -67,6 +67,14 @@ object NativeBridge {
      */
     external fun nativeFsReply(reply: ByteArray): Boolean
 
+    /**
+     * Drive the cable pairing flow against `127.0.0.1:port`. The host
+     * has already configured an `adb reverse`. Returns
+     * `"<host_pubkey_hex>|<host_name>"` on success and `null` on
+     * failure. No user prompt — the cable is the security guarantee.
+     */
+    external fun nativePairOverCable(port: Int, companionName: String): String?
+
     /** Tear the active session down. Safe to call when no session is open. */
     external fun nativeClose()
 }

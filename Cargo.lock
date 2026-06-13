@@ -244,6 +244,7 @@ dependencies = [
  "ansync-permissions",
  "ansync-proto",
  "ansync-transport",
+ "ansync-video",
  "bytes",
  "directories",
  "postcard",
@@ -295,6 +296,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "fuser",
+ "libc",
  "postcard",
  "sha2",
  "thiserror 2.0.18",
@@ -382,8 +384,11 @@ name = "ansync-video"
 version = "0.1.0"
 dependencies = [
  "ansync-core",
+ "ansync-proto",
  "async-trait",
  "bytes",
+ "eframe",
+ "egui",
  "ferricast-core",
  "ferricast-decoder",
  "thiserror 2.0.18",

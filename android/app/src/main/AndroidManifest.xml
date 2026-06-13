@@ -44,6 +44,17 @@
             android:exported="false"
             android:foregroundServiceType="mediaProjection" />
 
+        <!-- Cable-pairing entry point. Invoked by the host via
+             `adb shell am broadcast`. Exported so the ADB shell can
+             address it explicitly; intent action is namespaced. -->
+        <receiver
+            android:name=".PairingReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="org.gameros.ansync.action.PAIR" />
+            </intent-filter>
+        </receiver>
+
         <!-- Reverse-input handler: receives gesture dispatches from
              the host. Requires the user to enable it under Settings →
              Accessibility. Step 7e wires gesture dispatch + key

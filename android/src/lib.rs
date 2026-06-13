@@ -17,6 +17,7 @@ use std::sync::{Mutex, OnceLock};
 use ansync_core::{DeviceId, DevicePermissions, Permission};
 use ansync_crypto::IdentityKeypair;
 use ansync_files::{AutoAcceptPolicy, receive_file};
+use ansync_pairing::cable::bootstrap_companion;
 use ansync_permissions::{PermissionsError, PermissionsStore};
 use ansync_proto::{FsOpMessage, InputMessage};
 use ansync_transport::{
@@ -805,6 +806,68 @@ pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativePollInputMessa
             }
         },
         None => std::ptr::null_mut(),
+    }
+}
+
+/// Run the companion side of the cable pairing flow against
+/// `127.0.0.1:port` (where the host has already configured an `adb
+/// reverse`). Returns `"<host_pubkey_hex>|<host_name>"` on success
+/// and `null` on any failure. The caller persists the pair to
+/// `{filesDir}/paired_host.toml`.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativePairOverCable<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    port: jint,
+    companion_name: JString<'local>,
+) -> jni::sys::jstring {
+    let port = match u16::try_from(port) {
+        Ok(p) => p,
+        Err(_) => {
+            error!("nativePairOverCable: port {port} out of range");
+            return std::ptr::null_mut();
+        }
+    };
+    let companion_name: String = match env.get_string(&companion_name) {
+        Ok(s) => s.into(),
+        Err(e) => {
+            error!("nativePairOverCable: invalid name: {e}");
+            return std::ptr::null_mut();
+        }
+    };
+    let identity = {
+        let slot = state_slot().lock().expect("state mutex poisoned");
+        match slot.as_ref() {
+            Some(s) => IdentityKeypair::from_seed(*s.identity.seed_bytes()),
+            None => {
+                error!("nativePairOverCable: state not initialised");
+                return std::ptr::null_mut();
+            }
+        }
+    };
+    let result = runtime().block_on(async move {
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port)).await?;
+        let peer = bootstrap_companion(&mut stream, &identity, &companion_name)
+            .await
+            .map_err(|e| std::io::Error::other(format!("bootstrap: {e}")))?;
+        Ok::<_, std::io::Error>(peer)
+    });
+    let peer = match result {
+        Ok(p) => p,
+        Err(e) => {
+            error!("nativePairOverCable: pair failed: {e}");
+            return std::ptr::null_mut();
+        }
+    };
+    info!("cable pairing complete with host {}", peer.name.0);
+    let hex = hex_encode(&peer.pubkey);
+    let response = format!("{hex}|{}", peer.name.0);
+    match env.new_string(response) {
+        Ok(s) => s.into_raw(),
+        Err(e) => {
+            error!("nativePairOverCable: env.new_string failed: {e}");
+            std::ptr::null_mut()
+        }
     }
 }
 

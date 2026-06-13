@@ -171,6 +171,13 @@ pub async fn pair_host_via_adb(
     let port = listener.local_addr()?.port();
 
     add_adb_reverse(serial, port).await?;
+    // Wake the companion via broadcast so the user does not have to
+    // open the app manually. The cable is the security guarantee —
+    // no user prompt on the device side.
+    if let Err(e) = trigger_companion_pair(serial, port, local_name).await {
+        let _ = remove_adb_reverse(serial, port).await;
+        return Err(e);
+    }
     let result = wait_and_bootstrap(&listener, local, local_name).await;
     let _ = remove_adb_reverse(serial, port).await;
     result
@@ -205,6 +212,45 @@ async fn add_adb_reverse(serial: &str, port: u16) -> Result<(), PairingError> {
             "adb reverse failed: {err}"
         )));
     }
+    Ok(())
+}
+
+async fn trigger_companion_pair(
+    serial: &str,
+    port: u16,
+    host_name: &str,
+) -> Result<(), PairingError> {
+    let output = Command::new("adb")
+        .args([
+            "-s",
+            serial,
+            "shell",
+            "am",
+            "broadcast",
+            "-a",
+            "org.gameros.ansync.action.PAIR",
+            "-n",
+            "org.gameros.ansync/.PairingReceiver",
+            "--ei",
+            "port",
+            &port.to_string(),
+            "--es",
+            "name",
+            host_name,
+        ])
+        .output()
+        .await?;
+    if !output.status.success() {
+        let err = String::from_utf8_lossy(&output.stderr);
+        return Err(PairingError::Protocol(format!(
+            "adb shell am broadcast failed: {err}"
+        )));
+    }
+    // `am broadcast` exits 0 even if the receiver is missing; the
+    // stdout carries `Broadcast completed: result=0`. We don't try
+    // to parse that — the host's `wait_and_bootstrap` will time out
+    // if the companion never connects, and that's the canonical
+    // error surface.
     Ok(())
 }
 

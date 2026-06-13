@@ -105,6 +105,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "ansync-pairing"
+version = "0.1.0"
+dependencies = [
+ "ansync-core",
+ "ansync-crypto",
+ "ansync-proto",
+ "async-trait",
+ "serde",
+ "thiserror 2.0.18",
+ "tokio",
+ "toml",
+ "tracing",
+]
+
+[[package]]
 name = "ansync-permissions"
 version = "0.1.0"
 dependencies = [
@@ -156,6 +171,7 @@ dependencies = [
  "ansync-core",
  "ansync-crypto",
  "ansync-files",
+ "ansync-pairing",
  "ansync-permissions",
  "ansync-proto",
  "ansync-transport",
