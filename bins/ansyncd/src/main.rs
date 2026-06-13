@@ -16,7 +16,7 @@ use clap::Parser;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 #[cfg(feature = "dev-playback")]
-mod mirror_window;
+use ansyncd::mirror_window;
 
 #[derive(Debug, Parser)]
 #[command(name = "ansyncd", version, about = "ansync daemon")]

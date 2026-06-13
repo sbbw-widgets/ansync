@@ -14,11 +14,15 @@
 
 use std::sync::{Arc, Mutex};
 
+use ansync_video::{DecodedFrame, PixelFormat};
+use tracing::info;
+
+#[cfg(feature = "dev-playback")]
 use ansync_video::{
-    DecodedFrame, HostDecoder, PixelFormat, VideoCodec, VideoDecoder, VideoError,
-    feed::AnnexBFile, local_decoder_caps,
+    HostDecoder, VideoCodec, VideoDecoder, VideoError, feed::AnnexBFile, local_decoder_caps,
 };
-use tracing::{error, info, warn};
+#[cfg(feature = "dev-playback")]
+use tracing::{error, warn};
 
 pub type LatestFrame = Arc<Mutex<Option<DecodedFrame>>>;
 
@@ -187,6 +191,9 @@ fn yuv_to_rgba(y: i32, cb: i32, cr: i32) -> egui::Color32 {
 /// each successfully-decoded frame into `shared`. Sleeps between
 /// packets to roughly emulate 30 fps; real wall-clock pacing waits
 /// for Step 8 when QUIC delivery sets the cadence.
+///
+/// Dev-only entry point — gated behind the `dev-playback` feature.
+#[cfg(feature = "dev-playback")]
 pub async fn run_play_file_loop(
     path: std::path::PathBuf,
     shared: LatestFrame,
@@ -227,6 +234,7 @@ pub async fn run_play_file_loop(
     }
 }
 
+#[cfg(feature = "dev-playback")]
 pub fn spawn_play_file(
     runtime: &tokio::runtime::Runtime,
     path: std::path::PathBuf,

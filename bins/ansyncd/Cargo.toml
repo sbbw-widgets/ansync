@@ -7,6 +7,10 @@ license.workspace = true
 repository.workspace = true
 description = "ansync daemon — D-Bus surface, QUIC transport, screen mirror GUI"
 
+[lib]
+name = "ansyncd"
+path = "src/lib.rs"
+
 [[bin]]
 name = "ansyncd"
 path = "src/main.rs"
@@ -15,15 +19,15 @@ path = "src/main.rs"
 ansync-core.workspace = true
 ansync-daemon-core.workspace = true
 ansync-dbus.workspace = true
-ansync-video = { workspace = true, optional = true }
-bytes = { workspace = true, optional = true }
+ansync-video.workspace = true
+bytes.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 tracing-journald.workspace = true
 clap.workspace = true
-eframe = { workspace = true, optional = true }
-egui = { workspace = true, optional = true }
+eframe.workspace = true
+egui.workspace = true
 
 [features]
 default = []
@@ -32,6 +36,7 @@ default = []
 # Android companion or QUIC stream. Strictly a dev / CI affordance —
 # release builds (and the Nix derivation in Step 14) must keep this
 # off so the daemon cannot be coerced into reading arbitrary local
-# media files via CLI, and so eframe / wgpu / ansync-video stay out
-# of the production link entirely.
-dev-playback = ["dep:ansync-video", "dep:eframe", "dep:egui", "dep:bytes"]
+# media files via CLI. eframe / egui / ansync-video stay in the prod
+# link because the daemon needs them to render the real Android
+# screen-mirror stream once Step 7 wires QUIC video in.
+dev-playback = []
