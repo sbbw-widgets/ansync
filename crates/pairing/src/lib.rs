@@ -9,8 +9,12 @@
 use ansync_crypto::PeerIdentity;
 use async_trait::async_trait;
 
+pub mod cable;
 pub mod store;
 
+pub use cable::{
+    AdbDevice, bootstrap_companion, bootstrap_host, list_adb_devices, pair_host_via_adb,
+};
 pub use store::{PeerStore, PeerStoreError, StoredPeer};
 
 #[derive(Debug, thiserror::Error)]
