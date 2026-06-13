@@ -4,11 +4,17 @@
 //! physical access to the USB link, which we treat as the same trust
 //! level as plugging in a keyboard. Wire format is the same versioned
 //! `Envelope` used everywhere else; payload is `PairingMessage::Bootstrap*`.
+//!
+//! Step 16: ADB ops go through the pure-Rust [`adb_client`] crate
+//! against the host's local `adbd` (still required — `adb_client`
+//! speaks the ADB protocol, not the bare USB protocol). All blocking
+//! calls run inside `tokio::task::spawn_blocking` so they don't stall
+//! the runtime.
 
 use std::net::SocketAddr;
-use std::process::Stdio;
 use std::time::Duration;
 
+use adb_client::{ADBDeviceExt, ADBServer, ADBServerDevice};
 use ansync_core::{Capabilities, DeviceName, DevicePermissions};
 use ansync_crypto::IdentityKeypair;
 use ansync_proto::{
@@ -16,7 +22,6 @@ use ansync_proto::{
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
-use tokio::process::Command;
 use tokio::time::timeout;
 
 use crate::PairingError;
@@ -36,10 +41,18 @@ pub struct AdbDevice {
     pub state: String,
 }
 
-/// Companion's Android package id. Matched against `adb shell pm
-/// list packages` to decide whether `pair_host_via_adb` should
-/// auto-install the APK before triggering the pairing broadcast.
+/// Companion's Android package id. Matched against `pm list packages`
+/// to decide whether `pair_host_via_adb` should auto-install the APK
+/// before triggering the pairing broadcast.
 pub const COMPANION_PACKAGE: &str = "org.gameros.ansync";
+
+fn server() -> ADBServer {
+    ADBServer::default()
+}
+
+fn pairing_err<E: std::fmt::Display>(ctx: &'static str, e: E) -> PairingError {
+    PairingError::Protocol(format!("{ctx}: {e}"))
+}
 
 /// Drive the host side of the cable bootstrap over a single duplex
 /// stream. Returns a freshly populated `StoredPeer` with default
@@ -126,43 +139,29 @@ where
 /// `unauthorized` or `offline` are filtered out — the user must accept
 /// the USB-debugging prompt before they can pair.
 pub async fn list_adb_devices() -> Result<Vec<AdbDevice>, PairingError> {
-    let output = Command::new("adb")
-        .arg("devices")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .await?;
-    if !output.status.success() {
-        let err = String::from_utf8_lossy(&output.stderr);
-        return Err(PairingError::Protocol(format!(
-            "adb devices failed: {err}"
-        )));
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut devices = Vec::new();
-    for line in stdout.lines().skip(1) {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let mut parts = trimmed.split_whitespace();
-        let serial = match parts.next() {
-            Some(s) => s.to_string(),
-            None => continue,
-        };
-        let state = parts.next().unwrap_or("").to_string();
-        if state == "device" {
-            devices.push(AdbDevice { serial, state });
-        }
-    }
-    Ok(devices)
+    tokio::task::spawn_blocking(|| {
+        let mut srv = server();
+        let raw = srv
+            .devices()
+            .map_err(|e| pairing_err("adb devices", e))?;
+        Ok(raw
+            .into_iter()
+            .filter(|d| format!("{}", d.state).contains("device"))
+            .map(|d| AdbDevice {
+                serial: d.identifier,
+                state: format!("{}", d.state),
+            })
+            .collect())
+    })
+    .await
+    .map_err(|e| pairing_err("spawn_blocking devices", e))?
 }
 
 /// Full host-side cable pairing orchestration:
 ///
 /// 1. Bind a TCP listener on `127.0.0.1` (port chosen by the OS).
-/// 2. Configure `adb -s <serial> reverse` to forward the same port on
-///    the device back to the host's listener.
+/// 2. Tell the companion device (via `adb_client`) to reverse-forward
+///    the same port back to the host's listener.
 /// 3. Block waiting for the companion to dial in (bounded by
 ///    [`COMPANION_TIMEOUT`]).
 /// 4. Drive [`bootstrap_host`] over the resulting stream.
@@ -176,7 +175,7 @@ pub async fn pair_host_via_adb(
     if !companion_installed(serial).await? {
         let apk_path = apk.ok_or_else(|| {
             PairingError::Protocol(format!(
-                "{COMPANION_PACKAGE} not installed on {serial} and no --apk path supplied"
+                "{COMPANION_PACKAGE} not installed on {serial} and no APK path supplied (use --apk or wire Step 17 auto-fetch)"
             ))
         })?;
         install_companion_apk(serial, apk_path).await?;
@@ -186,9 +185,6 @@ pub async fn pair_host_via_adb(
     let port = listener.local_addr()?.port();
 
     add_adb_reverse(serial, port).await?;
-    // Wake the companion via broadcast so the user does not have to
-    // open the app manually. The cable is the security guarantee —
-    // no user prompt on the device side.
     if let Err(e) = trigger_companion_pair(serial, port, local_name).await {
         let _ = remove_adb_reverse(serial, port).await;
         return Err(e);
@@ -198,28 +194,30 @@ pub async fn pair_host_via_adb(
     result
 }
 
-/// Probe `adb shell pm list packages` for the companion. Returns
+/// Probe `pm list packages` for the companion. Returns
 /// `Ok(true)` if installed, `Ok(false)` if absent.
 pub async fn companion_installed(serial: &str) -> Result<bool, PairingError> {
-    let output = Command::new("adb")
-        .args(["-s", serial, "shell", "pm", "list", "packages", COMPANION_PACKAGE])
-        .output()
-        .await?;
-    if !output.status.success() {
-        let err = String::from_utf8_lossy(&output.stderr);
-        return Err(PairingError::Protocol(format!(
-            "adb shell pm list packages failed: {err}"
-        )));
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    Ok(stdout.lines().any(|l| l.trim() == format!("package:{COMPANION_PACKAGE}")))
+    let serial = serial.to_string();
+    tokio::task::spawn_blocking(move || {
+        let mut device = get_device(&serial)?;
+        let mut buf = Vec::with_capacity(256);
+        device
+            .shell_command(
+                &["pm", "list", "packages", COMPANION_PACKAGE],
+                &mut buf,
+            )
+            .map_err(|e| pairing_err("pm list packages", e))?;
+        let stdout = String::from_utf8_lossy(&buf);
+        Ok(stdout
+            .lines()
+            .any(|l| l.trim() == format!("package:{COMPANION_PACKAGE}")))
+    })
+    .await
+    .map_err(|e| pairing_err("spawn_blocking pm list", e))?
 }
 
-/// `adb install -r <apk>` — replaces existing install if the package
-/// is already present (so re-pairing after a companion update just
-/// works). `-g` grants every runtime permission listed in the
-/// manifest so the user does not have to walk through the runtime
-/// permission grant prompts after pair.
+/// Install the companion APK on the device. Replaces an existing
+/// install if present.
 pub async fn install_companion_apk(
     serial: &str,
     apk: &std::path::Path,
@@ -230,18 +228,17 @@ pub async fn install_companion_apk(
             apk.display()
         )));
     }
-    let output = Command::new("adb")
-        .args(["-s", serial, "install", "-r", "-g"])
-        .arg(apk)
-        .output()
-        .await?;
-    if !output.status.success() {
-        let err = String::from_utf8_lossy(&output.stderr);
-        return Err(PairingError::Protocol(format!(
-            "adb install failed: {err}"
-        )));
-    }
-    Ok(())
+    let serial = serial.to_string();
+    let apk = apk.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let mut device = get_device(&serial)?;
+        device
+            .install(&apk)
+            .map_err(|e| pairing_err("adb install", e))?;
+        Ok(())
+    })
+    .await
+    .map_err(|e| pairing_err("spawn_blocking install", e))?
 }
 
 async fn wait_and_bootstrap(
@@ -257,23 +254,15 @@ async fn wait_and_bootstrap(
 }
 
 async fn add_adb_reverse(serial: &str, port: u16) -> Result<(), PairingError> {
-    let output = Command::new("adb")
-        .args([
-            "-s",
-            serial,
-            "reverse",
-            &format!("tcp:{port}"),
-            &format!("tcp:{port}"),
-        ])
-        .output()
-        .await?;
-    if !output.status.success() {
-        let err = String::from_utf8_lossy(&output.stderr);
-        return Err(PairingError::Protocol(format!(
-            "adb reverse failed: {err}"
-        )));
-    }
-    Ok(())
+    let serial = serial.to_string();
+    tokio::task::spawn_blocking(move || {
+        let mut device = get_device(&serial)?;
+        device
+            .reverse(format!("tcp:{port}"), format!("tcp:{port}"))
+            .map_err(|e| pairing_err("adb reverse", e))
+    })
+    .await
+    .map_err(|e| pairing_err("spawn_blocking reverse", e))?
 }
 
 async fn trigger_companion_pair(
@@ -281,52 +270,57 @@ async fn trigger_companion_pair(
     port: u16,
     host_name: &str,
 ) -> Result<(), PairingError> {
-    let output = Command::new("adb")
-        .args([
-            "-s",
-            serial,
-            "shell",
-            "am",
-            "broadcast",
-            "-a",
-            "org.gameros.ansync.action.PAIR",
-            "-n",
-            "org.gameros.ansync/.PairingReceiver",
-            "--ei",
-            "port",
-            &port.to_string(),
-            "--es",
-            "name",
-            host_name,
-        ])
-        .output()
-        .await?;
-    if !output.status.success() {
-        let err = String::from_utf8_lossy(&output.stderr);
-        return Err(PairingError::Protocol(format!(
-            "adb shell am broadcast failed: {err}"
-        )));
-    }
-    // `am broadcast` exits 0 even if the receiver is missing; the
-    // stdout carries `Broadcast completed: result=0`. We don't try
-    // to parse that — the host's `wait_and_bootstrap` will time out
-    // if the companion never connects, and that's the canonical
-    // error surface.
-    Ok(())
+    let serial = serial.to_string();
+    let host_name = host_name.to_string();
+    tokio::task::spawn_blocking(move || {
+        let mut device = get_device(&serial)?;
+        let mut buf = Vec::with_capacity(256);
+        device
+            .shell_command(
+                &[
+                    "am",
+                    "broadcast",
+                    "-a",
+                    "org.gameros.ansync.action.PAIR",
+                    "-n",
+                    "org.gameros.ansync/.PairingReceiver",
+                    "--ei",
+                    "port",
+                    &port.to_string(),
+                    "--es",
+                    "name",
+                    &host_name,
+                ],
+                &mut buf,
+            )
+            .map_err(|e| pairing_err("am broadcast PAIR", e))?;
+        // `am broadcast` exits 0 even if the receiver is missing; the
+        // stdout carries `Broadcast completed: result=0`. We don't try
+        // to parse that — `wait_and_bootstrap` will time out if the
+        // companion never connects, and that's the canonical error
+        // surface.
+        Ok(())
+    })
+    .await
+    .map_err(|e| pairing_err("spawn_blocking broadcast", e))?
 }
 
-async fn remove_adb_reverse(serial: &str, port: u16) -> Result<(), PairingError> {
-    let output = Command::new("adb")
-        .args(["-s", serial, "reverse", "--remove", &format!("tcp:{port}")])
-        .output()
-        .await?;
-    if !output.status.success() {
-        let err = String::from_utf8_lossy(&output.stderr);
-        return Err(PairingError::Protocol(format!(
-            "adb reverse --remove failed: {err}"
-        )));
-    }
-    Ok(())
+async fn remove_adb_reverse(serial: &str, _port: u16) -> Result<(), PairingError> {
+    let serial = serial.to_string();
+    tokio::task::spawn_blocking(move || {
+        let mut device = get_device(&serial)?;
+        device
+            .reverse_remove_all()
+            .map_err(|e| pairing_err("adb reverse remove_all", e))
+    })
+    .await
+    .map_err(|e| pairing_err("spawn_blocking reverse remove_all", e))?
+}
+
+fn get_device(serial: &str) -> Result<ADBServerDevice, PairingError> {
+    let mut srv = server();
+    srv.get_device_by_name(serial)
+        .map_err(|e| pairing_err("get_device_by_name", e))
 }
 
 #[cfg(test)]

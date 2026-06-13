@@ -6,6 +6,12 @@
 
 use async_trait::async_trait;
 
+#[cfg(feature = "wayland")]
+pub mod wayland;
+
+#[cfg(feature = "wayland")]
+pub use wayland::WaylandClipboard;
+
 #[derive(Debug, Clone)]
 pub enum ClipboardContent {
     Text(String),

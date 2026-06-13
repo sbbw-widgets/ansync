@@ -13,9 +13,14 @@ pub mod session;
 #[cfg(feature = "uinput")]
 pub mod uinput;
 
+#[cfg(feature = "bt-hid")]
+pub mod bt_hid;
+
 pub use session::{InputDeviceFactory, InputSession, SessionError};
 #[cfg(feature = "uinput")]
 pub use session::UinputFactory;
+#[cfg(feature = "bt-hid")]
+pub use bt_hid::BtHidFactory;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputKind {

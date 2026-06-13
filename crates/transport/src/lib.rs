@@ -44,6 +44,7 @@ pub enum StreamKind {
     Fs,
     Input,
     Camera,
+    Clipboard,
 }
 
 #[async_trait]

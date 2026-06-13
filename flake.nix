@@ -21,6 +21,11 @@
     flake-parts.lib.mkFlake { inherit inputs; } {
       systems = [ "x86_64-linux" "aarch64-linux" ];
 
+      flake = {
+        nixosModules.default = ./nix/module.nix;
+        homeManagerModules.default = ./nix/hm-module.nix;
+      };
+
       perSystem = { system, lib, ... }:
         let
           pkgs = import inputs.nixpkgs {
@@ -29,6 +34,11 @@
           };
 
           rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
+
+          ansyncPkg = pkgs.callPackage ./nix/package.nix {
+            inherit rustToolchain;
+            crane = inputs.crane;
+          };
 
           # Native build deps required at link / build time.
           nativeBuildDeps = with pkgs; [
@@ -44,8 +54,12 @@
             # IPC
             dbus
 
-            # Audio (Step 11)
+            # Audio (Step 11). `cpal` speaks PipeWire via the
+            # PipeWire-ALSA shim, so we need both `alsa-lib` (for
+            # `alsa-sys`'s pkg-config probe) and pipewire (for the
+            # native lib that the shim forwards to).
             pipewire
+            alsa-lib
 
             # Video (Steps 5 / 6)
             libva
@@ -88,8 +102,21 @@
             LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
           };
 
-          # Build derivations (ansyncd / ansyncctl) get wired in Step 14
-          # using crane.mkLib pkgs |> .overrideToolchain rustToolchain.
+          packages = {
+            default = ansyncPkg;
+            ansync = ansyncPkg;
+          };
+
+          apps = {
+            ansyncd = {
+              type = "app";
+              program = "${ansyncPkg}/bin/ansyncd";
+            };
+            ansyncctl = {
+              type = "app";
+              program = "${ansyncPkg}/bin/ansyncctl";
+            };
+          };
         };
     };
 }

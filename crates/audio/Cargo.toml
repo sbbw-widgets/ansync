@@ -5,16 +5,18 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "ansync — virtual audio sources / sinks (PipeWire default, ALSA/JACK future)"
+description = "ansync — virtual audio sources / sinks (cpal default, ALSA/JACK future)"
 
 [dependencies]
 ansync-core.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
 thiserror.workspace = true
+tokio = { workspace = true, features = ["sync"] }
+tracing.workspace = true
 
-pipewire = { workspace = true, optional = true }
+cpal = { workspace = true, optional = true }
 
 [features]
 default = []
-pipewire-backend = ["dep:pipewire"]
+cpal-backend = ["dep:cpal"]

@@ -260,8 +260,38 @@ async fn pair(
             candidate.exists().then_some(candidate)
         });
 
+    // Step 17: if no explicit APK was supplied and the companion is
+    // missing, fall through to the GitHub release fetcher. The cache
+    // path is reused on subsequent runs, so re-pairing the same
+    // device after a clean shell is free.
+    let mut auto_apk: Option<PathBuf> = None;
+    let resolved_apk = if apk_path.is_some() {
+        apk_path
+    } else if !ansync_pairing::companion_installed(&serial).await? {
+        match ansync_pairing::fetch_latest_companion().await {
+            Ok(fetched) => {
+                println!(
+                    "fetched companion APK {} → {}",
+                    fetched.tag,
+                    fetched.path.display()
+                );
+                auto_apk = Some(fetched.path.clone());
+                Some(fetched.path)
+            }
+            Err(e) => {
+                eprintln!(
+                    "warning: auto-fetch failed ({e}); install will fail unless --apk is supplied"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let _ = auto_apk;
+
     println!("pairing with {serial} as `{local_name}` …");
-    let stored = pair_host_via_adb(&serial, &identity, &local_name, apk_path.as_deref()).await?;
+    let stored = pair_host_via_adb(&serial, &identity, &local_name, resolved_apk.as_deref()).await?;
     println!("paired: device_id={} name={}", stored.id, stored.name);
 
     let store = PeerStore::open(default_peers_dir()?)?;

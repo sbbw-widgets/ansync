@@ -38,6 +38,11 @@ class AnsyncCompanionService : Service() {
     private var cameraPollThread: HandlerThread? = null
     private var cameraPollHandler: Handler? = null
     @Volatile private var cameraPollRunning = false
+    private var audio: AudioRouter? = null
+    private var audioPollThread: HandlerThread? = null
+    private var audioPollHandler: Handler? = null
+    @Volatile private var audioPollRunning = false
+    private var clipboard: ClipboardBridge? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -45,6 +50,40 @@ class AnsyncCompanionService : Service() {
         NativeBridge.nativeInit(filesDir.absolutePath)
         maybeStartFsServer()
         startCameraControlPoller()
+        startAudioControlPoller()
+        clipboard = ClipboardBridge(this).also { it.start() }
+    }
+
+    private fun startAudioControlPoller() {
+        if (audioPollThread != null) return
+        val ht = HandlerThread("ansync-aud-ctrl").also { it.start() }
+        audioPollThread = ht
+        audioPollHandler = Handler(ht.looper)
+        audioPollRunning = true
+        audioPollHandler?.post(object : Runnable {
+            override fun run() {
+                while (audioPollRunning) {
+                    val blob = NativeBridge.nativePollAudioControl() ?: return
+                    when (val msg = WireAudioControl.decode(blob)) {
+                        is WireAudioControl.StartAudioRoute -> handleStartAudio(msg)
+                        WireAudioControl.StopAudioRoute -> handleStopAudio()
+                        null -> Log.w(TAG, "bad audio control blob")
+                    }
+                }
+            }
+        })
+    }
+
+    private fun handleStartAudio(msg: WireAudioControl.StartAudioRoute) {
+        audio?.stop()
+        audio = AudioRouter(msg.direction).also { it.start() }
+        Log.i(TAG, "audio route started ${msg.direction}")
+    }
+
+    private fun handleStopAudio() {
+        audio?.stop()
+        audio = null
+        Log.i(TAG, "audio route stopped")
     }
 
     private fun startCameraControlPoller() {
@@ -149,6 +188,14 @@ class AnsyncCompanionService : Service() {
         cameraPollThread?.quitSafely()
         cameraPollThread = null
         cameraPollHandler = null
+        audioPollRunning = false
+        audio?.stop()
+        audio = null
+        audioPollThread?.quitSafely()
+        audioPollThread = null
+        audioPollHandler = null
+        clipboard?.stop()
+        clipboard = null
         stopCapture()
         fsServer?.stop()
         fsServer = null

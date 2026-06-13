@@ -97,8 +97,12 @@ eframe = { version = "0.31", default-features = false, features = ["wgpu", "wayl
 egui = "0.31"
 wgpu = "24"
 
-# Audio (consumed in Step 11)
-pipewire = "0.8"
+# Audio (consumed in Step 11). `cpal` speaks PipeWire on Linux
+# through the ALSA bridge (PipeWire ships an ALSA plugin by default),
+# so we avoid the deep pipewire-rs FFI dance while still using the
+# user's preferred audio server. ALSA-only hosts fall back to plain
+# ALSA — same code path either way.
+cpal = "0.15"
 
 # Camera (consumed in Step 10)
 v4l = "0.14"
@@ -106,7 +110,21 @@ libc = "0.2"
 
 # Input (consumed in Steps 7 / 13)
 input-linux = "0.7"
-bluer = "0.17"
+bluer = { version = "0.17", default-features = false, features = ["bluetoothd"] }
+
+# Pure-Rust ADB client (Step 16). Replaces the `Command::new("adb")`
+# shell-outs from `pair_host_via_adb` etc. with structured calls
+# against the local `adb` server (still required — adb_client speaks
+# the ADB protocol, not the device protocol directly). Async-capable.
+adb_client = "2"
+
+# Step 17 APK auto-fetch. rustls-tls feature stays consistent with
+# the rest of the workspace — no OpenSSL anywhere. `json` for the
+# GitHub release API; `stream` lets us stream the APK download to
+# disk rather than buffering 30 MB in memory.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+serde_json = "1"
+hex = "0.4"
 
 # Filesystem (consumed in Step 9)
 fuser = "0.15"

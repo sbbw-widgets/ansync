@@ -89,7 +89,36 @@ El `flake.nix` pinea `nixpkgs` a `549bd84d6279f9852cae6225e372cc67fb91a4c1` para
   - Companion Kotlin: `CameraSession` Camera2 + MediaCodec AVC/HEVC con Surface input (zero-copy sensor → encoder). `pickOutputSize` matchea cuello bajo, `CONTROL_AE_TARGET_FPS_RANGE` fija fps, `CONTROL_VIDEO_STABILIZATION_MODE_ON` opcional. `AnsyncCompanionService` arranca HandlerThread `ansync-cam-ctrl` que polea native + dispatch Start/Stop. `WireCameraControl.kt` espejo. Manifest: `CAMERA` + `FOREGROUND_SERVICE_CAMERA`; service foregroundServiceType `mediaProjection|camera`.
   - `Capabilities::CAMERA_VIDEO` default-on en `DaemonConfig`.
   - `nix/v4l2loopback.nix` partial: `extraModulePackages = [ kernelPackages.v4l2loopback ]` + modprobe options (`devices=1 video_nr=10 card_label="Ansync" exclusive_caps=1`) + udev rule grupo `video`. Step 14 importa.
-- **Próximo (Step 11)** — audio PipeWire bidireccional + notification widget Android MediaSession.
+- **Step 11 cerrado** — Audio bidireccional cpal ↔ AudioRecord/AudioTrack:
+  - `ansync_audio::CpalBackend` (feature `cpal-backend`) — cpal habla PipeWire via la ALSA shim, evita pipewire-rs FFI. `CpalSource` capture + `CpalSink` playback. 48 kHz / stereo / S16LE en ambos lados.
+  - `ControlMessage::StartAudioRoute{direction}` + `StopAudioRoute`. `AudioStreamInit` header en primer frame de `StreamKind::Audio`.
+  - Daemon-core: `AudioRegistry` per-peer, perm gates `AudioIn`/`AudioOut`. `handle_start_audio` abre Control + provisions sink/source/streams. `audio_render_loop` drena inbound → `CpalSink`; `audio_pump_loop` drena `CpalSource` → outbound.
+  - D-Bus `Device.StartAudioRoute(direction)` + `StopAudioRoute` + `StartMicrophone`/`StopMicrophone` sugar.
+  - Companion native: `nativePollAudioControl` / `nativeSendAudioChunk` / `nativePollAudioChunk` / `nativeStopAudioStream`. `streams_accept_loop` demuxa `StreamKind::Audio` inbound.
+  - Companion Kotlin: `AudioRouter` w/ `AudioRecord` (mic→host) + `AudioTrack` (host→device). `WireAudioControl.kt` mirror del encoder Rust. Manifest gana `RECORD_AUDIO` + `MODIFY_AUDIO_SETTINGS` + `FOREGROUND_SERVICE_MICROPHONE`; service foregroundServiceType += `microphone`. MediaSession widget queda pending nice-to-have.
+- **Step 12 cerrado** — Clipboard sync Wayland ↔ Android:
+  - `ansync_clipboard::WaylandClipboard` (feature `wayland`) wrappea `wl-clipboard-rs` con spawn_blocking.
+  - `StreamKind::Clipboard` tag 0x08. `ClipboardMessage::Text|Blob` (ya existía en proto). Inbound perm gate `ClipboardIn`. Outbound via `DaemonAction::SyncClipboard` + perm gate `ClipboardOut`.
+  - D-Bus `Device.SyncClipboard()`. Companion JNI `nativeSendClipboardText` + `nativePollClipboardText`. Blob payloads ignored por ahora (text only).
+  - Kotlin `ClipboardBridge` polea native + `ClipboardManager.setPrimaryClip`. `pushToHost()` lee primaryClip + manda JNI. `AnsyncCompanionService` lifecycle.
+  - `Capabilities::CLIPBOARD` default-on.
+- **Step 13 cerrado (scaffold)** — BT-HID via bluer:
+  - `ansync_input::bt_hid::BtHidFactory` impl `InputDeviceFactory` (feature `bt-hid`). `BtHidDevice` abre `bluer::Session` + adapter + powered=true, loguea HID reports. Profile registration (SDP + L2CAP control/interrupt) deferred.
+- **Step 14 cerrado** — Nix module + crane:
+  - `nix/package.nix` crane build, instala udev rule + systemd unit a `$out`.
+  - `nix/module.nix` consolida imports de uinput/fuse/v4l2loopback partials. Opciones `services.ansync.{enable,user,package,extraGroups}`. Suma user a `input`/`video`/`fuse`. Systemd user unit con sandboxing.
+  - `nix/hm-module.nix` fallback home-manager para no-NixOS.
+  - `flake.nix` expone `nixosModules.default`, `homeManagerModules.default`, `packages.default`, apps `ansyncd`/`ansyncctl`.
+  - `flake.nix` dev-shell gana `alsa-lib`.
+- **Step 15 cerrado** — README expandido: status table, arquitectura ASCII, install NixOS + manual, pair workflow, surface D-Bus completa, ejemplos gdbus, troubleshooting, logs.
+- **Step 16 cerrado** — Pure-Rust ADB:
+  - `Command::new("adb")` de `pairing/cable.rs` migradas a `adb_client::ADBServer` + `ADBServerDevice::{reverse, reverse_remove_all, shell_command, install}`. Sync API → spawn_blocking. Sigue requiriendo adbd en host.
+- **Step 17 cerrado** — APK auto-fetch:
+  - `release::fetch_latest_companion()` GET `api.github.com/repos/SergioRibera/ansync/releases/latest` via reqwest `rustls-tls`. Picks asset `companion*.apk`.
+  - Cache en `$XDG_CACHE_HOME/ansync/companion-{tag}.apk`, size + SHA-256 verify (digest del release API; warning skip si ausente).
+  - `query_installed_version` parsea `dumpsys package` por `versionName=`.
+  - `ansyncctl pair` ahora: si no hay --apk/env/path Y companion missing → auto-fetch + install. Override sigue funcionando.
+- **Roadmap completo.** Ver `PLAN.md` para tabla final.
 
 Ver `PLAN.md` § Roadmap para la lista completa.
 

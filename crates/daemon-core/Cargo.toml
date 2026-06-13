@@ -20,6 +20,8 @@ ansync-input = { workspace = true, features = ["uinput"] }
 ansync-files = { workspace = true, features = ["fuse"] }
 ansync-video.workspace = true
 ansync-camera = { workspace = true, features = ["v4l2loopback"] }
+ansync-audio = { workspace = true, features = ["cpal-backend"] }
+ansync-clipboard = { workspace = true, features = ["wayland"] }
 bytes.workspace = true
 postcard.workspace = true
 tokio = { workspace = true, features = ["signal", "rt-multi-thread", "macros", "sync"] }

@@ -17,6 +17,14 @@ serde.workspace = true
 tokio = { workspace = true, features = ["io-util", "net", "process", "fs", "macros", "time", "sync"] }
 toml.workspace = true
 tracing.workspace = true
+adb_client.workspace = true
+bytes.workspace = true
+directories.workspace = true
+reqwest.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+hex.workspace = true
+futures.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-util", "net"] }

@@ -101,6 +101,45 @@ object NativeBridge {
     /** Close the outbound camera stream. Idempotent. */
     external fun nativeStopCameraStream(): Boolean
 
+    /**
+     * Block (in native) until the next audio control message arrives
+     * (StartAudioRoute / StopAudioRoute). Wire layout:
+     *   tag 0 StartAudioRoute : u8 direction(0=HostToDevice,1=DeviceToHost,2=Both)
+     *   tag 1 StopAudioRoute  : (no payload)
+     */
+    external fun nativePollAudioControl(): ByteArray?
+
+    /**
+     * Block until the next host→device PCM chunk arrives over the
+     * inbound `StreamKind::Audio`. Raw 48 kHz / stereo / S16LE bytes.
+     */
+    external fun nativePollAudioChunk(): ByteArray?
+
+    /**
+     * Push a device→host PCM chunk (raw 48 kHz / stereo / S16LE).
+     * Lazy-opens the outbound Audio stream + sends the
+     * AudioStreamInit header on first call.
+     */
+    external fun nativeSendAudioChunk(chunk: ByteArray): Boolean
+
+    /** Close the outbound Audio stream. Idempotent. */
+    external fun nativeStopAudioStream(): Boolean
+
+    /**
+     * Block until the next inbound clipboard text arrives from the
+     * host. Returns `null` on session teardown. Blob clipboard
+     * payloads are dropped natively — Step 12 surfaces text only.
+     */
+    external fun nativePollClipboardText(): String?
+
+    /**
+     * Push the device's current clipboard text to the host. Opens a
+     * one-shot `StreamKind::Clipboard` per call (the host writes the
+     * content to Wayland and the stream closes). Cheap — clipboard
+     * messages are tiny.
+     */
+    external fun nativeSendClipboardText(text: String): Boolean
+
     /** Tear the active session down. Safe to call when no session is open. */
     external fun nativeClose()
 }

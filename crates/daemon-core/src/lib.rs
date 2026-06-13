@@ -14,7 +14,9 @@ use std::sync::Arc;
 use std::collections::HashMap;
 use std::sync::Mutex as StdMutex;
 
+use ansync_audio::{AudioBackend, AudioFormat, AudioSink, AudioSource, CpalBackend, SampleFormat};
 use ansync_camera::{CameraFormat, CameraPixelFormat, VirtualCameraSink};
+use ansync_clipboard::{ClipboardBackend, ClipboardContent, WaylandClipboard};
 use ansync_core::{Capabilities, DeviceId, DeviceName, Permission};
 use ansync_crypto::IdentityKeypair;
 use ansync_dbus::{DaemonAction, DaemonState, serve};
@@ -26,8 +28,8 @@ use ansync_input::{InputDeviceFactory, InputSession, UinputFactory};
 use ansync_pairing::PeerStore;
 use ansync_permissions::FilePermissionsStore;
 use ansync_proto::{
-    CameraConfig, ControlMessage, Envelope, InputMessage, Message, PROTOCOL_VERSION,
-    VideoCodec as ProtoVideoCodec,
+    AudioDirection, AudioStreamInit, CameraConfig, ClipboardMessage, ControlMessage, Envelope,
+    InputMessage, Message, PROTOCOL_VERSION, VideoCodec as ProtoVideoCodec,
 };
 use ansync_transport::pinning::TrustedPeers;
 use ansync_transport::{
@@ -101,7 +103,11 @@ impl DaemonConfig {
             download_dir: None,
             capabilities: Capabilities::INPUT_FROM_DEV
                 | Capabilities::FILES
-                | Capabilities::CAMERA_VIDEO,
+                | Capabilities::CAMERA_VIDEO
+                | Capabilities::AUDIO_IN
+                | Capabilities::AUDIO_OUT
+                | Capabilities::MIC
+                | Capabilities::CLIPBOARD,
         }
     }
 }
@@ -175,10 +181,12 @@ impl Daemon {
 
         let mirrors = Arc::new(MirrorRegistry::default());
         let cameras = Arc::new(CameraRegistry::default());
+        let audios = Arc::new(AudioRegistry::default());
         let action_handle = tokio::spawn(action_loop(
             action_rx,
             mirrors.clone(),
             cameras.clone(),
+            audios.clone(),
             permissions.clone(),
         ));
 
@@ -196,6 +204,7 @@ impl Daemon {
             download_dir,
             mirrors: mirrors.clone(),
             cameras: cameras.clone(),
+            audios: audios.clone(),
         }));
 
         wait_for_shutdown().await?;
@@ -244,6 +253,7 @@ struct AcceptCtx {
     download_dir: PathBuf,
     mirrors: Arc<MirrorRegistry>,
     cameras: Arc<CameraRegistry>,
+    audios: Arc<AudioRegistry>,
 }
 
 /// Per-peer mirror state: frame slot the decoder populates and the
@@ -262,6 +272,54 @@ pub struct MirrorEntry {
     /// to open an outbound Input stream on ShowScreen. Cleared by
     /// `handle_connection` on disconnect.
     pub conn: StdMutex<Option<Arc<QuicConnection>>>,
+}
+
+/// Per-peer audio pipeline state. Like `CameraRegistry`, but with
+/// separate sink + source slots because the route directions are
+/// independent — the user may want speakers on the host but no
+/// microphone share, for example.
+#[derive(Default)]
+pub struct AudioRegistry {
+    entries: StdMutex<HashMap<DeviceId, Arc<AudioEntry>>>,
+}
+
+pub struct AudioEntry {
+    pub peer_name: String,
+    /// Plays *into* the host (peer → host direction).
+    sink: tokio::sync::Mutex<Option<Arc<tokio::sync::Mutex<ansync_audio::CpalSink>>>>,
+    /// Captures *from* the host (host → peer direction). The
+    /// background pump task moves bytes out of this source onto the
+    /// outbound stream.
+    pump_handle: StdMutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Channel the inbound `StreamKind::Audio` accept loop writes
+    /// raw S16LE PCM to. Drained by `audio_render_loop` into `sink`.
+    inbound_tx: StdMutex<Option<tokio::sync::mpsc::UnboundedSender<bytes::Bytes>>>,
+    /// Active inbound render task; aborted on Stop.
+    inbound_handle: StdMutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+impl AudioRegistry {
+    pub fn ensure(&self, id: &DeviceId, name: &str) -> Arc<AudioEntry> {
+        let mut entries = self.entries.lock().expect("audio registry poisoned");
+        entries
+            .entry(id.clone())
+            .or_insert_with(|| {
+                Arc::new(AudioEntry {
+                    peer_name: name.to_string(),
+                    sink: tokio::sync::Mutex::new(None),
+                    pump_handle: StdMutex::new(None),
+                    inbound_tx: StdMutex::new(None),
+                    inbound_handle: StdMutex::new(None),
+                })
+            })
+            .clone()
+    }
+    pub fn get(&self, id: &DeviceId) -> Option<Arc<AudioEntry>> {
+        self.entries
+            .lock()
+            .ok()
+            .and_then(|e| e.get(id).cloned())
+    }
 }
 
 /// Per-peer camera pipeline state. Lives across connect / disconnect
@@ -341,10 +399,42 @@ async fn action_loop(
     mut rx: UnboundedReceiver<DaemonAction>,
     mirrors: Arc<MirrorRegistry>,
     cameras: Arc<CameraRegistry>,
+    audios: Arc<AudioRegistry>,
     permissions: Arc<dyn ansync_permissions::PermissionsStore>,
 ) {
     while let Some(action) = rx.recv().await {
         match action {
+            DaemonAction::StartAudioRoute { device, direction } => {
+                if let Err(e) =
+                    handle_start_audio(&mirrors, &audios, &permissions, &device, direction).await
+                {
+                    warn!(%device, error = %e, "StartAudioRoute failed");
+                }
+            }
+            DaemonAction::StopAudioRoute { device } => {
+                handle_stop_audio(&audios, &device).await;
+            }
+            DaemonAction::StartMicrophone { device } => {
+                if let Err(e) = handle_start_audio(
+                    &mirrors,
+                    &audios,
+                    &permissions,
+                    &device,
+                    AudioDirection::DeviceToHost,
+                )
+                .await
+                {
+                    warn!(%device, error = %e, "StartMicrophone failed");
+                }
+            }
+            DaemonAction::StopMicrophone { device } => {
+                handle_stop_audio(&audios, &device).await;
+            }
+            DaemonAction::SyncClipboard { device } => {
+                if let Err(e) = push_clipboard_to_peer(&mirrors, &permissions, &device).await {
+                    warn!(%device, error = %e, "SyncClipboard failed");
+                }
+            }
             DaemonAction::StartCamera { device, config } => {
                 if let Err(e) =
                     handle_start_camera(&mirrors, &cameras, &permissions, &device, config).await
@@ -427,6 +517,7 @@ async fn accept_loop(ctx: AcceptCtx) {
                 let download_dir = ctx.download_dir.clone();
                 let mirrors = ctx.mirrors.clone();
                 let cameras = ctx.cameras.clone();
+                let audios = ctx.audios.clone();
                 tokio::spawn(async move {
                     if let Err(e) = handle_connection(
                         conn,
@@ -436,6 +527,7 @@ async fn accept_loop(ctx: AcceptCtx) {
                         download_dir,
                         mirrors,
                         cameras,
+                        audios,
                     )
                     .await
                     {
@@ -459,6 +551,7 @@ async fn handle_connection(
     download_dir: PathBuf,
     mirrors: Arc<MirrorRegistry>,
     cameras: Arc<CameraRegistry>,
+    audios: Arc<AudioRegistry>,
 ) -> Result<(), DaemonError> {
     let pubkey = conn.peer_identity().as_bytes();
     let mut id_bytes = [0u8; 16];
@@ -485,6 +578,7 @@ async fn handle_connection(
     let mirror_entry = mirrors.ensure(&peer_id, &peer.name.0);
     *mirror_entry.conn.lock().expect("conn slot poisoned") = Some(conn_arc.clone());
     let camera_entry = cameras.ensure(&peer_id, &peer.name.0);
+    let audio_entry = audios.ensure(&peer_id, &peer.name.0);
 
     // Auto-mount FUSE if the peer's `files_mount` flag is on. The
     // BackgroundSession is held on the stack so dropping it on
@@ -524,6 +618,17 @@ async fn handle_connection(
                 let pid = peer_id.clone();
                 tokio::spawn(camera_stream_loop(stream, entry, pid));
             }
+            StreamKind::Audio => {
+                let entry = audio_entry.clone();
+                let pid = peer_id.clone();
+                let perms = permissions.clone();
+                tokio::spawn(audio_inbound_loop(stream, entry, pid, perms));
+            }
+            StreamKind::Clipboard => {
+                let pid = peer_id.clone();
+                let perms = permissions.clone();
+                tokio::spawn(clipboard_inbound_loop(stream, pid, perms));
+            }
             other => {
                 warn!(kind = ?other, "stream kind accepted but not wired yet — dropping");
                 drop(stream);
@@ -550,6 +655,28 @@ async fn handle_connection(
             warn!(%peer_id, error = %e, "camera sink unregister on disconnect failed");
         }
     }
+    // Audio: tear down both directions if the peer drops mid-stream.
+    if let Some(h) = audio_entry
+        .pump_handle
+        .lock()
+        .expect("audio pump slot poisoned")
+        .take()
+    {
+        h.abort();
+    }
+    if let Some(h) = audio_entry
+        .inbound_handle
+        .lock()
+        .expect("audio inbound slot poisoned")
+        .take()
+    {
+        h.abort();
+    }
+    *audio_entry
+        .inbound_tx
+        .lock()
+        .expect("audio inbound tx poisoned") = None;
+    *audio_entry.sink.lock().await = None;
     Ok(())
 }
 
@@ -660,6 +787,306 @@ fn sanitize(name: &str) -> String {
             }
         })
         .collect()
+}
+
+/// Read one `ClipboardMessage` per frame from the inbound stream and
+/// stamp it into the host Wayland clipboard, gated by
+/// `Permission::ClipboardIn`.
+async fn clipboard_inbound_loop(
+    mut stream: QuicStream,
+    peer_id: DeviceId,
+    permissions: Arc<dyn ansync_permissions::PermissionsStore>,
+) {
+    let backend = WaylandClipboard::new();
+    loop {
+        let bytes = match stream.recv().await {
+            Ok(b) => b,
+            Err(ansync_transport::TransportError::Closed) => return,
+            Err(e) => {
+                warn!(%peer_id, error = %e, "clipboard recv error");
+                return;
+            }
+        };
+        let msg: ClipboardMessage = match postcard::from_bytes(&bytes) {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(error = %e, "clipboard decode failed");
+                continue;
+            }
+        };
+        if !permissions
+            .check(&peer_id, Permission::ClipboardIn)
+            .await
+            .unwrap_or(false)
+        {
+            warn!(%peer_id, "clipboard_in permission off; dropping inbound clipboard");
+            continue;
+        }
+        let content = match msg {
+            ClipboardMessage::Text { content } => ClipboardContent::Text(content),
+            ClipboardMessage::Blob { mime, data } => ClipboardContent::Blob { mime, data },
+        };
+        if let Err(e) = backend.write(content).await {
+            warn!(%peer_id, error = %e, "WaylandClipboard write failed");
+        }
+    }
+}
+
+/// Push the current host Wayland clipboard to `peer_id`, gated by
+/// `Permission::ClipboardOut`. Exposed via the D-Bus
+/// `Device.SyncClipboard` method.
+async fn push_clipboard_to_peer(
+    mirrors: &MirrorRegistry,
+    permissions: &Arc<dyn ansync_permissions::PermissionsStore>,
+    device: &DeviceId,
+) -> Result<(), DaemonError> {
+    if !permissions
+        .check(device, Permission::ClipboardOut)
+        .await
+        .unwrap_or(false)
+    {
+        warn!(%device, "clipboard_out permission off; refusing SyncClipboard");
+        return Ok(());
+    }
+    let mirror = mirrors
+        .get(device)
+        .ok_or_else(|| DaemonError::Startup(format!("no mirror entry for {device}")))?;
+    let conn = mirror
+        .conn
+        .lock()
+        .expect("conn slot poisoned")
+        .clone()
+        .ok_or_else(|| DaemonError::Startup(format!("peer {device} not connected")))?;
+    let backend = WaylandClipboard::new();
+    let content = match backend.read().await {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(error = %e, "WaylandClipboard read failed");
+            return Ok(());
+        }
+    };
+    let msg = match content {
+        ClipboardContent::Text(s) => ClipboardMessage::Text { content: s },
+        ClipboardContent::Blob { mime, data } => ClipboardMessage::Blob { mime, data },
+    };
+    let mut stream = conn.open(StreamKind::Clipboard).await?;
+    let bytes = postcard::to_allocvec(&msg)
+        .map_err(|e| DaemonError::Startup(format!("encode ClipboardMessage: {e}")))?;
+    stream.send(bytes::Bytes::from(bytes)).await?;
+    info!(%device, "host clipboard pushed");
+    Ok(())
+}
+
+async fn handle_start_audio(
+    mirrors: &MirrorRegistry,
+    audios: &AudioRegistry,
+    permissions: &Arc<dyn ansync_permissions::PermissionsStore>,
+    device: &DeviceId,
+    direction: AudioDirection,
+) -> Result<(), DaemonError> {
+    // Permission gates per direction. AudioIn = peer→host (mic
+    // forwarding into host PipeWire), AudioOut = host→peer (host
+    // capture going to the peer's speaker).
+    let need_in = matches!(direction, AudioDirection::DeviceToHost | AudioDirection::Both);
+    let need_out = matches!(direction, AudioDirection::HostToDevice | AudioDirection::Both);
+    if need_in
+        && !permissions
+            .check(device, Permission::AudioIn)
+            .await
+            .unwrap_or(false)
+    {
+        warn!(%device, "audio_in permission off; refusing StartAudioRoute(DeviceToHost)");
+        return Ok(());
+    }
+    if need_out
+        && !permissions
+            .check(device, Permission::AudioOut)
+            .await
+            .unwrap_or(false)
+    {
+        warn!(%device, "audio_out permission off; refusing StartAudioRoute(HostToDevice)");
+        return Ok(());
+    }
+    let mirror = mirrors
+        .get(device)
+        .ok_or_else(|| DaemonError::Startup(format!("no mirror entry for {device}")))?;
+    let conn = mirror
+        .conn
+        .lock()
+        .expect("conn slot poisoned")
+        .clone()
+        .ok_or_else(|| DaemonError::Startup(format!("peer {device} not connected")))?;
+    let entry = audios.ensure(device, &mirror.peer_name);
+
+    // Send the control message so the companion knows which
+    // direction to bring up on its side.
+    let mut ctrl = conn.open(StreamKind::Control).await?;
+    let env = Envelope {
+        version: PROTOCOL_VERSION,
+        message: Message::Control(ControlMessage::StartAudioRoute { direction }),
+    };
+    let bytes = postcard::to_allocvec(&env)
+        .map_err(|e| DaemonError::Startup(format!("encode StartAudioRoute: {e}")))?;
+    ctrl.send(bytes::Bytes::from(bytes)).await?;
+    info!(%device, ?direction, "StartAudioRoute control sent");
+
+    // Inbound: wait for the companion to open a StreamKind::Audio
+    // back at us. `audio_inbound_loop` consumes it and pushes into
+    // the entry's mpsc; `audio_render_loop` drains into the CpalSink.
+    if need_in {
+        let (tx, rx) = unbounded_channel::<bytes::Bytes>();
+        *entry.inbound_tx.lock().expect("audio inbound tx poisoned") = Some(tx);
+        let label = format!("ansync-in-{}", entry.peer_name);
+        let format = AudioFormat {
+            sample_rate: 48_000,
+            channels: 2,
+            format: SampleFormat::S16Le,
+        };
+        let sink = match CpalBackend::new().create_sink(&label, format).await {
+            Ok(s) => Arc::new(tokio::sync::Mutex::new(s)),
+            Err(e) => {
+                warn!(%device, error = %e, "open CpalSink failed");
+                return Ok(());
+            }
+        };
+        *entry.sink.lock().await = Some(sink.clone());
+        let handle = tokio::spawn(audio_render_loop(rx, sink));
+        *entry
+            .inbound_handle
+            .lock()
+            .expect("audio inbound slot poisoned") = Some(handle);
+    }
+
+    if need_out {
+        let mut stream = conn.open(StreamKind::Audio).await?;
+        let init = AudioStreamInit {
+            sample_rate: 48_000,
+            channels: 2,
+            direction: AudioDirection::HostToDevice,
+        };
+        let header = postcard::to_allocvec(&init)
+            .map_err(|e| DaemonError::Startup(format!("encode AudioStreamInit: {e}")))?;
+        stream.send(bytes::Bytes::from(header)).await?;
+        let label = format!("ansync-out-{}", entry.peer_name);
+        let format = AudioFormat {
+            sample_rate: 48_000,
+            channels: 2,
+            format: SampleFormat::S16Le,
+        };
+        let source = match CpalBackend::new().create_source(&label, format).await {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(%device, error = %e, "open CpalSource failed");
+                return Ok(());
+            }
+        };
+        let handle = tokio::spawn(audio_pump_loop(stream, source));
+        *entry
+            .pump_handle
+            .lock()
+            .expect("audio pump slot poisoned") = Some(handle);
+    }
+    Ok(())
+}
+
+async fn handle_stop_audio(audios: &AudioRegistry, device: &DeviceId) {
+    let entry = match audios.get(device) {
+        Some(e) => e,
+        None => return,
+    };
+    if let Some(h) = entry
+        .pump_handle
+        .lock()
+        .expect("audio pump slot poisoned")
+        .take()
+    {
+        h.abort();
+    }
+    if let Some(h) = entry
+        .inbound_handle
+        .lock()
+        .expect("audio inbound slot poisoned")
+        .take()
+    {
+        h.abort();
+    }
+    *entry.inbound_tx.lock().expect("audio inbound tx poisoned") = None;
+    *entry.sink.lock().await = None;
+    info!(%device, "StopAudioRoute done");
+}
+
+async fn audio_render_loop(
+    mut rx: UnboundedReceiver<bytes::Bytes>,
+    sink: Arc<tokio::sync::Mutex<ansync_audio::CpalSink>>,
+) {
+    while let Some(bytes) = rx.recv().await {
+        let mut guard = sink.lock().await;
+        if let Err(e) = guard.write(bytes).await {
+            warn!(error = %e, "audio_render_loop: sink write failed");
+            return;
+        }
+    }
+}
+
+async fn audio_pump_loop(mut stream: QuicStream, mut source: ansync_audio::CpalSource) {
+    loop {
+        match source.read().await {
+            Ok(bytes) => {
+                if let Err(e) = stream.send(bytes).await {
+                    warn!(error = %e, "audio_pump_loop: stream send failed");
+                    return;
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "audio_pump_loop: source read failed");
+                return;
+            }
+        }
+    }
+}
+
+async fn audio_inbound_loop(
+    mut stream: QuicStream,
+    entry: Arc<AudioEntry>,
+    peer_id: DeviceId,
+    _permissions: Arc<dyn ansync_permissions::PermissionsStore>,
+) {
+    // First frame: the AudioStreamInit header. We log it but use the
+    // host-side sink format the action handler already provisioned.
+    let _header = match stream.recv().await {
+        Ok(b) => b,
+        Err(_) => {
+            info!(%peer_id, "audio_inbound_loop: stream closed before header");
+            return;
+        }
+    };
+    info!(%peer_id, "audio inbound stream wired");
+    loop {
+        let bytes = match stream.recv().await {
+            Ok(b) => b,
+            Err(ansync_transport::TransportError::Closed) => {
+                info!(%peer_id, "audio inbound stream closed");
+                return;
+            }
+            Err(e) => {
+                warn!(%peer_id, error = %e, "audio inbound recv error");
+                return;
+            }
+        };
+        let tx = match entry
+            .inbound_tx
+            .lock()
+            .expect("audio inbound tx poisoned")
+            .clone()
+        {
+            Some(tx) => tx,
+            None => continue,
+        };
+        if tx.send(bytes).is_err() {
+            info!(%peer_id, "audio inbound receiver dropped; exiting");
+            return;
+        }
+    }
 }
 
 async fn handle_start_camera(

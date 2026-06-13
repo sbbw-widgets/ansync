@@ -10,11 +10,14 @@ use ansync_crypto::PeerIdentity;
 use async_trait::async_trait;
 
 pub mod cable;
+pub mod release;
 pub mod store;
 
 pub use cable::{
-    AdbDevice, bootstrap_companion, bootstrap_host, list_adb_devices, pair_host_via_adb,
+    AdbDevice, bootstrap_companion, bootstrap_host, companion_installed, install_companion_apk,
+    list_adb_devices, pair_host_via_adb, COMPANION_PACKAGE,
 };
+pub use release::{fetch_latest_companion, query_installed_version, FetchedApk};
 pub use store::{PeerStore, PeerStoreError, StoredPeer};
 
 #[derive(Debug, thiserror::Error)]

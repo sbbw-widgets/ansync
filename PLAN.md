@@ -247,20 +247,38 @@ ansync/
   - Companion native: nuevos JNI `nativePollCameraControl` (poll inbound Control → tag-binary blob) + `nativeSendCameraChunk` (lazy-open outbound Camera stream) + `nativeStopCameraStream`. `streams_accept_loop` ahora demuxa `StreamKind::Control` → `control_recv_loop` decoda Envelope/Message + reencoda como tag-binary para Kotlin.
   - Companion Kotlin: `CameraSession` Camera2 + MediaCodec AVC/HEVC encoder con Surface input (zero-copy del sensor al encoder). `pickOutputSize` busca el sensor size mínimo ≥ target, fallback al más grande. `CONTROL_AE_TARGET_FPS_RANGE` + `CONTROL_VIDEO_STABILIZATION_MODE_ON` cuando `cfg.stabilization`. `AnsyncCompanionService` arranca `HandlerThread` "ansync-cam-ctrl" que polea + dispatcha Start/Stop. `WireCameraControl.kt` espejo del encoder Rust (tag 0 StartCamera, tag 1 StopCamera). Manifest gana `CAMERA` + `FOREGROUND_SERVICE_CAMERA`; service.foregroundServiceType = `mediaProjection|camera`.
   - `nix/v4l2loopback.nix` parcial: `extraModulePackages` + modprobe options (`devices=1 video_nr=10 card_label="Ansync" exclusive_caps=1`) + udev rule grupo `video`. Step 14 lo importa.
-- [ ] **Step 11** — `audio` PipeWire bidireccional + notification widget Android (MediaSession)
-- [ ] **Step 12** — `clipboard` con privacy gates por device
-- [ ] **Step 13** — `input` BT HID secundario vía `bluer`
-- [ ] **Step 14** — Nix module (NixOS + home-manager) + `nix-bundle-app` integration + crane build derivation. Importar `nix/uinput.nix` (Step 7a) + `nix/fuse.nix` (Step 9). Considerar fragmento similar para v4l2loopback (Step 10).
-- [ ] **Step 15** — README detallado + docs site + binary releases
-- [ ] **Step 16** — Reemplazar `adb` CLI shell-outs por crate Rust nativo. Candidatos: `adb_client` (pure-Rust ADB protocol), `forensic-adb` (async), o `mozdevice` (Mozilla). Migrar todos los `Command::new("adb")` actuales: `pair_host_via_adb` (reverse + shell broadcast + pm list + install), `list_adb_devices`. Beneficio: zero dep sobre binary ADB instalado por usuario; mejor error reporting estructurado; no más parsing de stdout/stderr.
-- [ ] **Step 17** — APK auto-fetch desde GitHub releases. Reemplazar flag `--apk` / env `ANSYNC_COMPANION_APK` por:
-  - Query a `https://api.github.com/repos/SergioRibera/ansync/releases/latest` vía `reqwest` (TLS via rustls puro).
-  - Comparar versión instalada en device (`adb_client` → `pm dump org.gameros.ansync | grep versionName`) contra `tag_name` del release.
-  - Cache local del APK descargado en `$XDG_CACHE_HOME/ansync/companion-{version}.apk` con SHA-256 verification contra el `digest` o asset hash del release.
-  - Si companion ausente → instala latest por default sin prompt.
-  - Si companion presente pero outdated → prompt CLI "upgrade? (y/N)" o flag `--auto-upgrade`.
-  - Si companion presente y al día → skip.
-  - Sin flag `--apk` salvo override explícito para dev local (`--apk path/to/local-build.apk` sigue funcionando para CI / nightlies).
+- [x] **Step 11** — `audio` bidireccional + Android AudioRecord/AudioTrack
+  - `ansync_audio::CpalBackend` (feature `cpal-backend`) — cpal speaks PipeWire-ALSA shim, abstracts away the pipewire-rs FFI. `CpalSource` capture, `CpalSink` playback. 48 kHz / stereo / S16LE hardcoded both sides.
+  - `proto::ControlMessage::StartAudioRoute{direction}` + `StopAudioRoute`. `AudioStreamInit` header on first frame of `StreamKind::Audio`.
+  - Daemon-core: `AudioRegistry` per-peer, perm gates `AudioIn`/`AudioOut`. `StartAudioRoute` opens Control + provisions sink/source/streams; `audio_render_loop` drains inbound to `CpalSink`, `audio_pump_loop` drains `CpalSource` to outbound stream.
+  - Companion native: `nativePollAudioControl`/`nativeSendAudioChunk`/`nativePollAudioChunk`/`nativeStopAudioStream`. `streams_accept_loop` demuxa `StreamKind::Audio` inbound.
+  - Companion Kotlin: `AudioRouter` con `AudioRecord` (mic → host) + `AudioTrack` (host → device). `WireAudioControl.kt` decoder. Manifest gana `RECORD_AUDIO` + `MODIFY_AUDIO_SETTINGS` + `FOREGROUND_SERVICE_MICROPHONE`; service.foregroundServiceType += `microphone`.
+  - **Pendiente nice-to-have**: notification widget MediaSession para que el usuario corte mid-stream desde la barra de notificaciones Android sin abrir la app. Funcional sin esto.
+- [x] **Step 12** — `clipboard` sync con perm gates por device
+  - `ansync_clipboard::WaylandClipboard` (feature `wayland`) — wrappea `wl-clipboard-rs` con `tokio::task::spawn_blocking`. Lee/escribe `text/*` + blobs MIME-tagged.
+  - `StreamKind::Clipboard` tag 0x08. Mensaje `ClipboardMessage::Text|Blob` (ya existía en proto). Inbound: perm gate `ClipboardIn`. Outbound vía `DaemonAction::SyncClipboard` (gate `ClipboardOut`).
+  - D-Bus `Device.SyncClipboard()` empuja el clipboard actual del host al peer. Inbound se autodispara por accept loop.
+  - Companion native: `nativeSendClipboardText` (one-shot stream open + send) + `nativePollClipboardText`. Blob payloads se loguean + descartan por ahora (text-only para Step 12 ship).
+  - Companion Kotlin: `ClipboardBridge` polea native + `ClipboardManager.setPrimaryClip`. `pushToHost()` lee `primaryClip` y manda via JNI. `AnsyncCompanionService` arranca/para el bridge.
+  - `Capabilities::CLIPBOARD` default-on en `DaemonConfig`.
+- [x] **Step 13** — `input` BT-HID secundario via `bluer` (scaffold)
+  - `ansync_input::bt_hid::BtHidFactory` impl `InputDeviceFactory` (feature `bt-hid`). `BtHidDevice` abre `bluer::Session` + adapter, set_powered, loguea HID reports sin transmitirlos.
+  - Wire surface lista para que daemon-core pick BT factory en lugar de uinput cuando el peer pareé via BT en lugar de cable; profile SDP + L2CAP control/interrupt channels son follow-up.
+- [x] **Step 14** — Nix module + crane derivation
+  - `nix/package.nix` — crane build, importa workspace, instala udev rule + systemd user unit a `$out`.
+  - `nix/module.nix` — NixOS module consolidado. Importa `uinput.nix` + `fuse.nix` + `v4l2loopback.nix`. Opciones `services.ansync.{enable,user,package,extraGroups}`. Suma el user a `input`/`video`/`fuse`. Wirea systemd user unit con sandboxing (`ProtectSystem=strict`, etc.).
+  - `nix/hm-module.nix` — home-manager fallback para usuarios no-NixOS. `programs.ansync.{enable,package,autoStart}`.
+  - `flake.nix` expone `nixosModules.default`, `homeManagerModules.default`, `packages.default = ansyncPkg`, apps `ansyncd`/`ansyncctl`.
+- [x] **Step 15** — README + docs
+  - README expandido con tabla de status, arquitectura ASCII, instalación NixOS + manual, flujo de pair, surface D-Bus completa, ejemplos `gdbus call`, tabla de perms, troubleshooting, comandos de logs. No docs site separado (todo cabe en README).
+- [x] **Step 16** — Pure-Rust ADB (`adb_client` 2.x)
+  - Todas las `Command::new("adb")` de `crates/pairing/src/cable.rs` migradas a `ADBServer::default().get_device_by_name(serial)` + `ADBServerDevice::{reverse, reverse_remove_all, shell_command, install}`. Sync API → wrap en `tokio::task::spawn_blocking`.
+  - Beneficio: cero parsing de stdout, errores estructurados via `RustADBError`. Sigue requiriendo `adbd` en el host (adb_client habla el protocolo, no USB directo).
+- [x] **Step 17** — APK auto-fetch desde GitHub releases
+  - `ansync_pairing::release::fetch_latest_companion()` — `reqwest` con `rustls-tls` (cero OpenSSL). Query a `api.github.com/repos/SergioRibera/ansync/releases/latest`, picks first asset `companion*.apk`.
+  - Cache en `$XDG_CACHE_HOME/ansync/companion-{tag}.apk` con size + SHA-256 verify (usa `digest` field cuando GitHub lo expone; warning + skip cuando no).
+  - `query_installed_version(serial, package)` parsea `dumpsys package` por `versionName=`.
+  - `ansyncctl pair` ahora: si no hay `--apk` / `$ANSYNC_COMPANION_APK` / `/usr/share/ansync/companion.apk` Y el companion no está instalado → auto-fetch + install. Override `--apk` sigue funcionando para CI / nightlies.
 
 ## Dependencias Cargo (workspace)
 

@@ -7,6 +7,12 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 
+#[cfg(feature = "cpal-backend")]
+pub mod cpal_backend;
+
+#[cfg(feature = "cpal-backend")]
+pub use cpal_backend::{CpalBackend, CpalSink, CpalSource};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SampleFormat {
     S16Le,

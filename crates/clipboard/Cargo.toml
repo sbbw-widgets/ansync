@@ -11,6 +11,8 @@ description = "ansync — clipboard backend abstraction (wayland default, X11 fo
 ansync-core.workspace = true
 async-trait.workspace = true
 thiserror.workspace = true
+tokio = { workspace = true, features = ["sync"] }
+tracing.workspace = true
 
 wl-clipboard-rs = { workspace = true, optional = true }
 

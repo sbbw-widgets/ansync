@@ -21,6 +21,14 @@
     <uses-permission android:name="android.permission.CAMERA" />
     <uses-feature android:name="android.hardware.camera.any" android:required="false" />
 
+    <!-- Audio bidirectional (Step 11): mic forwarding via AudioRecord,
+         playback via AudioTrack. RECORD_AUDIO is required for the
+         mic side; MODIFY_AUDIO_SETTINGS lets the router switch
+         routing modes if needed. -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+
     <!-- Required to draw the persistent companion notification widget
          in Step 11 (audio routing controls). -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
@@ -55,7 +63,7 @@
         <service
             android:name=".AnsyncCompanionService"
             android:exported="false"
-            android:foregroundServiceType="mediaProjection|camera" />
+            android:foregroundServiceType="mediaProjection|camera|microphone" />
 
         <!-- Cable-pairing entry point. Invoked by the host via
              `adb shell am broadcast`. Exported so the ADB shell can

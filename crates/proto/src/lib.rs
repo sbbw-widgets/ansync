@@ -103,6 +103,17 @@ pub enum AudioDirection {
     Both,
 }
 
+/// PCM format declared on the first frame of every `StreamKind::Audio`
+/// stream. After this header, the stream carries raw little-endian
+/// S16 samples interleaved (L,R,L,R,...) — no per-frame envelope so
+/// the hot path stays a straight `recv → write_sink` copy.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct AudioStreamInit {
+    pub sample_rate: u32,
+    pub channels: u8,
+    pub direction: AudioDirection,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub enum PairingMessage {
     /// Bootstrap channel announces this side's identity.

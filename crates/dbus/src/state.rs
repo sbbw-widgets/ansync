@@ -8,7 +8,7 @@ use ansync_core::DeviceId;
 use ansync_crypto::IdentityKeypair;
 use ansync_pairing::PeerStore;
 use ansync_permissions::PermissionsStore;
-use ansync_proto::CameraConfig;
+use ansync_proto::{AudioDirection, CameraConfig};
 use tokio::sync::mpsc::UnboundedSender;
 
 /// Actions D-Bus interfaces dispatch back into `daemon-core`. Sent on
@@ -33,6 +33,20 @@ pub enum DaemonAction {
     /// Stop the camera pipeline for `device` (sink unregistered,
     /// stream closed).
     StopCamera { device: DeviceId },
+    /// Bring up the audio route in `direction`. `HostToDevice` pumps
+    /// the host's default capture into the peer's playback;
+    /// `DeviceToHost` pumps the peer's microphone into a virtual
+    /// PipeWire source. `Both` is the obvious union.
+    StartAudioRoute { device: DeviceId, direction: AudioDirection },
+    /// Tear the audio route down regardless of direction.
+    StopAudioRoute { device: DeviceId },
+    /// Sugar for `StartAudioRoute { direction: DeviceToHost }`.
+    StartMicrophone { device: DeviceId },
+    StopMicrophone { device: DeviceId },
+    /// Read the host's Wayland clipboard and push it to `device`
+    /// over a fresh `StreamKind::Clipboard`. Gated by
+    /// `Permission::ClipboardOut`.
+    SyncClipboard { device: DeviceId },
 }
 
 pub struct DaemonState {

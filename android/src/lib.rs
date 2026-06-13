@@ -19,7 +19,7 @@ use ansync_crypto::IdentityKeypair;
 use ansync_files::{AutoAcceptPolicy, receive_file};
 use ansync_pairing::cable::bootstrap_companion;
 use ansync_permissions::{PermissionsError, PermissionsStore};
-use ansync_proto::{ControlMessage, Envelope, FsOpMessage, InputMessage, Message};
+use ansync_proto::{ClipboardMessage, ControlMessage, Envelope, FsOpMessage, InputMessage, Message};
 use ansync_transport::{
     Connection, QuicConnection, QuicStream, QuicTransport, Stream as _, StreamKind,
 };
@@ -120,6 +120,17 @@ struct ActiveSession {
     /// for the Kotlin polling loop. Mirrors the FS request channel
     /// pattern.
     camera_ctrl_rx: Arc<AsyncMutex<UnboundedReceiver<Vec<u8>>>>,
+    /// Inbound `ControlMessage::StartAudioRoute` / `StopAudioRoute`.
+    /// Same tag-binary fanout pattern as camera_ctrl_rx.
+    audio_ctrl_rx: Arc<AsyncMutex<UnboundedReceiver<Vec<u8>>>>,
+    /// Outbound device→host Audio stream for mic forwarding.
+    /// Lazy-opened on the first `nativeSendAudioChunk` (device-side).
+    outbound_audio: Arc<AsyncMutex<Option<QuicStream>>>,
+    /// Receiver side of host→device PCM. Kotlin polls it via
+    /// `nativePollAudioChunk` and writes to AudioTrack.
+    audio_in_rx: Arc<AsyncMutex<UnboundedReceiver<Vec<u8>>>>,
+    /// Inbound clipboard text from the host. UTF-8 bytes.
+    clipboard_in_rx: Arc<AsyncMutex<UnboundedReceiver<String>>>,
 }
 
 #[unsafe(no_mangle)]
@@ -298,6 +309,15 @@ pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativeOpenConnection
     let (camera_ctrl_tx, camera_ctrl_rx) = unbounded_channel::<Vec<u8>>();
     let camera_ctrl_tx = Arc::new(camera_ctrl_tx);
 
+    let (audio_ctrl_tx, audio_ctrl_rx) = unbounded_channel::<Vec<u8>>();
+    let audio_ctrl_tx = Arc::new(audio_ctrl_tx);
+
+    let (audio_in_tx, audio_in_rx) = unbounded_channel::<Vec<u8>>();
+    let audio_in_tx = Arc::new(audio_in_tx);
+
+    let (clip_in_tx, clip_in_rx) = unbounded_channel::<String>();
+    let clip_in_tx = Arc::new(clip_in_tx);
+
     let conn_arc = Arc::new(conn);
     let download_dir = {
         let slot = state_slot().lock().expect("state mutex poisoned");
@@ -321,6 +341,9 @@ pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativeOpenConnection
         fs_reply_rx.clone(),
         input_tx_arc.clone(),
         camera_ctrl_tx.clone(),
+        audio_ctrl_tx.clone(),
+        audio_in_tx.clone(),
+        clip_in_tx.clone(),
     ));
 
     let session = ActiveSession {
@@ -332,6 +355,10 @@ pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativeOpenConnection
         fs_reply_tx,
         outbound_camera: Arc::new(AsyncMutex::new(None)),
         camera_ctrl_rx: Arc::new(AsyncMutex::new(camera_ctrl_rx)),
+        audio_ctrl_rx: Arc::new(AsyncMutex::new(audio_ctrl_rx)),
+        outbound_audio: Arc::new(AsyncMutex::new(None)),
+        audio_in_rx: Arc::new(AsyncMutex::new(audio_in_rx)),
+        clipboard_in_rx: Arc::new(AsyncMutex::new(clip_in_rx)),
     };
     let mut slot = state_slot().lock().expect("state mutex poisoned");
     if let Some(s) = slot.as_mut() {
@@ -348,6 +375,9 @@ async fn streams_accept_loop(
     fs_reply_rx: Arc<AsyncMutex<UnboundedReceiver<Vec<u8>>>>,
     input_inbound_tx: Arc<UnboundedSender<Vec<u8>>>,
     camera_ctrl_tx: Arc<UnboundedSender<Vec<u8>>>,
+    audio_ctrl_tx: Arc<UnboundedSender<Vec<u8>>>,
+    audio_in_tx: Arc<UnboundedSender<Vec<u8>>>,
+    clip_in_tx: Arc<UnboundedSender<String>>,
 ) {
     let permissions: Arc<dyn PermissionsStore> = Arc::new(PermissivePermissions);
     loop {
@@ -392,8 +422,17 @@ async fn streams_accept_loop(
                 tokio::spawn(fs_serve_loop(stream, tx, rx));
             }
             StreamKind::Control => {
-                let tx = camera_ctrl_tx.clone();
-                tokio::spawn(control_recv_loop(stream, (*tx).clone()));
+                let cam_tx = camera_ctrl_tx.clone();
+                let aud_tx = audio_ctrl_tx.clone();
+                tokio::spawn(control_recv_loop(stream, (*cam_tx).clone(), (*aud_tx).clone()));
+            }
+            StreamKind::Audio => {
+                let tx = audio_in_tx.clone();
+                tokio::spawn(audio_in_loop(stream, (*tx).clone()));
+            }
+            StreamKind::Clipboard => {
+                let tx = clip_in_tx.clone();
+                tokio::spawn(clipboard_in_loop(stream, (*tx).clone()));
             }
             other => {
                 warn!("streams_accept_loop: dropping unexpected stream {other:?}");
@@ -685,7 +724,11 @@ impl<'a> Cursor<'a> {
 ///                        u8 aspect(0=Crop,1=Letterbox,2=Stretch) |
 ///                        u8 stabilization
 ///   tag 1  StopCamera  : (no payload)
-async fn control_recv_loop(mut stream: QuicStream, tx: UnboundedSender<Vec<u8>>) {
+async fn control_recv_loop(
+    mut stream: QuicStream,
+    camera_tx: UnboundedSender<Vec<u8>>,
+    audio_tx: UnboundedSender<Vec<u8>>,
+) {
     loop {
         let bytes = match stream.recv().await {
             Ok(b) => b,
@@ -705,7 +748,7 @@ async fn control_recv_loop(mut stream: QuicStream, tx: UnboundedSender<Vec<u8>>)
                 continue;
             }
         };
-        let blob = match env.message {
+        match env.message {
             Message::Control(ControlMessage::StartCamera(cfg)) => {
                 let mut out = Vec::with_capacity(32);
                 out.push(0u8);
@@ -726,16 +769,95 @@ async fn control_recv_loop(mut stream: QuicStream, tx: UnboundedSender<Vec<u8>>)
                     ansync_proto::CameraAspect::Stretch => 2,
                 });
                 out.push(if cfg.stabilization { 1 } else { 0 });
-                out
+                if camera_tx.send(out).is_err() {
+                    info!("control_recv_loop: camera receiver dropped; exiting");
+                    return;
+                }
             }
-            Message::Control(ControlMessage::StopCamera) => vec![1u8],
+            Message::Control(ControlMessage::StopCamera) => {
+                if camera_tx.send(vec![1u8]).is_err() {
+                    return;
+                }
+            }
+            Message::Control(ControlMessage::StartAudioRoute { direction }) => {
+                let dir_byte = match direction {
+                    ansync_proto::AudioDirection::HostToDevice => 0u8,
+                    ansync_proto::AudioDirection::DeviceToHost => 1,
+                    ansync_proto::AudioDirection::Both => 2,
+                };
+                if audio_tx.send(vec![0u8, dir_byte]).is_err() {
+                    return;
+                }
+            }
+            Message::Control(ControlMessage::StopAudioRoute) => {
+                if audio_tx.send(vec![1u8]).is_err() {
+                    return;
+                }
+            }
             other => {
-                warn!("control_recv_loop: ignoring non-camera Control message {other:?}");
+                warn!("control_recv_loop: ignoring Control message {other:?}");
+            }
+        }
+    }
+}
+
+/// Inbound `StreamKind::Audio` from the host. First frame is the
+/// `AudioStreamInit` header (postcard), subsequent frames are raw
+/// little-endian S16 PCM. We forward the raw PCM straight to Kotlin
+/// via the `audio_in_tx` channel — the header is logged + discarded
+/// because both sides hardcode 48 kHz stereo today.
+async fn audio_in_loop(mut stream: QuicStream, tx: UnboundedSender<Vec<u8>>) {
+    let _header = match stream.recv().await {
+        Ok(b) => b,
+        Err(_) => return,
+    };
+    info!("audio_in_loop: header received, streaming PCM");
+    loop {
+        match stream.recv().await {
+            Ok(bytes) => {
+                if tx.send(bytes.to_vec()).is_err() {
+                    info!("audio_in_loop: receiver dropped; exiting");
+                    return;
+                }
+            }
+            Err(ansync_transport::TransportError::Closed) => {
+                info!("audio_in_loop: stream closed");
+                return;
+            }
+            Err(e) => {
+                warn!("audio_in_loop: recv error: {e}");
+                return;
+            }
+        }
+    }
+}
+
+async fn clipboard_in_loop(mut stream: QuicStream, tx: UnboundedSender<String>) {
+    loop {
+        let bytes = match stream.recv().await {
+            Ok(b) => b,
+            Err(ansync_transport::TransportError::Closed) => return,
+            Err(e) => {
+                warn!("clipboard_in_loop: recv error: {e}");
+                return;
+            }
+        };
+        let msg: ClipboardMessage = match postcard::from_bytes(&bytes) {
+            Ok(m) => m,
+            Err(e) => {
+                warn!("clipboard_in_loop: decode failed: {e}");
                 continue;
             }
         };
-        if tx.send(blob).is_err() {
-            info!("control_recv_loop: receiver dropped; exiting");
+        let text = match msg {
+            ClipboardMessage::Text { content } => content,
+            ClipboardMessage::Blob { mime, .. } => {
+                warn!("clipboard_in_loop: ignoring blob (mime={mime})");
+                continue;
+            }
+        };
+        if tx.send(text).is_err() {
+            info!("clipboard_in_loop: receiver dropped; exiting");
             return;
         }
     }
@@ -1208,6 +1330,205 @@ pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativeStopCameraStre
         *guard = None;
     });
     jni::sys::JNI_TRUE
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativePollAudioControl<'local>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+) -> jni::sys::jbyteArray {
+    let rx = {
+        let slot = state_slot().lock().expect("state mutex poisoned");
+        match slot.as_ref().and_then(|s| s.session.as_ref()) {
+            Some(sess) => sess.audio_ctrl_rx.clone(),
+            None => return std::ptr::null_mut(),
+        }
+    };
+    let bytes = runtime().block_on(async move {
+        let mut guard = rx.lock().await;
+        guard.recv().await
+    });
+    match bytes {
+        Some(b) => match env.byte_array_from_slice(&b) {
+            Ok(arr) => arr.into_raw(),
+            Err(e) => {
+                error!("nativePollAudioControl: byte_array_from_slice: {e}");
+                std::ptr::null_mut()
+            }
+        },
+        None => std::ptr::null_mut(),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativePollAudioChunk<'local>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+) -> jni::sys::jbyteArray {
+    let rx = {
+        let slot = state_slot().lock().expect("state mutex poisoned");
+        match slot.as_ref().and_then(|s| s.session.as_ref()) {
+            Some(sess) => sess.audio_in_rx.clone(),
+            None => return std::ptr::null_mut(),
+        }
+    };
+    let bytes = runtime().block_on(async move {
+        let mut guard = rx.lock().await;
+        guard.recv().await
+    });
+    match bytes {
+        Some(b) => match env.byte_array_from_slice(&b) {
+            Ok(arr) => arr.into_raw(),
+            Err(e) => {
+                error!("nativePollAudioChunk: byte_array_from_slice: {e}");
+                std::ptr::null_mut()
+            }
+        },
+        None => std::ptr::null_mut(),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativeSendAudioChunk<'local>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    chunk: JByteArray<'local>,
+) -> jboolean {
+    let bytes = match env.convert_byte_array(&chunk) {
+        Ok(b) => b,
+        Err(e) => {
+            error!("nativeSendAudioChunk: convert_byte_array: {e}");
+            return jni::sys::JNI_FALSE;
+        }
+    };
+    let (conn, outbound_audio) = {
+        let slot = state_slot().lock().expect("state mutex poisoned");
+        match slot.as_ref().and_then(|s| s.session.as_ref()) {
+            Some(sess) => (sess.conn.clone(), sess.outbound_audio.clone()),
+            None => {
+                warn!("nativeSendAudioChunk: no active session");
+                return jni::sys::JNI_FALSE;
+            }
+        }
+    };
+    let result = runtime().block_on(async move {
+        let mut guard = outbound_audio.lock().await;
+        if guard.is_none() {
+            let mut stream = conn.open(StreamKind::Audio).await?;
+            let init = ansync_proto::AudioStreamInit {
+                sample_rate: 48_000,
+                channels: 2,
+                direction: ansync_proto::AudioDirection::DeviceToHost,
+            };
+            let header = postcard::to_allocvec(&init)
+                .map_err(|e| ansync_transport::TransportError::Handshake(format!("encode header: {e}")))?;
+            stream.send(Bytes::from(header)).await?;
+            *guard = Some(stream);
+        }
+        guard
+            .as_mut()
+            .expect("just inserted")
+            .send(Bytes::from(bytes))
+            .await
+    });
+    match result {
+        Ok(()) => jni::sys::JNI_TRUE,
+        Err(e) => {
+            warn!("nativeSendAudioChunk: send failed: {e}");
+            jni::sys::JNI_FALSE
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativeStopAudioStream<'local>(
+    _env: JNIEnv<'local>,
+    _class: JClass<'local>,
+) -> jboolean {
+    let outbound_audio = {
+        let slot = state_slot().lock().expect("state mutex poisoned");
+        match slot.as_ref().and_then(|s| s.session.as_ref()) {
+            Some(sess) => sess.outbound_audio.clone(),
+            None => return jni::sys::JNI_FALSE,
+        }
+    };
+    runtime().block_on(async move {
+        let mut guard = outbound_audio.lock().await;
+        *guard = None;
+    });
+    jni::sys::JNI_TRUE
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativePollClipboardText<'local>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+) -> jni::sys::jstring {
+    let rx = {
+        let slot = state_slot().lock().expect("state mutex poisoned");
+        match slot.as_ref().and_then(|s| s.session.as_ref()) {
+            Some(sess) => sess.clipboard_in_rx.clone(),
+            None => return std::ptr::null_mut(),
+        }
+    };
+    let text = runtime().block_on(async move {
+        let mut guard = rx.lock().await;
+        guard.recv().await
+    });
+    match text {
+        Some(s) => match env.new_string(s) {
+            Ok(js) => js.into_raw(),
+            Err(e) => {
+                error!("nativePollClipboardText: new_string failed: {e}");
+                std::ptr::null_mut()
+            }
+        },
+        None => std::ptr::null_mut(),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativeSendClipboardText<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    text: JString<'local>,
+) -> jboolean {
+    let text: String = match env.get_string(&text) {
+        Ok(s) => s.into(),
+        Err(e) => {
+            error!("nativeSendClipboardText: get_string failed: {e}");
+            return jni::sys::JNI_FALSE;
+        }
+    };
+    let conn = {
+        let slot = state_slot().lock().expect("state mutex poisoned");
+        match slot.as_ref().and_then(|s| s.session.as_ref()) {
+            Some(sess) => sess.conn.clone(),
+            None => {
+                warn!("nativeSendClipboardText: no active session");
+                return jni::sys::JNI_FALSE;
+            }
+        }
+    };
+    let msg = ClipboardMessage::Text { content: text };
+    let payload = match postcard::to_allocvec(&msg) {
+        Ok(b) => b,
+        Err(e) => {
+            warn!("nativeSendClipboardText: encode failed: {e}");
+            return jni::sys::JNI_FALSE;
+        }
+    };
+    let result = runtime().block_on(async move {
+        let mut stream = conn.open(StreamKind::Clipboard).await?;
+        stream.send(Bytes::from(payload)).await
+    });
+    match result {
+        Ok(()) => jni::sys::JNI_TRUE,
+        Err(e) => {
+            warn!("nativeSendClipboardText: send failed: {e}");
+            jni::sys::JNI_FALSE
+        }
+    }
 }
 
 #[unsafe(no_mangle)]
