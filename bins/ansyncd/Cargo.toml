@@ -15,12 +15,23 @@ path = "src/main.rs"
 ansync-core.workspace = true
 ansync-daemon-core.workspace = true
 ansync-dbus.workspace = true
-ansync-video.workspace = true
-bytes.workspace = true
+ansync-video = { workspace = true, optional = true }
+bytes = { workspace = true, optional = true }
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 tracing-journald.workspace = true
 clap.workspace = true
-eframe.workspace = true
-egui.workspace = true
+eframe = { workspace = true, optional = true }
+egui = { workspace = true, optional = true }
+
+[features]
+default = []
+# Step 6 standalone test path. Enables the `--play-file PATH` flag
+# that feeds the decoder from a local Annex-B recording without an
+# Android companion or QUIC stream. Strictly a dev / CI affordance —
+# release builds (and the Nix derivation in Step 14) must keep this
+# off so the daemon cannot be coerced into reading arbitrary local
+# media files via CLI, and so eframe / wgpu / ansync-video stay out
+# of the production link entirely.
+dev-playback = ["dep:ansync-video", "dep:eframe", "dep:egui", "dep:bytes"]

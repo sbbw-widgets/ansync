@@ -1,16 +1,21 @@
 //! `ansyncd` — the ansync daemon.
 //!
 //! Hosts the D-Bus surface, the QUIC transport, and the screen mirror GUI
-//! window (eframe + wgpu) when a client invokes `ShowScreen` (or when
-//! `--play-file` is passed for Step 6 standalone testing).
+//! window (eframe + wgpu) when a client invokes `ShowScreen`.
+//!
+//! The `dev-playback` feature additionally exposes a `--play-file
+//! PATH` flag that drives the decoder from a local Annex-B recording.
+//! This is a Step-6 test affordance only; release builds must be
+//! compiled without the feature.
 
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use ansync_daemon_core::{Daemon, DaemonConfig};
 use clap::Parser;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
+#[cfg(feature = "dev-playback")]
 mod mirror_window;
 
 #[derive(Debug, Parser)]
@@ -29,9 +34,9 @@ struct Args {
     #[arg(long)]
     permissions_dir: Option<PathBuf>,
     /// Bring up the mirror window and feed it from a local Annex-B
-    /// recording (`.h264` / `.h265`). Step 6 test path — bypasses the
-    /// daemon's D-Bus / QUIC surface entirely so the decode + render
-    /// hot path can be exercised without an Android companion.
+    /// recording (`.h264` / `.h265`). Dev-only — only present when
+    /// compiled with `--features dev-playback`.
+    #[cfg(feature = "dev-playback")]
     #[arg(long, value_name = "PATH")]
     play_file: Option<PathBuf>,
 }
@@ -44,18 +49,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .enable_all()
         .build()?;
 
+    #[cfg(feature = "dev-playback")]
     if let Some(path) = args.play_file.clone() {
-        let shared: mirror_window::LatestFrame = Arc::new(Mutex::new(None));
-        mirror_window::spawn_play_file(&runtime, path, shared.clone());
-        // `run` blocks the calling thread on the eframe event loop.
-        // When the window closes, drop the tokio runtime to abort
-        // the decoder loop.
-        let result = mirror_window::run(shared);
-        drop(runtime);
-        return result;
+        return run_play_file(runtime, path);
     }
 
     runtime.block_on(run_daemon(args))
+}
+
+#[cfg(feature = "dev-playback")]
+fn run_play_file(
+    runtime: tokio::runtime::Runtime,
+    path: PathBuf,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::sync::Mutex;
+
+    let shared: mirror_window::LatestFrame = Arc::new(Mutex::new(None));
+    mirror_window::spawn_play_file(&runtime, path, shared.clone());
+    // `run` blocks the calling thread on the eframe event loop. When
+    // the window closes, drop the tokio runtime to abort the decoder
+    // loop.
+    let result = mirror_window::run(shared);
+    drop(runtime);
+    result
 }
 
 async fn run_daemon(args: Args) -> Result<(), Box<dyn std::error::Error>> {

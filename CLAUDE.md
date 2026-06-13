@@ -44,7 +44,7 @@ El `flake.nix` pinea `nixpkgs` a `549bd84d6279f9852cae6225e372cc67fb91a4c1` para
 
 ## Estado actual
 
-**Step 6 completo**: `HostDecoder` ahora instance-owned (slot `Arc<Mutex<Option<CapturedFrame>>>`), `DecodedFrame` con `stride` + `Bgra8`/`Rgba8`. `ansync_video::feed::AnnexBFile` itera Access Units desde `.h264`/`.h265` para alimentar al decoder sin companion Android. `ansyncd::mirror_window` levanta `eframe` con `Renderer::Wgpu`, convierte NV12/I420/BGRA/RGBA → `ColorImage` y sube vía `Context::load_texture`. Nuevo flag `--play-file PATH` en `ansyncd` corre solo decode + window (D-Bus skip). `flake.nix` exporta `LIBCLANG_PATH` para bindgen.
+**Step 6 completo**: `HostDecoder` ahora instance-owned (slot `Arc<Mutex<Option<CapturedFrame>>>`), `DecodedFrame` con `stride` + `Bgra8`/`Rgba8`. `ansync_video::feed::AnnexBFile` itera Access Units desde `.h264`/`.h265` para alimentar al decoder sin companion Android. `ansyncd::mirror_window` levanta `eframe` con `Renderer::Wgpu`, convierte NV12/I420/BGRA/RGBA → `ColorImage` y sube vía `Context::load_texture`. Flag `--play-file PATH` + módulo `mirror_window` viven detrás del feature **`dev-playback`** (off por default) — prod no linkea `eframe`/`egui`/`ansync-video` ni acepta el flag. `flake.nix` exporta `LIBCLANG_PATH` para bindgen.
 
 **Próximo**: Step 7 — `ansync_input` uinput (Android como kbd/touch/stylus/gamepad del PC) + reverse vía AccessibilityService en el companion Kotlin. Acá arranca formalmente la app Android en `android/` — el companion se vuelve necesario para producir streams reales de input + capture H.264 (Step 6 ya quedó probado vía `--play-file`).
 

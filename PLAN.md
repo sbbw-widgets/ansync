@@ -314,7 +314,7 @@ Entregables:
 - `ansync_video::feed::AnnexBFile`: lector streaming de `.h264` / `.h265` Annex-B sobre `tokio::fs`. Detecta start-codes 3/4 bytes, agrupa NALs por Access Unit (AUD-delimited o primer VCL post-NAL no-VCL), expone `next_packet() -> AnnexBPacket`. Suficiente para alimentar al decoder en Step 6 sin companion Android.
 - `ansyncd::mirror_window`: `eframe::run_native` con `Renderer::Wgpu`. `MirrorApp` peekea el slot compartido, convierte NV12 / I420 / BGRA / RGBA → `egui::ColorImage` (BT.601 limited range, Q8 integer math), `ctx.load_texture` lo sube al texture manager de egui (wgpu por debajo). El widget mantiene aspect ratio centrando la imagen.
 - `ansyncd::mirror_window::run_play_file_loop`: bombea `AnnexBFile` → `HostDecoder::feed` → `take` → slot compartido, paced a ~30 fps. Falla limpio si `local_decoder_caps()` no soporta el codec.
-- `bins/ansyncd` CLI: nuevo flag `--play-file PATH`. Sin él se ejecuta el daemon como antes; con él se levanta solo la mirror window + decode loop (D-Bus / mDNS skip por simplicidad — Step 6 es path de test standalone).
+- `bins/ansyncd` CLI: nuevo flag `--play-file PATH` detrás del feature **`dev-playback`** (off por default). Con feature off el flag no existe, `mirror_window` no se compila, y `eframe`/`egui`/`bytes`/`ansync-video` quedan fuera del link de prod. Con feature on se levanta solo la mirror window + decode loop (D-Bus / mDNS skip por simplicidad — Step 6 es path de test standalone). Step 14 (Nix derivation) tiene que dejar la feature off.
 - `flake.nix`: `LIBCLANG_PATH` exportado para que `bindgen` (transitivo vía VA-API + NVDEC en ferricast) parsee headers dentro del shell de nix.
 
 ### Step 5 — cerrado
