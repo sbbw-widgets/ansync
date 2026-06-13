@@ -44,9 +44,9 @@ El `flake.nix` pinea `nixpkgs` a `549bd84d6279f9852cae6225e372cc67fb91a4c1` para
 
 ## Estado actual
 
-**Step 2 completo**: framing `proto`, identidad Ed25519 persistente + Noise XX en `crypto`, QUIC + rustls + pinning Ed25519 vía `x509-parser`/`rcgen` en `transport`, subcomandos `ansyncctl identity init|show`, test e2e localhost (`cargo test -p ansync-transport --test echo`).
+**Step 3 completo**: `MdnsDiscovery` anuncio + browse, `PeerStore` toml en `$XDG_DATA_HOME/ansync/peers/`, protocolo cable `bootstrap_host`/`bootstrap_companion` + orquestación `pair_host_via_adb`, subcomandos `ansyncctl discover` y `ansyncctl pair`.
 
-**Próximo**: Step 3 — `discovery` mDNS + `pairing` cable bootstrap + `PeerStore` en `$XDG_DATA_HOME/ansync/peers/`.
+**Próximo**: Step 4 — `permissions` storage + `ansync_dbus` Manager/Device/Permissions + integración con `ansyncd` (systemd user unit, journald activo).
 
 Ver `PLAN.md` § Roadmap para la lista completa.
 

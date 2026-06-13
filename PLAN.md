@@ -191,7 +191,7 @@ ansync/
 
 - [x] **Step 1** — Skeleton workspace + flake + crates con traits + Cargo wiring + docs
 - [x] **Step 2** — `proto` + `crypto` + `transport` QUIC echo end-to-end con pinning Ed25519
-- [ ] **Step 3** — `discovery` mDNS + `pairing` cable bootstrap → llave Ed25519 persistida en `$XDG_DATA_HOME/ansync/peers/`
+- [x] **Step 3** — `discovery` mDNS + `pairing` cable bootstrap → llave Ed25519 persistida en `$XDG_DATA_HOME/ansync/peers/`
 - [ ] **Step 4** — `permissions` storage + `dbus` Manager + Device + Permissions interfaces + systemd user unit + journald
 - [ ] **Step 5** — Extender `ferricast-encoder/decoder` con HEVC (NVENC + VAAPI)
 - [ ] **Step 6** — `video` decode + `ansyncd` egui window — screen mirror end-to-end H.264 → wgpu texture
@@ -283,9 +283,20 @@ Entregables:
 - `ansyncctl identity {init|show}` lee/escribe `$XDG_DATA_HOME/ansync/identity.key`.
 - Test e2e `crates/transport/tests/echo.rs`: dos endpoints en `127.0.0.1`, pinning Ed25519, Noise XX 3-way handshake sobre el control stream, hello cifrado + echo.
 
-### Step 3 — arranque
+### Step 3 — cerrado
 
-- `ansync_discovery::Discovery` impl mDNS-SD anunciando `_ansync._udp.local.` con TXT (`id=`, `name=`, `caps=`).
-- `ansync_pairing` flujo cable ADB: detectar device vía `adb devices`, abrir socket vía `adb reverse`, intercambiar Ed25519 pubkeys + PIN, persistir el peer en `$XDG_DATA_HOME/ansync/peers/{device_id}.toml`.
-- `PeerStore` con load/save por device id (toml + bitflags `Capabilities`).
-- `ansyncctl pair` que conduce el flujo end-to-end.
+Entregables:
+
+- `discovery::MdnsDiscovery` anuncia `_ansync._udp.local.` con TXT `id=<pubkey hex 64>`, `name=<utf8>`, `caps=<u32 hex>`. `browse()` devuelve un `Pin<Box<Stream<Item=DiscoveredDevice>>>` derivado del `Receiver` de mdns-sd.
+- `pairing::store::PeerStore` persiste en `$XDG_DATA_HOME/ansync/peers/{device_id}.toml` con perms `0700` directorio + `0600` archivo. API `put/get/remove/list`. Escritura atómica vía `*.toml.tmp` + rename.
+- `pairing::cable` define el protocolo cable sobre cualquier stream `AsyncRead + AsyncWrite`: `bootstrap_host` espera `PairingMessage::BootstrapHello` y responde `BootstrapAck`; `bootstrap_companion` simétrico. Cable assures security ⇒ sin PIN; caps quedan vacías hasta la primera conexión control.
+- `pairing::pair_host_via_adb(serial, identity, name)` orquesta `adb reverse tcp:port tcp:port`, TCP listen, bootstrap, cleanup de la reverse, devuelve `StoredPeer`.
+- `ansyncctl discover [--seconds N]` browse mDNS por N segundos (default 5).
+- `ansyncctl pair [--serial …] [--name …]` auto-selecciona si hay 1 device adb, exige `--serial` si hay varios.
+
+### Step 4 — arranque
+
+- `ansync_permissions::PermissionsStore` envuelve `DevicePermissions` por device id, toml en `$XDG_CONFIG_HOME/ansync/devices/{id}.toml`.
+- `ansync_dbus`: interfaces `org.gameros.Ansync1.Manager`, `.Device.{id}`, `.Permissions.{id}` con zbus 5 (tokio). Daemon expone, CLI consume.
+- `ansync_daemon_core::Daemon::run()` enciende mdns announce, dbus server, accept loop QUIC, dispatch a handlers por device.
+- systemd user unit (`ansyncd.service`) + `tracing-journald` activado por defecto en `bins/ansyncd`.
