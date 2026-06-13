@@ -11,6 +11,14 @@ use ansync_crypto::PeerIdentity;
 use async_trait::async_trait;
 use bytes::Bytes;
 
+#[cfg(feature = "quic")]
+pub mod pinning;
+#[cfg(feature = "quic")]
+pub mod quic;
+
+#[cfg(feature = "quic")]
+pub use quic::{QuicConnection, QuicServer, QuicStream, QuicTransport};
+
 #[derive(Debug, thiserror::Error)]
 pub enum TransportError {
     #[error("connection closed")]
