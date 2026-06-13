@@ -13,3 +13,4 @@ serde.workspace = true
 postcard.workspace = true
 bytes.workspace = true
 thiserror.workspace = true
+tokio = { workspace = true, features = ["io-util"] }

@@ -7,6 +7,13 @@
 use ansync_core::{Capabilities, DeviceId, DeviceName, DevicePermissions, Permission};
 use serde::{Deserialize, Serialize};
 
+pub mod frame;
+
+pub use frame::{
+    FrameError, MAX_FRAME_SIZE, decode_envelope, encode_envelope, encode_message, read_envelope,
+    read_frame, read_typed, write_envelope, write_frame, write_typed,
+};
+
 pub const PROTOCOL_VERSION: u16 = 1;
 
 #[derive(Debug, Serialize, Deserialize)]
