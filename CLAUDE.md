@@ -44,9 +44,9 @@ El `flake.nix` pinea `nixpkgs` a `549bd84d6279f9852cae6225e372cc67fb91a4c1` para
 
 ## Estado actual
 
-**Step 4 completo**: `FilePermissionsStore` (toml, 0600/0700), `ansync_dbus` zbus 5 con `DaemonState` + interfaces `Manager`/`Device`/`PermissionsIface` registrando un par por peer al startup, `daemon-core::Daemon` orquesta identity + stores + mdns announce + dbus serve + handler de SIGTERM/SIGINT, `ansyncd` con flags CLI y `contrib/ansyncd.service` (user unit sandboxed).
+**Step 5 completo**: `ferricast-core` con `H265Profile` + `max_h265_profile`. `ferricast-encoder::nvenc::NvencEncoder<C>` generic (sealed `NvencCodec`, H.264 + HEVC markers, feature `nvenc-hevc`). VAAPI HEVC encoder completo en `ferricast-encoder::h265` (bitstream + VPS/SPS/PPS HEVC + parameter buffers + packed headers, feature `vaapi-hevc`). `H265Encoder` facade NVENC → VAAPI sin SW fallback. `ferricast-decoder::nvdec::NvdecDecoder<C>` con markers H.264 + HEVC (features `nvdec-decode` / `nvdec-hevc-decode`), NVDEC ahora wired en el chain del `H264Decoder` facade. `H265Decoder` facade NVDEC → VAAPI + `VaapiH265Decoder` scaffold (probe + surface pool listos; slice submission marcado como pending, mismo patrón opt-in que el H.264 VAAPI decoder). `ansync_video` con `negotiate_codec`, `local_decoder_caps`, `HostDecoder` enum dispatch.
 
-**Próximo**: Step 5 — extender `ferricast-encoder`/`ferricast-decoder` con HEVC (NVENC + VAAPI) y wirear `ansync_video`.
+**Próximo**: Step 6 — `ansync_video` decode hot path + `ansyncd` egui window + wgpu texture upload — screen mirror end-to-end H.264 → render.
 
 Ver `PLAN.md` § Roadmap para la lista completa.
 

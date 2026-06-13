@@ -113,11 +113,14 @@ wl-clipboard-rs = "0.9"
 # CLI
 clap = { version = "4", features = ["derive"] }
 
-# Ferricast — sibling project at ../../ferricast. Path deps; wired in Steps 5 / 6.
-# Uncomment when those steps land.
-# ferricast-core = { path = "../../ferricast/crates/core" }
-# ferricast-encoder = { path = "../../ferricast/crates/encoder", default-features = false }
-# ferricast-decoder = { path = "../../ferricast/crates/decoder", default-features = false }
+# Ferricast — sibling project at ../../ferricast. Wired here (Step 5):
+# the encoder facade carries H.264 + HEVC (`nvenc-hevc` / `vaapi-hevc`),
+# the decoder carries H.264 + HEVC NVDEC and a VA-API HEVC scaffold.
+# `default-features = false` keeps fdk-aac / wayland-direct / etc out
+# of the link until Step 11 explicitly turns them on.
+ferricast-core = { path = "../../ferricast/crates/core" }
+ferricast-encoder = { path = "../../ferricast/crates/encoder", default-features = false, features = ["openh264", "vaapi", "nvenc", "nvenc-hevc", "vaapi-hevc"] }
+ferricast-decoder = { path = "../../ferricast/crates/decoder", default-features = false, features = ["openh264-decode", "nvdec-decode", "nvdec-hevc-decode", "vaapi-hevc-decode"] }
 
 [profile.release]
 lto = "thin"

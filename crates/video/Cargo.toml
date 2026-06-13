@@ -12,10 +12,13 @@ ansync-core.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
 thiserror.workspace = true
+tracing.workspace = true
 
-# Wired in Step 6 once HEVC support lands in ferricast.
-# ferricast-decoder = { workspace = true, optional = true }
+# Step 5 wires ferricast-decoder in directly. The H.264 facade picks
+# NVDEC → VA-API → openh264; the H.265 facade picks NVDEC → VA-API
+# (no SW fallback — HEVC is HW-only by design).
+ferricast-core.workspace = true
+ferricast-decoder.workspace = true
 
 [features]
 default = []
-# ferricast = ["dep:ferricast-decoder"]

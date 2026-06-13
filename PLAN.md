@@ -193,7 +193,7 @@ ansync/
 - [x] **Step 2** — `proto` + `crypto` + `transport` QUIC echo end-to-end con pinning Ed25519
 - [x] **Step 3** — `discovery` mDNS + `pairing` cable bootstrap → llave Ed25519 persistida en `$XDG_DATA_HOME/ansync/peers/`
 - [x] **Step 4** — `permissions` storage + `dbus` Manager + Device + Permissions interfaces + systemd user unit + journald
-- [ ] **Step 5** — Extender `ferricast-encoder/decoder` con HEVC (NVENC + VAAPI)
+- [x] **Step 5** — Extender `ferricast-encoder/decoder` con HEVC (NVENC + VAAPI) + wirear `ansync_video`
 - [ ] **Step 6** — `video` decode + `ansyncd` egui window — screen mirror end-to-end H.264 → wgpu texture
 - [ ] **Step 7** — `input` uinput — Android como kbd/touch/stylus para PC + reverse para controlar Android vía AccessibilityService
 - [ ] **Step 8** — `files` transfer push/pull (sin mount)
@@ -306,8 +306,18 @@ Entregables:
 - `bins/ansyncd`: CLI con `--device-name --identity --peers-dir --permissions-dir`, `tracing-journald` activo.
 - `bins/ansyncd/contrib/ansyncd.service`: user unit con sandboxing (`ProtectSystem=strict`, `ProtectHome=read-only`, `NoNewPrivileges`), journald stdout.
 
-### Step 5 — arranque
+### Step 5 — cerrado
 
-- Sumar HEVC al pipeline NVENC y VAAPI dentro de `ferricast-encoder` y `ferricast-decoder`.
-- Activar las path deps `ferricast-*` en `Cargo.toml`.
-- Wiring inicial en `ansync_video` (encoder host-side + decoder client-side) sin renderizar todavía.
+Entregables del lado ferricast:
+
+- `ferricast-core` expone `H265Profile { Main, Main10 }` + `max_h265_profile` en `DeviceCapabilities` y `EncoderConfig`.
+- `ferricast-encoder::nvenc::NvencEncoder<C>` generic sobre sealed `NvencCodec`; aliases `NvencH264Encoder` / `NvencH265Encoder`. Feature `nvenc-hevc` (default-off) habilita el marker HEVC.
+- `ferricast-encoder::h265` agrega VAAPI HEVC encoder completo: bitstream + headers VPS/SPS/PPS + parameter buffers + packed headers. Feature `vaapi-hevc`.
+- `H265Encoder` facade (NVENC → VAAPI, sin SW fallback) con `FERRICAST_H265_BACKEND` override.
+- `ferricast-decoder::nvdec::NvdecDecoder<C>` generic con markers H.264 + HEVC; aliases `NvdecH264Decoder` / `NvdecH265Decoder`. Features `nvdec-decode` / `nvdec-hevc-decode`. NVDEC ahora vive en el chain del `H264Decoder` facade (NVDEC → VAAPI opt-in → openh264).
+- `ferricast-decoder::h265` con `H265Decoder` facade (NVDEC → VAAPI) + `VaapiH265Decoder` scaffold (display + profile probe + surface pool; slice submission retorna error explícito, mismo patrón que el H.264 VAAPI decoder opt-in).
+
+Entregables del lado ansync:
+
+- `ansync/Cargo.toml` activa `ferricast-core` / `ferricast-encoder` / `ferricast-decoder` con feature set `["openh264","vaapi","nvenc","nvenc-hevc","vaapi-hevc"]` (encoder) y `["openh264-decode","nvdec-decode","nvdec-hevc-decode","vaapi-hevc-decode"]` (decoder).
+- `ansync_video` con `CodecCapabilities`, `negotiate_codec(peer, local)`, `local_decoder_caps()` (one-shot HW probe cacheado), `HostDecoder` enum dispatch sobre `H264Decoder | H265Decoder`. Sin render — Step 6.
