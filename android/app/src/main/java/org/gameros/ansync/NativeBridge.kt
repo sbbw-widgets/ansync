@@ -53,6 +53,20 @@ object NativeBridge {
      */
     external fun nativePollInputMessage(): ByteArray?
 
+    /**
+     * Block (in native) until the next remote `FsOpMessage` arrives
+     * from the host, then return the tag-binary encoding (see
+     * `FsOpCodec`). Returns `null` on session teardown.
+     */
+    external fun nativePollFsRequest(): ByteArray?
+
+    /**
+     * Submit the tag-binary reply for the most recent request returned
+     * by `nativePollFsRequest`. Sequential per Fs stream — callers
+     * MUST poll and reply in strict alternation.
+     */
+    external fun nativeFsReply(reply: ByteArray): Boolean
+
     /** Tear the active session down. Safe to call when no session is open. */
     external fun nativeClose()
 }

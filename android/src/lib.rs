@@ -18,7 +18,7 @@ use ansync_core::{DeviceId, DevicePermissions, Permission};
 use ansync_crypto::IdentityKeypair;
 use ansync_files::{AutoAcceptPolicy, receive_file};
 use ansync_permissions::{PermissionsError, PermissionsStore};
-use ansync_proto::InputMessage;
+use ansync_proto::{FsOpMessage, InputMessage};
 use ansync_transport::{
     Connection, QuicConnection, QuicStream, QuicTransport, Stream as _, StreamKind,
 };
@@ -100,6 +100,12 @@ struct ActiveSession {
     /// can call `nativePollInputMessage` from any thread without
     /// reading-while-spawning races against the recv task.
     input_rx: Arc<AsyncMutex<UnboundedReceiver<Vec<u8>>>>,
+    /// Per-Fs-stream pair of queues: native pushes inbound
+    /// `FsOpMessage` requests as tag-binary blobs for the Kotlin
+    /// worker; Kotlin replies through `fs_reply_tx` after running
+    /// the SAF op. Sequential per stream.
+    fs_req_rx: Arc<AsyncMutex<UnboundedReceiver<Vec<u8>>>>,
+    fs_reply_tx: Arc<UnboundedSender<Vec<u8>>>,
 }
 
 #[unsafe(no_mangle)]
@@ -271,6 +277,12 @@ pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativeOpenConnection
     let (input_tx, input_rx) = unbounded_channel::<Vec<u8>>();
     runtime().spawn(input_recv_loop(input_stream, input_tx));
 
+    let (fs_req_tx, fs_req_rx) = unbounded_channel::<Vec<u8>>();
+    let (fs_reply_tx, fs_reply_rx) = unbounded_channel::<Vec<u8>>();
+    let fs_req_tx = Arc::new(fs_req_tx);
+    let fs_reply_tx = Arc::new(fs_reply_tx);
+    let fs_reply_rx = Arc::new(AsyncMutex::new(fs_reply_rx));
+
     let conn_arc = Arc::new(conn);
     let download_dir = {
         let slot = state_slot().lock().expect("state mutex poisoned");
@@ -286,16 +298,20 @@ pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativeOpenConnection
         id_bytes.copy_from_slice(&expected_server[..16]);
         DeviceId(id_bytes)
     };
-    runtime().spawn(files_accept_loop(
+    runtime().spawn(streams_accept_loop(
         conn_arc.clone(),
         host_device_id,
         download_dir,
+        fs_req_tx.clone(),
+        fs_reply_rx.clone(),
     ));
 
     let session = ActiveSession {
         _conn: conn_arc,
         video_stream: Arc::new(AsyncMutex::new(video_stream)),
         input_rx: Arc::new(AsyncMutex::new(input_rx)),
+        fs_req_rx: Arc::new(AsyncMutex::new(fs_req_rx)),
+        fs_reply_tx,
     };
     let mut slot = state_slot().lock().expect("state mutex poisoned");
     if let Some(s) = slot.as_mut() {
@@ -304,40 +320,324 @@ pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativeOpenConnection
     jni::sys::JNI_TRUE
 }
 
-async fn files_accept_loop(
+async fn streams_accept_loop(
     conn: Arc<QuicConnection>,
     host_id: DeviceId,
     download_dir: PathBuf,
+    fs_req_tx: Arc<UnboundedSender<Vec<u8>>>,
+    fs_reply_rx: Arc<AsyncMutex<UnboundedReceiver<Vec<u8>>>>,
 ) {
     let permissions: Arc<dyn PermissionsStore> = Arc::new(PermissivePermissions);
     loop {
-        let (kind, mut stream) = match conn.accept().await {
+        let (kind, stream) = match conn.accept().await {
             Ok(v) => v,
             Err(ansync_transport::TransportError::Closed) => {
-                info!("files_accept_loop: connection closed");
+                info!("streams_accept_loop: connection closed");
                 return;
             }
             Err(e) => {
-                warn!("files_accept_loop: accept failed: {e}");
+                warn!("streams_accept_loop: accept failed: {e}");
                 return;
             }
         };
-        if kind != StreamKind::Files {
-            warn!("files_accept_loop: dropping unexpected stream {kind:?}");
-            drop(stream);
-            continue;
-        }
-        let policy = Arc::new(AutoAcceptPolicy {
-            root: download_dir.clone(),
-        });
-        let host_id = host_id.clone();
-        let perms = permissions.clone();
-        tokio::spawn(async move {
-            match receive_file(&host_id, perms.as_ref(), &mut stream, policy.as_ref()).await {
-                Ok(p) => info!("inbound file -> {}", p.display()),
-                Err(e) => warn!("inbound file failed: {e}"),
+        match kind {
+            StreamKind::Files => {
+                let mut stream = stream;
+                let policy = Arc::new(AutoAcceptPolicy {
+                    root: download_dir.clone(),
+                });
+                let host_id = host_id.clone();
+                let perms = permissions.clone();
+                tokio::spawn(async move {
+                    match receive_file(&host_id, perms.as_ref(), &mut stream, policy.as_ref()).await
+                    {
+                        Ok(p) => info!("inbound file -> {}", p.display()),
+                        Err(e) => warn!("inbound file failed: {e}"),
+                    }
+                });
             }
-        });
+            StreamKind::Fs => {
+                let tx = fs_req_tx.clone();
+                let rx = fs_reply_rx.clone();
+                tokio::spawn(fs_serve_loop(stream, tx, rx));
+            }
+            other => {
+                warn!("streams_accept_loop: dropping unexpected stream {other:?}");
+                drop(stream);
+            }
+        }
+    }
+}
+
+async fn fs_serve_loop(
+    mut stream: QuicStream,
+    req_tx: Arc<UnboundedSender<Vec<u8>>>,
+    reply_rx: Arc<AsyncMutex<UnboundedReceiver<Vec<u8>>>>,
+) {
+    loop {
+        let bytes = match stream.recv().await {
+            Ok(b) => b,
+            Err(ansync_transport::TransportError::Closed) => {
+                info!("fs_serve_loop: stream closed");
+                return;
+            }
+            Err(e) => {
+                warn!("fs_serve_loop: recv error: {e}");
+                return;
+            }
+        };
+        let msg: FsOpMessage = match postcard::from_bytes(&bytes) {
+            Ok(m) => m,
+            Err(e) => {
+                warn!("fs_serve_loop: malformed FsOpMessage: {e}");
+                let err_reply = FsOpMessage::Error {
+                    code: 5, // EIO
+                    message: "malformed request".into(),
+                };
+                if let Ok(bytes) = postcard::to_allocvec(&err_reply) {
+                    let _ = stream.send(Bytes::from(bytes)).await;
+                }
+                continue;
+            }
+        };
+        let req_blob = encode_fs_req_for_kotlin(&msg);
+        if req_tx.send(req_blob).is_err() {
+            info!("fs_serve_loop: req receiver gone; exiting");
+            return;
+        }
+        let reply_blob = {
+            let mut guard = reply_rx.lock().await;
+            match guard.recv().await {
+                Some(b) => b,
+                None => {
+                    info!("fs_serve_loop: reply sender gone; exiting");
+                    return;
+                }
+            }
+        };
+        let reply_msg = match decode_fs_reply_from_kotlin(&reply_blob) {
+            Ok(m) => m,
+            Err(e) => {
+                warn!("fs_serve_loop: bad reply blob: {e}");
+                FsOpMessage::Error {
+                    code: 5,
+                    message: format!("bad reply: {e}"),
+                }
+            }
+        };
+        let out = match postcard::to_allocvec(&reply_msg) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("fs_serve_loop: postcard encode reply: {e}");
+                return;
+            }
+        };
+        if let Err(e) = stream.send(Bytes::from(out)).await {
+            warn!("fs_serve_loop: stream send reply failed: {e}");
+            return;
+        }
+    }
+}
+
+/// Tag-binary FsOp wire format — native → Kotlin direction.
+///
+/// Layout per tag (multi-byte ints little-endian, strings are length-
+/// prefixed u32 + UTF-8 bytes, byte blobs are u32 + bytes):
+///   0 Stat(path)
+///   1 ReadDir(path)
+///   2 Open(path, flags u32)
+///   3 Read(handle u64, offset u64, len u32)
+///   4 Write(handle u64, offset u64, data blob)
+///   5 Close(handle u64)
+///   6 Create(path, mode u32)
+///   7 Unlink(path)
+///   8 Rename(from, to)
+///   9 Truncate(path, size u64)
+///  10 Chmod(path, mode u32)
+///
+/// Mirrored verbatim in Kotlin `FsOpCodec.kt`. Any change requires
+/// matching diffs on both files in the same commit.
+fn encode_fs_req_for_kotlin(msg: &FsOpMessage) -> Vec<u8> {
+    let mut out = Vec::with_capacity(64);
+    match msg {
+        FsOpMessage::Stat { path } => {
+            out.push(0);
+            write_str(&mut out, path);
+        }
+        FsOpMessage::ReadDir { path } => {
+            out.push(1);
+            write_str(&mut out, path);
+        }
+        FsOpMessage::Open { path, flags } => {
+            out.push(2);
+            write_str(&mut out, path);
+            out.extend_from_slice(&flags.to_le_bytes());
+        }
+        FsOpMessage::Read { handle, offset, len } => {
+            out.push(3);
+            out.extend_from_slice(&handle.to_le_bytes());
+            out.extend_from_slice(&offset.to_le_bytes());
+            out.extend_from_slice(&len.to_le_bytes());
+        }
+        FsOpMessage::Write { handle, offset, data } => {
+            out.push(4);
+            out.extend_from_slice(&handle.to_le_bytes());
+            out.extend_from_slice(&offset.to_le_bytes());
+            write_blob(&mut out, data);
+        }
+        FsOpMessage::Close { handle } => {
+            out.push(5);
+            out.extend_from_slice(&handle.to_le_bytes());
+        }
+        FsOpMessage::Create { path, mode } => {
+            out.push(6);
+            write_str(&mut out, path);
+            out.extend_from_slice(&mode.to_le_bytes());
+        }
+        FsOpMessage::Unlink { path } => {
+            out.push(7);
+            write_str(&mut out, path);
+        }
+        FsOpMessage::Rename { from, to } => {
+            out.push(8);
+            write_str(&mut out, from);
+            write_str(&mut out, to);
+        }
+        FsOpMessage::Truncate { path, size } => {
+            out.push(9);
+            write_str(&mut out, path);
+            out.extend_from_slice(&size.to_le_bytes());
+        }
+        FsOpMessage::Chmod { path, mode } => {
+            out.push(10);
+            write_str(&mut out, path);
+            out.extend_from_slice(&mode.to_le_bytes());
+        }
+        FsOpMessage::Ok
+        | FsOpMessage::StatReply { .. }
+        | FsOpMessage::ReadDirReply { .. }
+        | FsOpMessage::OpenReply { .. }
+        | FsOpMessage::ReadReply { .. }
+        | FsOpMessage::WriteReply { .. }
+        | FsOpMessage::CreateReply { .. }
+        | FsOpMessage::Error { .. } => {
+            // Reply-side variants — should not appear as inbound requests.
+            // Emit a single zero byte so Kotlin can flag "unexpected".
+            out.clear();
+            out.push(0xFF);
+        }
+    }
+    out
+}
+
+/// Tag-binary FsOp reply wire — Kotlin → native. Tag layout:
+///   0  Ok                 : (no payload)
+///   1  StatReply          : meta(size u64, mode u32, mtime u64, is_dir u8)
+///   2  ReadDirReply       : count u32, then count × { name(str), meta(20B) }
+///   3  OpenReply          : handle u64
+///   4  ReadReply          : data(blob)
+///   5  WriteReply         : written u32
+///   6  CreateReply        : handle u64
+///   7  Error              : code i32, message(str)
+fn decode_fs_reply_from_kotlin(bytes: &[u8]) -> Result<FsOpMessage, String> {
+    let mut c = Cursor::new(bytes);
+    let tag = c.take(1)?[0];
+    match tag {
+        0 => Ok(FsOpMessage::Ok),
+        1 => {
+            let meta = read_meta(&mut c)?;
+            Ok(FsOpMessage::StatReply { meta })
+        }
+        2 => {
+            let count = c.take_u32()?;
+            let mut entries = Vec::with_capacity(count as usize);
+            for _ in 0..count {
+                let name = c.take_str()?;
+                let meta = read_meta(&mut c)?;
+                entries.push(ansync_proto::FsEntry { name, meta });
+            }
+            Ok(FsOpMessage::ReadDirReply { entries })
+        }
+        3 => Ok(FsOpMessage::OpenReply {
+            handle: c.take_u64()?,
+        }),
+        4 => Ok(FsOpMessage::ReadReply {
+            data: c.take_blob()?,
+        }),
+        5 => Ok(FsOpMessage::WriteReply {
+            written: c.take_u32()?,
+        }),
+        6 => Ok(FsOpMessage::CreateReply {
+            handle: c.take_u64()?,
+        }),
+        7 => Ok(FsOpMessage::Error {
+            code: c.take_i32()?,
+            message: c.take_str()?,
+        }),
+        other => Err(format!("unknown reply tag {other}")),
+    }
+}
+
+fn read_meta(c: &mut Cursor<'_>) -> Result<ansync_proto::FsMeta, String> {
+    Ok(ansync_proto::FsMeta {
+        size: c.take_u64()?,
+        mode: c.take_u32()?,
+        mtime: c.take_u64()?,
+        is_dir: c.take(1)?[0] != 0,
+    })
+}
+
+fn write_str(out: &mut Vec<u8>, s: &str) {
+    let bytes = s.as_bytes();
+    let len = bytes.len() as u32;
+    out.extend_from_slice(&len.to_le_bytes());
+    out.extend_from_slice(bytes);
+}
+
+fn write_blob(out: &mut Vec<u8>, b: &[u8]) {
+    let len = b.len() as u32;
+    out.extend_from_slice(&len.to_le_bytes());
+    out.extend_from_slice(b);
+}
+
+struct Cursor<'a> {
+    buf: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Cursor<'a> {
+    fn new(buf: &'a [u8]) -> Self {
+        Self { buf, pos: 0 }
+    }
+    fn take(&mut self, n: usize) -> Result<&'a [u8], String> {
+        if self.pos + n > self.buf.len() {
+            return Err(format!("short read: need {n}, have {}", self.buf.len() - self.pos));
+        }
+        let s = &self.buf[self.pos..self.pos + n];
+        self.pos += n;
+        Ok(s)
+    }
+    fn take_u32(&mut self) -> Result<u32, String> {
+        let s = self.take(4)?;
+        Ok(u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+    }
+    fn take_i32(&mut self) -> Result<i32, String> {
+        Ok(self.take_u32()? as i32)
+    }
+    fn take_u64(&mut self) -> Result<u64, String> {
+        let s = self.take(8)?;
+        let mut a = [0u8; 8];
+        a.copy_from_slice(s);
+        Ok(u64::from_le_bytes(a))
+    }
+    fn take_str(&mut self) -> Result<String, String> {
+        let n = self.take_u32()? as usize;
+        let s = self.take(n)?;
+        String::from_utf8(s.to_vec()).map_err(|e| e.to_string())
+    }
+    fn take_blob(&mut self) -> Result<Vec<u8>, String> {
+        let n = self.take_u32()? as usize;
+        Ok(self.take(n)?.to_vec())
     }
 }
 
@@ -498,6 +798,61 @@ pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativePollInputMessa
         },
         None => std::ptr::null_mut(),
     }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativePollFsRequest<'local>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+) -> jni::sys::jbyteArray {
+    let fs_req_rx = {
+        let slot = state_slot().lock().expect("state mutex poisoned");
+        match slot.as_ref().and_then(|s| s.session.as_ref()) {
+            Some(sess) => sess.fs_req_rx.clone(),
+            None => return std::ptr::null_mut(),
+        }
+    };
+    let bytes = runtime().block_on(async move {
+        let mut guard = fs_req_rx.lock().await;
+        guard.recv().await
+    });
+    match bytes {
+        Some(b) => match env.byte_array_from_slice(&b) {
+            Ok(arr) => arr.into_raw(),
+            Err(e) => {
+                error!("nativePollFsRequest: byte_array_from_slice: {e}");
+                std::ptr::null_mut()
+            }
+        },
+        None => std::ptr::null_mut(),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativeFsReply<'local>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    reply: JByteArray<'local>,
+) -> jboolean {
+    let bytes = match env.convert_byte_array(&reply) {
+        Ok(b) => b,
+        Err(e) => {
+            error!("nativeFsReply: convert_byte_array: {e}");
+            return jni::sys::JNI_FALSE;
+        }
+    };
+    let fs_reply_tx = {
+        let slot = state_slot().lock().expect("state mutex poisoned");
+        match slot.as_ref().and_then(|s| s.session.as_ref()) {
+            Some(sess) => sess.fs_reply_tx.clone(),
+            None => return jni::sys::JNI_FALSE,
+        }
+    };
+    if fs_reply_tx.send(bytes).is_err() {
+        warn!("nativeFsReply: reply channel closed");
+        return jni::sys::JNI_FALSE;
+    }
+    jni::sys::JNI_TRUE
 }
 
 #[unsafe(no_mangle)]

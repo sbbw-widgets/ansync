@@ -4,6 +4,7 @@ import android.app.Activity
 import android.content.Context
 import android.content.Intent
 import android.media.projection.MediaProjectionManager
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
@@ -31,22 +32,13 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 
-/**
- * Companion entry point. Step 7d-3 renders:
- *   - This device's pubkey fingerprint (shared by NativeBridge).
- *   - A button that requests `MediaProjection` and starts the
- *     foreground capture service. The pairing UX (host discovery +
- *     fingerprint accept) lands in 7d-4.
- */
+const val PREFS = "ansync_prefs"
+const val PREF_TREE_URI = "shared_tree_uri"
+
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-
-        // Identity is created on the native side. Init here so the
-        // activity can read the pubkey for the status screen even
-        // when the foreground service has not yet started.
         NativeBridge.nativeInit(filesDir.absolutePath)
-
         setContent {
             MaterialTheme {
                 Surface(modifier = Modifier.fillMaxSize()) {
@@ -62,6 +54,7 @@ private fun StatusScreen() {
     val ctx = LocalContext.current
     var pubkey by remember { mutableStateOf<String?>(null) }
     var status by remember { mutableStateOf("idle") }
+    var sharedFolder by remember { mutableStateOf(loadTreeUri(ctx)) }
 
     LaunchedEffect(Unit) {
         pubkey = NativeBridge.nativeOurPubkeyHex()
@@ -88,6 +81,19 @@ private fun StatusScreen() {
         }
     }
 
+    val treePicker = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocumentTree()
+    ) { uri: Uri? ->
+        if (uri != null) {
+            ctx.contentResolver.takePersistableUriPermission(
+                uri,
+                Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION,
+            )
+            saveTreeUri(ctx, uri)
+            sharedFolder = uri
+        }
+    }
+
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -109,6 +115,27 @@ private fun StatusScreen() {
             Text("Start screen capture")
         }
         Spacer(modifier = Modifier.height(12.dp))
+        Button(onClick = { treePicker.launch(null) }) {
+            Text("Pick shared folder")
+        }
+        Spacer(modifier = Modifier.height(8.dp))
+        Text(
+            text = sharedFolder?.let { "shared: ${it.lastPathSegment ?: it}" } ?: "no shared folder",
+            style = MaterialTheme.typography.bodySmall,
+        )
+        Spacer(modifier = Modifier.height(12.dp))
         Text(text = "status: $status", style = MaterialTheme.typography.bodyMedium)
     }
+}
+
+private fun loadTreeUri(ctx: Context): Uri? {
+    val prefs = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+    return prefs.getString(PREF_TREE_URI, null)?.let { Uri.parse(it) }
+}
+
+private fun saveTreeUri(ctx: Context, uri: Uri) {
+    ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        .edit()
+        .putString(PREF_TREE_URI, uri.toString())
+        .apply()
 }

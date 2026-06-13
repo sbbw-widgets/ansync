@@ -9,6 +9,7 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
+import android.net.Uri
 import android.os.Build
 import android.os.IBinder
 import android.util.Log
@@ -30,11 +31,21 @@ class AnsyncCompanionService : Service() {
 
     private var projection: MediaProjection? = null
     private var capture: CaptureSession? = null
+    private var fsServer: AnsyncFsServer? = null
 
     override fun onCreate() {
         super.onCreate()
         ensureChannel(this)
         NativeBridge.nativeInit(filesDir.absolutePath)
+        maybeStartFsServer()
+    }
+
+    private fun maybeStartFsServer() {
+        val prefs = getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val uriStr = prefs.getString(PREF_TREE_URI, null) ?: return
+        val uri = Uri.parse(uriStr)
+        fsServer = AnsyncFsServer(this, uri).also { it.start() }
+        Log.i(TAG, "fs server started against $uri")
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -90,6 +101,8 @@ class AnsyncCompanionService : Service() {
 
     override fun onDestroy() {
         stopCapture()
+        fsServer?.stop()
+        fsServer = null
         NativeBridge.nativeClose()
         super.onDestroy()
     }

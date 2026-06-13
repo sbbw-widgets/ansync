@@ -212,7 +212,7 @@ ansync/
   - Daemon: `StreamKind::Files` accept loop spawnea `files_stream_loop` por stream con `AutoAcceptPolicy { root: download_dir }`. `DaemonConfig.download_dir` configurable (default `$XDG_DATA_HOME/ansync/incoming/`). `Capabilities::FILES` activa por default.
   - `ansyncctl push <id> <path> [--addr host:port] [--seconds N]`: direct QUIC dial (bypass D-Bus por ahora), discovery vía mDNS si `--addr` ausente, abre `StreamKind::Files`, `send_file`.
   - Companion: `files_accept_loop` en cdylib spawnea recv tasks por inbound stream del daemon. `PermissivePermissions` in-memory store ("everything on" — pairing ya estableció trust). Inbound files land en `{filesDir}/incoming/{peer_id}/{name}`.
-- [ ] **Step 9** — `files` FUSE mount + SAF integration Android side
+- [x] **Step 9** — `files` FUSE mount + SAF integration Android side
   - [x] **9a** — `FsOpMessage` extendido: `Create`/`Unlink`/`Rename`/`Truncate`/`Chmod` + variante genérica `Ok` para acks de ops sin payload. `FsMeta`/`FsEntry` ganan `Clone`.
   - [x] **9b** — `ansync_files::fs` module:
     - `client::FsClient<S>` — async RPC sequential req/reply sobre un stream (Mutex around stream). Métodos: stat, readdir, open, create, read, write, close, unlink, rename, truncate, chmod.
@@ -220,8 +220,8 @@ ansync/
     - `fuse_mount::FuseMount<S>` impl `fuser::Filesystem` — lookup, getattr, readdir, open, read, write, release, create, unlink, rename, setattr (truncate + chmod). `InodeTable` bi-mapa path↔ino, root inode 1 hardcoded. ATTR_TTL 5s, blksize 256 KiB matchea readahead recomendado. `spawn(mountpoint)` levanta sesión bg con `AutoUnmount + AllowOther + DefaultPermissions`.
   - [x] **9c** — Daemon auto-mount al peer connect si `Permission::FilesMount` ON. Monta en `$XDG_RUNTIME_DIR/ansync/mounts/{sanitized_device_name}/`. `BackgroundSession` vive en stack frame de `handle_connection` — drop al disconnect umounta. Re-export `fuser::BackgroundSession` desde `ansync_files::fs` para no forzar dep directa.
   - [x] **nix** — `nix/fuse.nix` partial: `fuse3` package + kernel module load + `userAllowOther = true` + reminder grupo `fuse`. Step 14 lo importa.
-  - [ ] **9d** — Companion native: receive `FsOpMessage` stream + JNI callbacks a Kotlin SAF (worker thread, `runtime.spawn_blocking`).
-  - [ ] **9e** — Companion Kotlin: SAF picker + `takePersistableUriPermission` + `ContentResolver` ops backing los JNI callbacks.
+  - [x] **9d** — Companion native: `streams_accept_loop` (rebautizado de `files_accept_loop`) demuxa `Files` y `Fs`. `fs_serve_loop` por stream Fs: recibe postcard `FsOpMessage`, re-encoda como tag-binary blob, push a `fs_req_tx` mpsc, espera reply blob desde `fs_reply_rx`, decoda + encoda postcard + manda al stream. Sequencial por stream. JNI: `nativePollFsRequest()` blocking + `nativeFsReply(bytes)` push. Tag-binary wire (Stat/ReadDir/Open/Read/Write/Close/Create/Unlink/Rename/Truncate/Chmod + Ok/StatReply/ReadDirReply/OpenReply/ReadReply/WriteReply/CreateReply/Error) documentado en `lib.rs` y espejado en `FsOpCodec.kt`.
+  - [x] **9e** — Companion Kotlin: `FsOpCodec` encode/decode espejo. `AnsyncFsServer` worker thread polls native + dispatchea contra `DocumentsContract` resolviendo paths por walk + matching de display names. Step 9e ship: `stat`/`readdir`/`open`/`read`/`close` con SAF reales (modes `0o755`/`0o644` sintéticos según `MIME_TYPE_DIR`). `write`/`create`/`unlink`/`rename`/`truncate`/`chmod` retornan `ENOSYS` por ahora (follow-up). `MainActivity` agrega botón "Pick shared folder" → `ACTION_OPEN_DOCUMENT_TREE` + `takePersistableUriPermission(R/W)` + persist en `SharedPreferences`. `AnsyncCompanionService.onCreate` arranca `AnsyncFsServer` si hay tree URI saved.
 - [ ] **Step 10** — `camera` v4l2loopback con device name = nombre del Android
 - [ ] **Step 11** — `audio` PipeWire bidireccional + notification widget Android (MediaSession)
 - [ ] **Step 12** — `clipboard` con privacy gates por device
