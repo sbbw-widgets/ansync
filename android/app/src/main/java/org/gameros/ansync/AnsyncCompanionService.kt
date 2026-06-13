@@ -25,6 +25,12 @@ class AnsyncCompanionService : Service() {
     override fun onCreate() {
         super.onCreate()
         ensureChannel(this)
+        NativeBridge.nativeInit()
+    }
+
+    override fun onDestroy() {
+        NativeBridge.nativeClose()
+        super.onDestroy()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {

@@ -1,26 +1,36 @@
-# Version catalog — single source of truth for Android dependency
-# pins. Bumped per release; `gradle/verification-metadata.xml` will
-# be added in Step 14 once the binary release pipeline lands.
+# Version catalog — pins matched to the `rust-android:1.90-sdk-36`
+# docker image so the project builds out-of-the-box with:
+#   docker run --rm -v "$(pwd):/src" -w /src rust-android:1.90-sdk-36 \
+#     -p android assembleDebug
 
 [versions]
-agp = "8.5.2"
-kotlin = "2.0.20"
+agp = "8.13.0"
+kotlin = "1.9.22"
+compileSdk = "36"
+targetSdk = "34"
+minSdk = "26"
+buildTools = "35.0.0"
+ndk = "29.0.14033849"
+java = "17"
+rustAndroid = "0.9.6"
+
 coreKtx = "1.13.1"
 lifecycleRuntimeKtx = "2.8.4"
 activityCompose = "1.9.1"
-composeBom = "2024.08.00"
+composeBom = "2024.02.00"
+composeCompiler = "1.5.10"
 
 [libraries]
-androidx-core-ktx              = { group = "androidx.core",              name = "core-ktx",              version.ref = "coreKtx" }
-androidx-lifecycle-runtime-ktx = { group = "androidx.lifecycle",         name = "lifecycle-runtime-ktx", version.ref = "lifecycleRuntimeKtx" }
-androidx-activity-compose      = { group = "androidx.activity",          name = "activity-compose",      version.ref = "activityCompose" }
-androidx-compose-bom           = { group = "androidx.compose",           name = "compose-bom",           version.ref = "composeBom" }
-androidx-compose-ui            = { group = "androidx.compose.ui",        name = "ui" }
-androidx-compose-ui-graphics   = { group = "androidx.compose.ui",        name = "ui-graphics" }
-androidx-compose-ui-tooling-preview = { group = "androidx.compose.ui",   name = "ui-tooling-preview" }
-androidx-compose-material3     = { group = "androidx.compose.material3", name = "material3" }
+androidx-core-ktx                   = { group = "androidx.core",              name = "core-ktx",              version.ref = "coreKtx" }
+androidx-lifecycle-runtime-ktx      = { group = "androidx.lifecycle",         name = "lifecycle-runtime-ktx", version.ref = "lifecycleRuntimeKtx" }
+androidx-activity-compose           = { group = "androidx.activity",          name = "activity-compose",      version.ref = "activityCompose" }
+androidx-compose-bom                = { group = "androidx.compose",           name = "compose-bom",           version.ref = "composeBom" }
+androidx-compose-ui                 = { group = "androidx.compose.ui",        name = "ui" }
+androidx-compose-ui-graphics        = { group = "androidx.compose.ui",        name = "ui-graphics" }
+androidx-compose-ui-tooling-preview = { group = "androidx.compose.ui",        name = "ui-tooling-preview" }
+androidx-compose-material3          = { group = "androidx.compose.material3", name = "material3" }
 
 [plugins]
-android-application = { id = "com.android.application", version.ref = "agp" }
-kotlin-android      = { id = "org.jetbrains.kotlin.android",      version.ref = "kotlin" }
-kotlin-compose      = { id = "org.jetbrains.kotlin.plugin.compose", version.ref = "kotlin" }
+android-application = { id = "com.android.application",                          version.ref = "agp" }
+kotlin-android      = { id = "org.jetbrains.kotlin.android",                     version.ref = "kotlin" }
+rust-android        = { id = "org.mozilla.rust-android-gradle.rust-android",     version.ref = "rustAndroid" }

@@ -1,0 +1,58 @@
+# Native (Rust) half of the ansync companion. Compiled by the
+# Mozilla `rust-android-gradle` plugin into `lib<name>.so` for each
+# Android ABI and bundled into the APK's `jniLibs/<abi>/`.
+#
+# Deliberately NOT part of the top-level ansync workspace: the host
+# workspace targets `x86_64-unknown-linux-gnu`, and pulling NDK
+# cross-compile units into that resolver would force every host crate
+# to link against bionic. Build via:
+#
+#   docker run --rm -v "$(pwd):/src" -w /src rust-android:1.90-sdk-36 \
+#       -p android assembleDebug
+#
+# Shares wire-format types with the daemon by path-depending on
+# `ansync-proto` and `ansync-crypto`. Those crates are pure-Rust + no
+# system deps, so they cross-compile cleanly.
+
+[package]
+name = "ansync_companion_native"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+name = "ansync_companion_native"
+crate-type = ["cdylib"]
+
+[dependencies]
+# JNI bridge into Kotlin.
+jni = "0.21"
+
+# Shared wire format + pinning helpers from the host workspace.
+ansync-proto = { path = "../crates/proto" }
+ansync-crypto = { path = "../crates/crypto" }
+
+# QUIC client mirrors the host's `quinn` + `rustls` stack — same
+# wire bytes, zero compat work. `default-features = false` keeps
+# native-tls / native-roots out of the link; pinning is custom.
+quinn = { version = "0.11", default-features = false, features = ["rustls", "runtime-tokio", "ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rcgen = { version = "0.13", default-features = false, features = ["crypto", "ring", "pem"] }
+bytes = "1"
+postcard = { version = "1", features = ["alloc"] }
+thiserror = "2"
+
+# Async runtime: rt-multi-thread for tokio's worker pool inside the
+# JNI calls so blocking work doesn't hold the JVM main thread.
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "net", "io-util", "sync", "macros", "time"] }
+
+# Logging: forward `log` records into `android_logger` so they land
+# in `adb logcat -s ansync` instead of vanishing.
+log = "0.4"
+android_logger = "0.13"
+
+[profile.release]
+opt-level = "z"
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

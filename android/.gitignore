@@ -7,7 +7,10 @@ local.properties
 captures/
 .cxx/
 
-# Wrapper jars get fetched at first `gradle wrapper` run; committing
-# them inflates the repo. Step 14 will add signature verification +
-# wrapper jar via the binary release pipeline.
+# Rust native build artifacts
+target/
+
+# Gradle wrapper jar — fetched at first `gradle wrapper` run. Bundled
+# in the rust-android docker image so callers do not need to run
+# `gradle wrapper` manually when using the docker workflow.
 gradle/wrapper/gradle-wrapper.jar
