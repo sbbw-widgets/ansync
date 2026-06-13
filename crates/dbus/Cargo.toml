@@ -9,7 +9,12 @@ description = "ansync — D-Bus service org.gameros.Ansync1 (zbus 5)"
 
 [dependencies]
 ansync-core.workspace = true
+ansync-crypto.workspace = true
+ansync-pairing.workspace = true
+ansync-permissions.workspace = true
+async-trait.workspace = true
 zbus.workspace = true
 serde.workspace = true
 thiserror.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["sync"] }
+tracing.workspace = true
