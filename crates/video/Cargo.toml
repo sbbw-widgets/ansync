@@ -9,6 +9,7 @@ description = "ansync — video decode pipeline (ferricast-decoder + wgpu sink)"
 
 [dependencies]
 ansync-core.workspace = true
+ansync-proto.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
 thiserror.workspace = true

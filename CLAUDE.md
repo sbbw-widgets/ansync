@@ -62,7 +62,9 @@ El `flake.nix` pinea `nixpkgs` a `549bd84d6279f9852cae6225e372cc67fb91a4c1` para
 - **Step 9.5 arrancado (glue integration)**:
   - **9.5a cerrado** — Renderer `MirrorApp`/`FrameSlot`/`run` movido a `ansync_video::sink_egui`. Daemon-core `video_stream_loop` decode H.264 → push a slot per-peer en `MirrorRegistry`. `ansyncd` lib-side ahora solo tiene el feeder Annex-B dev-only.
   - **9.5b cerrado** — `DaemonAction::{ShowScreen,HideScreen}` enum + `UnboundedSender` en `DaemonState`. D-Bus `Device.ShowScreen` envía action; `action_loop` spawnea thread con `sink_egui::run(title, slot)`. Window thread separado del tokio runtime. Ya se puede probar: pairing manual + `dbus-send` para ShowScreen + companion empujando Video.
-  - **Pendiente (9.5c-f)**: input directions ambas + companion pairing cable accept.
+  - **9.5c cerrado** — Companion `streams_accept_loop` maneja Input inbound → mpsc → AccessibilityService. Convención: opener escribe, accepter lee. `nativeOpenConnection` ya no pre-abre Input.
+  - **9.5d cerrado** — `ShowScreen` action handler abre Input outbound; `MirrorApp` mapea pointer egui → `InputMessage::TouchSlot` con coords absolutas; `input_writer_loop` postcard + write_frame.
+  - **Pendiente (9.5e/f)**: device→host input (Android overlay capture) + companion pairing cable accept side.
 - **Próximo (Step 10)** — camera + D-Bus control (camera_id, w/h, fps, bitrate, codec, aspect, stabilization).
 - Después (7c–e) arranca companion Android en `android/`.
 

@@ -267,15 +267,13 @@ pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativeOpenConnection
             return jni::sys::JNI_FALSE;
         }
     };
-    let input_stream = match runtime().block_on(conn.open(StreamKind::Input)) {
-        Ok(s) => s,
-        Err(e) => {
-            error!("nativeOpenConnection: open Input stream: {e}");
-            return jni::sys::JNI_FALSE;
-        }
-    };
+    // Convention: the OPENER of a stream uses it for send. The
+    // host→device input stream is opened by the daemon on
+    // ShowScreen; we accept it in `streams_accept_loop`. Device→host
+    // input (9.5e) opens its own stream lazily when the user starts
+    // interacting with the projected overlay.
     let (input_tx, input_rx) = unbounded_channel::<Vec<u8>>();
-    runtime().spawn(input_recv_loop(input_stream, input_tx));
+    let input_tx_arc = Arc::new(input_tx);
 
     let (fs_req_tx, fs_req_rx) = unbounded_channel::<Vec<u8>>();
     let (fs_reply_tx, fs_reply_rx) = unbounded_channel::<Vec<u8>>();
@@ -304,6 +302,7 @@ pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativeOpenConnection
         download_dir,
         fs_req_tx.clone(),
         fs_reply_rx.clone(),
+        input_tx_arc.clone(),
     ));
 
     let session = ActiveSession {
@@ -326,6 +325,7 @@ async fn streams_accept_loop(
     download_dir: PathBuf,
     fs_req_tx: Arc<UnboundedSender<Vec<u8>>>,
     fs_reply_rx: Arc<AsyncMutex<UnboundedReceiver<Vec<u8>>>>,
+    input_inbound_tx: Arc<UnboundedSender<Vec<u8>>>,
 ) {
     let permissions: Arc<dyn PermissionsStore> = Arc::new(PermissivePermissions);
     loop {
@@ -341,6 +341,14 @@ async fn streams_accept_loop(
             }
         };
         match kind {
+            StreamKind::Input => {
+                // Host opened an Input stream to push host→device
+                // events. Drain into the same mpsc that
+                // `nativePollInputMessage` reads from so the
+                // AccessibilityService replays them.
+                let tx = input_inbound_tx.clone();
+                tokio::spawn(input_recv_loop(stream, (*tx).clone()));
+            }
             StreamKind::Files => {
                 let mut stream = stream;
                 let policy = Arc::new(AutoAcceptPolicy {

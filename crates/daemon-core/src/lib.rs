@@ -244,6 +244,10 @@ pub struct MirrorEntry {
     pub peer_name: String,
     /// `Some` while a window thread is alive; cleared on HideScreen.
     window: StdMutex<Option<std::thread::JoinHandle<()>>>,
+    /// `Some` while the peer is connected. `action_loop` reads this
+    /// to open an outbound Input stream on ShowScreen. Cleared by
+    /// `handle_connection` on disconnect.
+    pub conn: StdMutex<Option<Arc<QuicConnection>>>,
 }
 
 impl MirrorRegistry {
@@ -258,6 +262,7 @@ impl MirrorRegistry {
                     slot: new_slot(),
                     peer_name: name.to_string(),
                     window: StdMutex::new(None),
+                    conn: StdMutex::new(None),
                 })
             })
             .clone()
@@ -282,22 +287,43 @@ async fn action_loop(
                     warn!(%device, "ShowScreen: no mirror entry (peer not connected?)");
                     continue;
                 };
-                let mut guard = entry.window.lock().expect("window slot poisoned");
-                if guard.is_some() {
-                    debug!(%device, "ShowScreen: window already up");
-                    continue;
+                {
+                    let guard = entry.window.lock().expect("window slot poisoned");
+                    if guard.is_some() {
+                        debug!(%device, "ShowScreen: window already up");
+                        continue;
+                    }
                 }
+                // Open the outbound Input stream so pointer events
+                // from the host window land on the peer.
+                let conn = entry.conn.lock().expect("conn slot poisoned").clone();
+                let input_tx = if let Some(conn) = conn {
+                    match conn.open(StreamKind::Input).await {
+                        Ok(stream) => {
+                            let (tx, rx) = unbounded_channel::<InputMessage>();
+                            tokio::spawn(input_writer_loop(stream, rx, device.clone()));
+                            Some(tx)
+                        }
+                        Err(e) => {
+                            warn!(%device, error = %e, "open outbound Input stream failed; window will be view-only");
+                            None
+                        }
+                    }
+                } else {
+                    warn!(%device, "ShowScreen: no live connection; window will be view-only");
+                    None
+                };
                 let slot = entry.slot.clone();
                 let title = format!("ansync — {}", entry.peer_name);
                 let handle = std::thread::Builder::new()
                     .name(format!("ansync-mirror-{device}"))
                     .spawn(move || {
-                        if let Err(e) = ansync_video::sink_egui::run(title, slot) {
+                        if let Err(e) = ansync_video::sink_egui::run(title, slot, input_tx) {
                             warn!(error = %e, "mirror window exited with error");
                         }
                     })
                     .ok();
-                *guard = handle;
+                *entry.window.lock().expect("window slot poisoned") = handle;
                 info!(%device, "ShowScreen: window spawned");
             }
             DaemonAction::HideScreen { device } => {
@@ -367,18 +393,22 @@ async fn handle_connection(
         factory.clone(),
     )));
 
+    let conn_arc = Arc::new(conn);
+
     // Ensure the mirror entry exists for this peer so the Video
     // stream loop can populate it as soon as the companion opens its
     // Video bidi stream.
     let mirror_entry = mirrors.ensure(&peer_id, &peer.name.0);
+    *mirror_entry.conn.lock().expect("conn slot poisoned") = Some(conn_arc.clone());
 
     // Auto-mount FUSE if the peer's `files_mount` flag is on. The
     // BackgroundSession is held on the stack so dropping it on
     // peer-disconnect umounts cleanly.
-    let _fuse_session = maybe_auto_mount(&conn, &peer_id, &peer.name, permissions.as_ref()).await;
+    let _fuse_session =
+        maybe_auto_mount(&conn_arc, &peer_id, &peer.name, permissions.as_ref()).await;
 
     loop {
-        let (kind, stream) = match conn.accept().await {
+        let (kind, stream) = match conn_arc.accept().await {
             Ok(v) => v,
             Err(ansync_transport::TransportError::Closed) => {
                 info!(%peer_id, "peer closed connection");
@@ -411,6 +441,9 @@ async fn handle_connection(
         }
     }
     input_session.lock().await.shutdown().await;
+    // Clear the conn slot so ShowScreen won't try to open streams on
+    // a closed connection until the peer reconnects.
+    *mirror_entry.conn.lock().expect("conn slot poisoned") = None;
     Ok(())
 }
 
@@ -480,6 +513,27 @@ fn sanitize(name: &str) -> String {
             }
         })
         .collect()
+}
+
+async fn input_writer_loop(
+    mut stream: QuicStream,
+    mut rx: UnboundedReceiver<InputMessage>,
+    peer_id: DeviceId,
+) {
+    while let Some(msg) = rx.recv().await {
+        let bytes = match postcard::to_allocvec(&msg) {
+            Ok(b) => b,
+            Err(e) => {
+                warn!(%peer_id, error = %e, "input postcard encode failed");
+                continue;
+            }
+        };
+        if let Err(e) = stream.send(bytes::Bytes::from(bytes)).await {
+            warn!(%peer_id, error = %e, "input writer stream send failed; exiting");
+            return;
+        }
+    }
+    info!(%peer_id, "input writer channel closed");
 }
 
 async fn video_stream_loop(mut stream: QuicStream, slot: FrameSlot, peer_id: DeviceId) {

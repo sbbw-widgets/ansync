@@ -13,6 +13,8 @@
 
 use std::sync::{Arc, Mutex};
 
+use ansync_proto::InputMessage;
+use tokio::sync::mpsc::UnboundedSender;
 use tracing::info;
 
 use crate::{DecodedFrame, PixelFormat};
@@ -30,7 +32,16 @@ pub fn new_slot() -> FrameSlot {
 /// Block the calling thread on `eframe::run_native`. Spawn this on a
 /// dedicated thread when the caller wants the daemon to keep running
 /// alongside the window — winit on Linux is happy on any thread.
-pub fn run(title: String, slot: FrameSlot) -> Result<(), Box<dyn std::error::Error>> {
+///
+/// `input_tx` is `Some` for prod paths where the host wants to push
+/// the mirror window's pointer / key events back to the peer; pass
+/// `None` for the dev `--play-file` path where there is no peer to
+/// drive.
+pub fn run(
+    title: String,
+    slot: FrameSlot,
+    input_tx: Option<UnboundedSender<InputMessage>>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([960.0, 540.0])
@@ -41,7 +52,7 @@ pub fn run(title: String, slot: FrameSlot) -> Result<(), Box<dyn std::error::Err
     eframe::run_native(
         &title,
         native_options,
-        Box::new(move |_cc| Ok(Box::new(MirrorApp::new(slot)))),
+        Box::new(move |_cc| Ok(Box::new(MirrorApp::new(slot, input_tx)))),
     )
     .map_err(|e| format!("eframe: {e}").into())
 }
@@ -50,14 +61,18 @@ pub struct MirrorApp {
     slot: FrameSlot,
     texture: Option<egui::TextureHandle>,
     last_size: Option<(u32, u32)>,
+    input_tx: Option<UnboundedSender<InputMessage>>,
+    last_pointer: Option<egui::Pos2>,
 }
 
 impl MirrorApp {
-    pub fn new(slot: FrameSlot) -> Self {
+    pub fn new(slot: FrameSlot, input_tx: Option<UnboundedSender<InputMessage>>) -> Self {
         Self {
             slot,
             texture: None,
             last_size: None,
+            input_tx,
+            last_pointer: None,
         }
     }
 }
@@ -78,6 +93,8 @@ impl eframe::App for MirrorApp {
                 self.last_size = Some(size);
             }
         }
+        let frame_dims = self.last_size;
+        let mut hit_rect: Option<egui::Rect> = None;
         egui::CentralPanel::default().show(ctx, |ui| {
             if let Some(tex) = &self.texture {
                 let available = ui.available_size();
@@ -89,7 +106,9 @@ impl eframe::App for MirrorApp {
                     size.y = size.x / aspect;
                 }
                 ui.centered_and_justified(|ui| {
-                    ui.add(egui::Image::from_texture(tex).fit_to_exact_size(size));
+                    let resp =
+                        ui.add(egui::Image::from_texture(tex).fit_to_exact_size(size));
+                    hit_rect = Some(resp.rect);
                 });
             } else {
                 ui.centered_and_justified(|ui| {
@@ -97,8 +116,86 @@ impl eframe::App for MirrorApp {
                 });
             }
         });
+        if let (Some(rect), Some((fw, fh)), Some(tx)) =
+            (hit_rect, frame_dims, self.input_tx.as_ref())
+        {
+            emit_pointer_events(ctx, &mut self.last_pointer, rect, fw, fh, tx);
+        }
         ctx.request_repaint_after(std::time::Duration::from_millis(16));
     }
+}
+
+/// Map egui pointer state inside `rect` to absolute coordinates in
+/// the remote display's coordinate space (`fw × fh`) and emit
+/// `InputMessage::TouchSlot` events. Touch events drive
+/// `AccessibilityService.dispatchGesture` on the peer (Step 7e).
+fn emit_pointer_events(
+    ctx: &egui::Context,
+    last: &mut Option<egui::Pos2>,
+    rect: egui::Rect,
+    fw: u32,
+    fh: u32,
+    tx: &UnboundedSender<InputMessage>,
+) {
+    let mut tracking_id: i32 = 0;
+    ctx.input(|i| {
+        let Some(pos) = i.pointer.hover_pos() else {
+            // Pointer left the window: emit a synthetic lift on the
+            // last known slot so the peer releases the touch.
+            if last.take().is_some() {
+                let _ = tx.send(InputMessage::TouchSlot {
+                    slot: 0,
+                    x: 0,
+                    y: 0,
+                    pressure: 0,
+                    tracking_id: -1,
+                });
+            }
+            return;
+        };
+        if !rect.contains(pos) {
+            return;
+        }
+        let nx = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
+        let ny = ((pos.y - rect.top()) / rect.height()).clamp(0.0, 1.0);
+        let abs_x = (nx * fw as f32) as i32;
+        let abs_y = (ny * fh as f32) as i32;
+        let pressed = i.pointer.primary_down();
+        // Move when changed.
+        let changed = last.map(|p| p != pos).unwrap_or(true);
+        if changed {
+            *last = Some(pos);
+            if pressed {
+                tracking_id = 1;
+                let _ = tx.send(InputMessage::TouchSlot {
+                    slot: 0,
+                    x: abs_x,
+                    y: abs_y,
+                    pressure: 255,
+                    tracking_id,
+                });
+            }
+        }
+        // Press / release transitions.
+        if i.pointer.primary_pressed() {
+            let _ = tx.send(InputMessage::TouchSlot {
+                slot: 0,
+                x: abs_x,
+                y: abs_y,
+                pressure: 255,
+                tracking_id: 1,
+            });
+        }
+        if i.pointer.primary_released() {
+            let _ = tx.send(InputMessage::TouchSlot {
+                slot: 0,
+                x: abs_x,
+                y: abs_y,
+                pressure: 0,
+                tracking_id: -1,
+            });
+        }
+    });
 }
 
 /// Convert a [`DecodedFrame`] to an `egui::ColorImage` in RGBA8.
