@@ -8,6 +8,12 @@
 use ansync_core::{DeviceId, DevicePermissions, Permission};
 use async_trait::async_trait;
 
+pub mod store;
+
+pub use store::{
+    FilePermissionsStore, apply_permission, parse_permission, permission_name, permission_value,
+};
+
 #[derive(Debug, thiserror::Error)]
 pub enum PermissionsError {
     #[error("io: {0}")]
