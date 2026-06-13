@@ -36,6 +36,11 @@ pub struct AdbDevice {
     pub state: String,
 }
 
+/// Companion's Android package id. Matched against `adb shell pm
+/// list packages` to decide whether `pair_host_via_adb` should
+/// auto-install the APK before triggering the pairing broadcast.
+pub const COMPANION_PACKAGE: &str = "org.gameros.ansync";
+
 /// Drive the host side of the cable bootstrap over a single duplex
 /// stream. Returns a freshly populated `StoredPeer` with default
 /// permissions; capabilities are left empty and refreshed on first
@@ -166,7 +171,17 @@ pub async fn pair_host_via_adb(
     serial: &str,
     local: &IdentityKeypair,
     local_name: &str,
+    apk: Option<&std::path::Path>,
 ) -> Result<StoredPeer, PairingError> {
+    if !companion_installed(serial).await? {
+        let apk_path = apk.ok_or_else(|| {
+            PairingError::Protocol(format!(
+                "{COMPANION_PACKAGE} not installed on {serial} and no --apk path supplied"
+            ))
+        })?;
+        install_companion_apk(serial, apk_path).await?;
+    }
+
     let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
     let port = listener.local_addr()?.port();
 
@@ -181,6 +196,52 @@ pub async fn pair_host_via_adb(
     let result = wait_and_bootstrap(&listener, local, local_name).await;
     let _ = remove_adb_reverse(serial, port).await;
     result
+}
+
+/// Probe `adb shell pm list packages` for the companion. Returns
+/// `Ok(true)` if installed, `Ok(false)` if absent.
+pub async fn companion_installed(serial: &str) -> Result<bool, PairingError> {
+    let output = Command::new("adb")
+        .args(["-s", serial, "shell", "pm", "list", "packages", COMPANION_PACKAGE])
+        .output()
+        .await?;
+    if !output.status.success() {
+        let err = String::from_utf8_lossy(&output.stderr);
+        return Err(PairingError::Protocol(format!(
+            "adb shell pm list packages failed: {err}"
+        )));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(stdout.lines().any(|l| l.trim() == format!("package:{COMPANION_PACKAGE}")))
+}
+
+/// `adb install -r <apk>` — replaces existing install if the package
+/// is already present (so re-pairing after a companion update just
+/// works). `-g` grants every runtime permission listed in the
+/// manifest so the user does not have to walk through the runtime
+/// permission grant prompts after pair.
+pub async fn install_companion_apk(
+    serial: &str,
+    apk: &std::path::Path,
+) -> Result<(), PairingError> {
+    if !apk.exists() {
+        return Err(PairingError::Protocol(format!(
+            "APK not found at {}",
+            apk.display()
+        )));
+    }
+    let output = Command::new("adb")
+        .args(["-s", serial, "install", "-r", "-g"])
+        .arg(apk)
+        .output()
+        .await?;
+    if !output.status.success() {
+        let err = String::from_utf8_lossy(&output.stderr);
+        return Err(PairingError::Protocol(format!(
+            "adb install failed: {err}"
+        )));
+    }
+    Ok(())
 }
 
 async fn wait_and_bootstrap(

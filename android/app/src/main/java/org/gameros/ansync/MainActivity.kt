@@ -22,8 +22,10 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -63,6 +65,7 @@ private fun StatusScreen() {
     var pairedHostName by remember {
         mutableStateOf(prefs.getString(PairingReceiver.PREF_HOST_NAME, null))
     }
+    val discovered = remember { mutableStateListOf<DiscoveredHost>() }
 
     LaunchedEffect(Unit) {
         pubkey = NativeBridge.nativeOurPubkeyHex()
@@ -70,6 +73,15 @@ private fun StatusScreen() {
         // MainActivity was backgrounded.
         pairedHostHex = prefs.getString(PairingReceiver.PREF_HOST_PUBKEY_HEX, null)
         pairedHostName = prefs.getString(PairingReceiver.PREF_HOST_NAME, null)
+    }
+
+    DisposableEffect(Unit) {
+        val discovery = HostDiscovery(ctx)
+        discovery.start { hosts ->
+            discovered.clear()
+            discovered.addAll(hosts)
+        }
+        onDispose { discovery.stop() }
     }
 
     val captureLauncher = rememberLauncherForActivityResult(
@@ -148,6 +160,26 @@ private fun StatusScreen() {
                 text = "paired host: ${pairedHostName ?: "?"} (${hex.take(8)}…)",
                 style = MaterialTheme.typography.bodySmall,
             )
+            val match = discovered.firstOrNull { it.pubkeyHex == hex }
+            if (match != null) {
+                Spacer(modifier = Modifier.height(8.dp))
+                Button(onClick = {
+                    val ok = NativeBridge.nativeOpenConnection(
+                        match.address.hostAddress ?: "",
+                        match.port,
+                        hex,
+                    )
+                    status = if (ok) "connected to ${match.name}" else "connect failed"
+                }) {
+                    Text("Connect to ${match.name} (${match.address.hostAddress})")
+                }
+            } else {
+                Spacer(modifier = Modifier.height(8.dp))
+                Text(
+                    text = "browsing LAN for paired host… (${discovered.size} hosts seen)",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
         } else {
             Text(
                 text = "no paired host — run `ansyncctl pair` on the host",

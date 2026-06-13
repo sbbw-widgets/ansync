@@ -49,6 +49,12 @@ enum Command {
         /// Human-readable name advertised to the peer.
         #[arg(long)]
         name: Option<String>,
+        /// Path to the companion APK. Auto-installed if the device
+        /// does not already have `org.gameros.ansync`. Defaults to
+        /// `$ANSYNC_COMPANION_APK` env or
+        /// `/usr/share/ansync/companion.apk`.
+        #[arg(long)]
+        apk: Option<PathBuf>,
     },
     /// Forget a previously paired device.
     Forget { id: String },
@@ -104,7 +110,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Identity { action } => identity(action)?,
         Command::Devices => list_devices()?,
         Command::Discover { seconds } => discover(seconds).await?,
-        Command::Pair { serial, name } => pair(serial, name).await?,
+        Command::Pair { serial, name, apk } => pair(serial, name, apk).await?,
         Command::Forget { id } => println!("(skeleton) forget {id}"),
         Command::Show { id } => println!("(skeleton) show {id}"),
         Command::Push { id, path, addr, seconds } => push(id, path, addr, seconds).await?,
@@ -220,6 +226,7 @@ async fn discover(seconds: u64) -> Result<(), Box<dyn std::error::Error>> {
 async fn pair(
     serial: Option<String>,
     name: Option<String>,
+    apk: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let identity = load_identity()?;
     let local_name = name
@@ -246,8 +253,15 @@ async fn pair(
         }
     };
 
+    let apk_path = apk
+        .or_else(|| std::env::var_os("ANSYNC_COMPANION_APK").map(PathBuf::from))
+        .or_else(|| {
+            let candidate = PathBuf::from("/usr/share/ansync/companion.apk");
+            candidate.exists().then_some(candidate)
+        });
+
     println!("pairing with {serial} as `{local_name}` …");
-    let stored = pair_host_via_adb(&serial, &identity, &local_name).await?;
+    let stored = pair_host_via_adb(&serial, &identity, &local_name, apk_path.as_deref()).await?;
     println!("paired: device_id={} name={}", stored.id, stored.name);
 
     let store = PeerStore::open(default_peers_dir()?)?;
@@ -257,6 +271,28 @@ async fn pair(
         store.root().display(),
         stored.id
     );
+    // Nudge the running daemon (if any) to wire the D-Bus Device +
+    // Permissions object paths for the freshly paired peer. No-op if
+    // the daemon is not running.
+    if let Err(e) = notify_daemon_refresh().await {
+        eprintln!("note: daemon not running or unreachable: {e}");
+    }
+    Ok(())
+}
+
+async fn notify_daemon_refresh() -> Result<(), Box<dyn std::error::Error>> {
+    let conn = zbus::Connection::session().await?;
+    let proxy = zbus::Proxy::new(
+        &conn,
+        ansync_dbus::SERVICE_NAME,
+        ansync_dbus::PATH_MANAGER,
+        "org.gameros.Ansync1.Manager",
+    )
+    .await?;
+    let added: Vec<String> = proxy.call("RefreshPeers", &()).await?;
+    if !added.is_empty() {
+        println!("daemon registered new device paths: {added:?}");
+    }
     Ok(())
 }
 

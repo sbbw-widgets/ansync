@@ -76,6 +76,10 @@ El `flake.nix` pinea `nixpkgs` a `549bd84d6279f9852cae6225e372cc67fb91a4c1` para
   7. Companion "Open touchpad" → MotionEvent → daemon uinput Mouse.
   8. FUSE auto-mount si `files_mount` perm on; ls del mount → SAF.
   9. `ansyncctl push id path` → transferencia + sha256 verify.
+- **Post-9.5 gap closers (UX scrcpy-level)**:
+  - **D-Bus dynamic registration** — `Manager.RefreshPeers()` D-Bus method; `ansyncctl pair` lo llama post-store.put. No más restart del daemon después de pair.
+  - **Auto-install APK durante pair** — `pair_host_via_adb` ahora chequea `pm list packages` y corre `adb install -r -g` si el companion no está. CLI flag `--apk` o env `ANSYNC_COMPANION_APK` o default `/usr/share/ansync/companion.apk`. UX idéntica a scrcpy modulo path al APK.
+  - **Companion mDNS + Connect button** — `HostDiscovery.kt` wrappea `NsdManager` con `WifiManager.MulticastLock` (mandatorio en Android). `MainActivity` matchea paired pubkey con hosts descubiertos y muestra botón "Connect to X (IP)" que dispara `nativeOpenConnection`.
 - **Próximo (Step 10)** — camera + D-Bus control (camera_id, w/h, fps, bitrate, codec, aspect, stabilization).
 - Después (7c–e) arranca companion Android en `android/`.
 
