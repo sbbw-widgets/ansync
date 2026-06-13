@@ -14,9 +14,14 @@ async-trait.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 futures.workspace = true
+tokio.workspace = true
+tracing.workspace = true
 
 mdns-sd = { workspace = true, optional = true }
 
 [features]
-default = []
+default = ["mdns"]
 mdns = ["dep:mdns-sd"]
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
