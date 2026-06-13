@@ -3,6 +3,7 @@
 //! Hosts the D-Bus surface, the QUIC transport, and the screen mirror GUI
 //! window (eframe + wgpu) when a client invokes `ShowScreen`.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use ansync_daemon_core::{Daemon, DaemonConfig};
@@ -15,6 +16,15 @@ struct Args {
     /// Override the device name advertised on the LAN.
     #[arg(long)]
     device_name: Option<String>,
+    /// Override the identity key path.
+    #[arg(long)]
+    identity: Option<PathBuf>,
+    /// Override the peers directory.
+    #[arg(long)]
+    peers_dir: Option<PathBuf>,
+    /// Override the per-device permissions directory.
+    #[arg(long)]
+    permissions_dir: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -27,7 +37,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .or_else(hostname)
         .unwrap_or_else(|| "ansync-host".to_string());
 
-    let daemon = Arc::new(Daemon::new(DaemonConfig { device_name }));
+    let mut config = DaemonConfig::new(device_name);
+    config.identity_path = args.identity;
+    config.peers_dir = args.peers_dir;
+    config.permissions_dir = args.permissions_dir;
+
+    let daemon = Arc::new(Daemon::new(config));
     daemon.run().await?;
 
     Ok(())
