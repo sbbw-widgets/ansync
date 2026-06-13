@@ -9,6 +9,10 @@
 use ansync_crypto::PeerIdentity;
 use async_trait::async_trait;
 
+pub mod store;
+
+pub use store::{PeerStore, PeerStoreError, StoredPeer};
+
 #[derive(Debug, thiserror::Error)]
 pub enum PairingError {
     #[error("cancelled by user")]
@@ -17,6 +21,12 @@ pub enum PairingError {
     Rejected,
     #[error("crypto: {0}")]
     Crypto(#[from] ansync_crypto::CryptoError),
+    #[error("store: {0}")]
+    Store(#[from] PeerStoreError),
+    #[error("protocol: {0}")]
+    Protocol(String),
+    #[error("frame: {0}")]
+    Frame(#[from] ansync_proto::FrameError),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 }
