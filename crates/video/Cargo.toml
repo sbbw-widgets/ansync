@@ -21,5 +21,11 @@ tracing.workspace = true
 ferricast-core.workspace = true
 ferricast-decoder.workspace = true
 
+# eframe + egui used by the screen-mirror window (`sink_egui`).
+# Daemon-core spawns the window on D-Bus ShowScreen; ansyncd's bin
+# only re-exports it.
+eframe.workspace = true
+egui.workspace = true
+
 [features]
 default = []

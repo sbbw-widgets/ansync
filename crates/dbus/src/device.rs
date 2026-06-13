@@ -5,7 +5,7 @@ use std::sync::Arc;
 use ansync_core::{Capabilities, DeviceId};
 use zbus::interface;
 
-use crate::state::DaemonState;
+use crate::state::{DaemonAction, DaemonState};
 
 #[derive(Clone)]
 pub struct Device {
@@ -92,11 +92,21 @@ impl Device {
     }
 
     async fn show_screen(&self) -> zbus::fdo::Result<()> {
-        Err(not_yet("ShowScreen"))
+        let tx = self.state.actions.as_ref().ok_or_else(|| {
+            zbus::fdo::Error::Failed("daemon action channel not wired".into())
+        })?;
+        tx.send(DaemonAction::ShowScreen { device: self.id.clone() })
+            .map_err(|e| zbus::fdo::Error::Failed(format!("send action: {e}")))?;
+        Ok(())
     }
 
     async fn hide_screen(&self) -> zbus::fdo::Result<()> {
-        Err(not_yet("HideScreen"))
+        let tx = self.state.actions.as_ref().ok_or_else(|| {
+            zbus::fdo::Error::Failed("daemon action channel not wired".into())
+        })?;
+        tx.send(DaemonAction::HideScreen { device: self.id.clone() })
+            .map_err(|e| zbus::fdo::Error::Failed(format!("send action: {e}")))?;
+        Ok(())
     }
 
     async fn start_camera(&self) -> zbus::fdo::Result<()> {

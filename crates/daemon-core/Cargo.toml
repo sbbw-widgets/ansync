@@ -18,6 +18,7 @@ ansync-dbus.workspace = true
 ansync-proto.workspace = true
 ansync-input = { workspace = true, features = ["uinput"] }
 ansync-files = { workspace = true, features = ["fuse"] }
+ansync-video.workspace = true
 bytes.workspace = true
 postcard.workspace = true
 tokio = { workspace = true, features = ["signal", "rt-multi-thread", "macros", "sync"] }

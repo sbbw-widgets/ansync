@@ -28,6 +28,7 @@ use ferricast_decoder::{H264Decoder, H265Decoder};
 use tracing::{debug, info, warn};
 
 pub mod feed;
+pub mod sink_egui;
 
 /// Codecs the ansync video pipeline ever produces / consumes. Strict
 /// subset of `ferricast_core::Codec` — VP8 / VP9 are out of scope

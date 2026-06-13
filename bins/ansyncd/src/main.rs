@@ -62,14 +62,9 @@ fn run_play_file(
     runtime: tokio::runtime::Runtime,
     path: PathBuf,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use std::sync::Mutex;
-
-    let shared: mirror_window::LatestFrame = Arc::new(Mutex::new(None));
+    let shared = ansync_video::sink_egui::new_slot();
     mirror_window::spawn_play_file(&runtime, path, shared.clone());
-    // `run` blocks the calling thread on the eframe event loop. When
-    // the window closes, drop the tokio runtime to abort the decoder
-    // loop.
-    let result = mirror_window::run(shared);
+    let result = ansync_video::sink_egui::run("ansync mirror".into(), shared);
     drop(runtime);
     result
 }

@@ -23,7 +23,7 @@ mod util;
 pub use device::Device;
 pub use manager::Manager;
 pub use permissions::PermissionsIface;
-pub use state::DaemonState;
+pub use state::{DaemonAction, DaemonState};
 pub use util::parse_device_id;
 
 pub const SERVICE_NAME: &str = "org.gameros.Ansync1";

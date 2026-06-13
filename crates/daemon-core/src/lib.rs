@@ -11,9 +11,12 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use std::collections::HashMap;
+use std::sync::Mutex as StdMutex;
+
 use ansync_core::{Capabilities, DeviceId, DeviceName, Permission};
 use ansync_crypto::IdentityKeypair;
-use ansync_dbus::{DaemonState, serve};
+use ansync_dbus::{DaemonAction, DaemonState, serve};
 use ansync_discovery::{Discovery, MdnsDiscovery};
 use ansync_files::{
     AutoAcceptPolicy, fs::client::FsClient, fs::fuse_mount::FuseMount, receive_file,
@@ -26,9 +29,12 @@ use ansync_transport::pinning::TrustedPeers;
 use ansync_transport::{
     Connection, QuicConnection, QuicServer, QuicStream, QuicTransport, Stream as _, StreamKind,
 };
+use ansync_video::sink_egui::{FrameSlot, new_slot};
+use ansync_video::{HostDecoder, VideoCodec, VideoDecoder};
 use directories::BaseDirs;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::Mutex;
+use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 use tracing::{debug, error, info, warn};
 
 #[derive(Debug, thiserror::Error)]
@@ -147,15 +153,22 @@ impl Daemon {
         let listen = server.local_addr()?;
         info!(addr = %listen, "QUIC server bound");
 
-        let state = Arc::new(DaemonState::new(
-            identity,
-            self.config.device_name.clone(),
-            peers.clone(),
-            permissions.clone(),
-        ));
+        let (action_tx, action_rx) = unbounded_channel::<DaemonAction>();
+        let state = Arc::new(
+            DaemonState::new(
+                identity,
+                self.config.device_name.clone(),
+                peers.clone(),
+                permissions.clone(),
+            )
+            .with_actions(action_tx),
+        );
 
         let dbus_conn = serve(state.clone()).await?;
         info!(service = ansync_dbus::SERVICE_NAME, "D-Bus surface ready");
+
+        let mirrors = Arc::new(MirrorRegistry::default());
+        let action_handle = tokio::spawn(action_loop(action_rx, mirrors.clone()));
 
         let device_name = DeviceName(self.config.device_name.clone());
         mdns.announce(&device_name, listen.port(), self.config.capabilities)
@@ -169,11 +182,13 @@ impl Daemon {
             permissions: permissions.clone(),
             factory,
             download_dir,
+            mirrors: mirrors.clone(),
         }));
 
         wait_for_shutdown().await?;
 
         accept_handle.abort();
+        action_handle.abort();
         if let Err(e) = mdns.stop_announce().await {
             warn!(error = %e, "mDNS stop_announce failed");
         }
@@ -214,6 +229,91 @@ struct AcceptCtx {
     permissions: Arc<dyn ansync_permissions::PermissionsStore>,
     factory: Arc<dyn InputDeviceFactory>,
     download_dir: PathBuf,
+    mirrors: Arc<MirrorRegistry>,
+}
+
+/// Per-peer mirror state: frame slot the decoder populates and the
+/// thread handle of the open window (if any).
+#[derive(Default)]
+pub struct MirrorRegistry {
+    entries: StdMutex<HashMap<DeviceId, Arc<MirrorEntry>>>,
+}
+
+pub struct MirrorEntry {
+    pub slot: FrameSlot,
+    pub peer_name: String,
+    /// `Some` while a window thread is alive; cleared on HideScreen.
+    window: StdMutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+impl MirrorRegistry {
+    /// Get-or-create the entry. Slot survives multiple peer reconnects
+    /// so the window can stay open while video pauses + resumes.
+    pub fn ensure(&self, id: &DeviceId, name: &str) -> Arc<MirrorEntry> {
+        let mut entries = self.entries.lock().expect("mirror registry poisoned");
+        entries
+            .entry(id.clone())
+            .or_insert_with(|| {
+                Arc::new(MirrorEntry {
+                    slot: new_slot(),
+                    peer_name: name.to_string(),
+                    window: StdMutex::new(None),
+                })
+            })
+            .clone()
+    }
+
+    pub fn get(&self, id: &DeviceId) -> Option<Arc<MirrorEntry>> {
+        self.entries
+            .lock()
+            .ok()
+            .and_then(|e| e.get(id).cloned())
+    }
+}
+
+async fn action_loop(
+    mut rx: UnboundedReceiver<DaemonAction>,
+    mirrors: Arc<MirrorRegistry>,
+) {
+    while let Some(action) = rx.recv().await {
+        match action {
+            DaemonAction::ShowScreen { device } => {
+                let Some(entry) = mirrors.get(&device) else {
+                    warn!(%device, "ShowScreen: no mirror entry (peer not connected?)");
+                    continue;
+                };
+                let mut guard = entry.window.lock().expect("window slot poisoned");
+                if guard.is_some() {
+                    debug!(%device, "ShowScreen: window already up");
+                    continue;
+                }
+                let slot = entry.slot.clone();
+                let title = format!("ansync — {}", entry.peer_name);
+                let handle = std::thread::Builder::new()
+                    .name(format!("ansync-mirror-{device}"))
+                    .spawn(move || {
+                        if let Err(e) = ansync_video::sink_egui::run(title, slot) {
+                            warn!(error = %e, "mirror window exited with error");
+                        }
+                    })
+                    .ok();
+                *guard = handle;
+                info!(%device, "ShowScreen: window spawned");
+            }
+            DaemonAction::HideScreen { device } => {
+                let Some(entry) = mirrors.get(&device) else {
+                    continue;
+                };
+                let mut guard = entry.window.lock().expect("window slot poisoned");
+                // eframe doesn't expose a clean external close API; the
+                // user closes the window. Just clear our handle so the
+                // next ShowScreen can re-open. The thread terminates
+                // when the user closes the window.
+                *guard = None;
+                info!(%device, "HideScreen: handle cleared");
+            }
+        }
+    }
 }
 
 async fn accept_loop(ctx: AcceptCtx) {
@@ -224,9 +324,11 @@ async fn accept_loop(ctx: AcceptCtx) {
                 let permissions = ctx.permissions.clone();
                 let factory = ctx.factory.clone();
                 let download_dir = ctx.download_dir.clone();
+                let mirrors = ctx.mirrors.clone();
                 tokio::spawn(async move {
                     if let Err(e) =
-                        handle_connection(conn, peers, permissions, factory, download_dir).await
+                        handle_connection(conn, peers, permissions, factory, download_dir, mirrors)
+                            .await
                     {
                         warn!(error = %e, "peer connection errored");
                     }
@@ -246,6 +348,7 @@ async fn handle_connection(
     permissions: Arc<dyn ansync_permissions::PermissionsStore>,
     factory: Arc<dyn InputDeviceFactory>,
     download_dir: PathBuf,
+    mirrors: Arc<MirrorRegistry>,
 ) -> Result<(), DaemonError> {
     let pubkey = conn.peer_identity().as_bytes();
     let mut id_bytes = [0u8; 16];
@@ -263,6 +366,11 @@ async fn handle_connection(
         permissions.clone(),
         factory.clone(),
     )));
+
+    // Ensure the mirror entry exists for this peer so the Video
+    // stream loop can populate it as soon as the companion opens its
+    // Video bidi stream.
+    let mirror_entry = mirrors.ensure(&peer_id, &peer.name.0);
 
     // Auto-mount FUSE if the peer's `files_mount` flag is on. The
     // BackgroundSession is held on the stack so dropping it on
@@ -290,6 +398,11 @@ async fn handle_connection(
                     root: download_dir.clone(),
                 });
                 tokio::spawn(files_stream_loop(stream, peer_id_inbound, perms, policy));
+            }
+            StreamKind::Video => {
+                let slot = mirror_entry.slot.clone();
+                let pid = peer_id.clone();
+                tokio::spawn(video_stream_loop(stream, slot, pid));
             }
             other => {
                 warn!(kind = ?other, "stream kind accepted but not wired yet — dropping");
@@ -367,6 +480,47 @@ fn sanitize(name: &str) -> String {
             }
         })
         .collect()
+}
+
+async fn video_stream_loop(mut stream: QuicStream, slot: FrameSlot, peer_id: DeviceId) {
+    // Initial dimension hint is rewritten by SPS on the first IDR;
+    // 1080p is a safe upper bound for the NVDEC / VA-API surface pools.
+    let mut decoder = match HostDecoder::configure(VideoCodec::H264, 1920, 1080) {
+        Ok(d) => d,
+        Err(e) => {
+            warn!(%peer_id, error = %e, "video decoder unavailable");
+            return;
+        }
+    };
+    info!(%peer_id, "video stream wired");
+    loop {
+        let bytes = match stream.recv().await {
+            Ok(b) => b,
+            Err(ansync_transport::TransportError::Closed) => {
+                info!(%peer_id, "video stream closed");
+                return;
+            }
+            Err(e) => {
+                warn!(%peer_id, error = %e, "video recv error");
+                return;
+            }
+        };
+        if let Err(e) = decoder.feed(bytes).await {
+            warn!(%peer_id, error = %e, "decoder feed failed; continuing");
+            continue;
+        }
+        match decoder.take().await {
+            Ok(Some(frame)) => {
+                if let Ok(mut s) = slot.lock() {
+                    *s = Some(frame);
+                }
+            }
+            Ok(None) => {}
+            Err(e) => {
+                warn!(%peer_id, error = %e, "decoder take failed");
+            }
+        }
+    }
 }
 
 async fn files_stream_loop(
