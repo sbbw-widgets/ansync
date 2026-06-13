@@ -80,8 +80,16 @@ El `flake.nix` pinea `nixpkgs` a `549bd84d6279f9852cae6225e372cc67fb91a4c1` para
   - **D-Bus dynamic registration** — `Manager.RefreshPeers()` D-Bus method; `ansyncctl pair` lo llama post-store.put. No más restart del daemon después de pair.
   - **Auto-install APK durante pair** — `pair_host_via_adb` ahora chequea `pm list packages` y corre `adb install -r -g` si el companion no está. CLI flag `--apk` o env `ANSYNC_COMPANION_APK` o default `/usr/share/ansync/companion.apk`. UX idéntica a scrcpy modulo path al APK.
   - **Companion mDNS + Connect button** — `HostDiscovery.kt` wrappea `NsdManager` con `WifiManager.MulticastLock` (mandatorio en Android). `MainActivity` matchea paired pubkey con hosts descubiertos y muestra botón "Connect to X (IP)" que dispara `nativeOpenConnection`.
-- **Próximo (Step 10)** — camera + D-Bus control (camera_id, w/h, fps, bitrate, codec, aspect, stabilization).
-- Después (7c–e) arranca companion Android en `android/`.
+- **Step 10 cerrado** — Camera v4l2loopback end-to-end:
+  - Proto: `CameraConfig {camera_id, w, h, fps, bitrate_kbps, codec, aspect, stabilization}` + `CameraAspect{Crop,Letterbox,Stretch}`. `ControlMessage::StartCamera(CameraConfig)` reemplaza el stub. `StreamKind::Camera` tag 0x07.
+  - `ansync_camera::V4l2LoopbackSink` impl `VirtualCameraSink` (feature `v4l2loopback`): auto-discover scan `/dev/video*` por `V4L2_CAP_VIDEO_OUTPUT` + `with_path` override; set_format NV12 / YUYV / MJPG; `write_frame` raw → `libc::write` al fd (v4l2loopback acepta `write(2)` directo). Card label fijo "Ansync" via modprobe option.
+  - D-Bus: `Device.StartCamera(camera_id, w, h, fps, bitrate_kbps, codec, aspect, stabilization)` + `StopCamera()`. Codec str `h264|h265`, aspect str `crop|letterbox|stretch`. Disparan `DaemonAction::{StartCamera,StopCamera}`.
+  - `daemon-core`: `CameraRegistry` per-peer (sink + JoinHandle + frame_tx mpsc). `handle_start_camera` chequea `Permission::CameraVideo`, abre `StreamKind::Control` outbound, manda postcard `Envelope{Message::Control(StartCamera(cfg))}`, spawn-ea `camera_decode_loop` (HostDecoder NV12 → sink). Accept `StreamKind::Camera` inbound demuxa al `frame_tx` del entry. Disconnect tear-down (abort handle + sink.unregister).
+  - Companion native: JNI `nativePollCameraControl` + `nativeSendCameraChunk` (lazy `StreamKind::Camera` outbound) + `nativeStopCameraStream`. `streams_accept_loop` demuxa `StreamKind::Control` → `control_recv_loop` decoda Envelope/Message Control → tag-binary blob para Kotlin.
+  - Companion Kotlin: `CameraSession` Camera2 + MediaCodec AVC/HEVC con Surface input (zero-copy sensor → encoder). `pickOutputSize` matchea cuello bajo, `CONTROL_AE_TARGET_FPS_RANGE` fija fps, `CONTROL_VIDEO_STABILIZATION_MODE_ON` opcional. `AnsyncCompanionService` arranca HandlerThread `ansync-cam-ctrl` que polea native + dispatch Start/Stop. `WireCameraControl.kt` espejo. Manifest: `CAMERA` + `FOREGROUND_SERVICE_CAMERA`; service foregroundServiceType `mediaProjection|camera`.
+  - `Capabilities::CAMERA_VIDEO` default-on en `DaemonConfig`.
+  - `nix/v4l2loopback.nix` partial: `extraModulePackages = [ kernelPackages.v4l2loopback ]` + modprobe options (`devices=1 video_nr=10 card_label="Ansync" exclusive_caps=1`) + udev rule grupo `video`. Step 14 importa.
+- **Próximo (Step 11)** — audio PipeWire bidireccional + notification widget Android MediaSession.
 
 Ver `PLAN.md` § Roadmap para la lista completa.
 

@@ -12,6 +12,7 @@ ansync-core.workspace = true
 ansync-crypto.workspace = true
 ansync-pairing.workspace = true
 ansync-permissions.workspace = true
+ansync-proto.workspace = true
 async-trait.workspace = true
 zbus.workspace = true
 serde.workspace = true

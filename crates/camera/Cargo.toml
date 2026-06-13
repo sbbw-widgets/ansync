@@ -12,9 +12,12 @@ ansync-core.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
 thiserror.workspace = true
+tokio = { workspace = true, features = ["sync"] }
+tracing.workspace = true
 
+libc = { workspace = true, optional = true }
 v4l = { workspace = true, optional = true }
 
 [features]
 default = []
-v4l2loopback = ["dep:v4l"]
+v4l2loopback = ["dep:v4l", "dep:libc"]

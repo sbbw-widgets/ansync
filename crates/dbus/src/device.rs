@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use ansync_core::{Capabilities, DeviceId};
+use ansync_proto::{CameraAspect, CameraConfig, VideoCodec};
 use zbus::interface;
 
 use crate::state::{DaemonAction, DaemonState};
@@ -109,12 +110,75 @@ impl Device {
         Ok(())
     }
 
-    async fn start_camera(&self) -> zbus::fdo::Result<()> {
-        Err(not_yet("StartCamera"))
+    /// Start a camera capture session on the paired peer.
+    ///
+    /// * `camera_id` is the Android `cameraId` string (typically
+    ///   `"0"` = primary back, `"1"` = primary front).
+    /// * `codec` accepts `"h264"` / `"h265"`.
+    /// * `aspect` accepts `"crop"` / `"letterbox"` / `"stretch"`.
+    /// * `stabilization` toggles `CONTROL_VIDEO_STABILIZATION_MODE_ON`
+    ///   on the companion side when the device supports it.
+    #[allow(clippy::too_many_arguments)]
+    async fn start_camera(
+        &self,
+        camera_id: String,
+        width: u32,
+        height: u32,
+        fps: u8,
+        bitrate_kbps: u32,
+        codec: String,
+        aspect: String,
+        stabilization: bool,
+    ) -> zbus::fdo::Result<()> {
+        let tx = self.state.actions.as_ref().ok_or_else(|| {
+            zbus::fdo::Error::Failed("daemon action channel not wired".into())
+        })?;
+        let codec = match codec.as_str() {
+            "h264" | "H264" => VideoCodec::H264,
+            "h265" | "H265" | "hevc" | "HEVC" => VideoCodec::H265,
+            other => {
+                return Err(zbus::fdo::Error::InvalidArgs(format!(
+                    "codec must be h264|h265, got {other}"
+                )));
+            }
+        };
+        let aspect = match aspect.as_str() {
+            "crop" => CameraAspect::Crop,
+            "letterbox" => CameraAspect::Letterbox,
+            "stretch" => CameraAspect::Stretch,
+            other => {
+                return Err(zbus::fdo::Error::InvalidArgs(format!(
+                    "aspect must be crop|letterbox|stretch, got {other}"
+                )));
+            }
+        };
+        let config = CameraConfig {
+            camera_id,
+            width,
+            height,
+            fps,
+            bitrate_kbps,
+            codec,
+            aspect,
+            stabilization,
+        };
+        tx.send(DaemonAction::StartCamera {
+            device: self.id.clone(),
+            config,
+        })
+        .map_err(|e| zbus::fdo::Error::Failed(format!("send action: {e}")))?;
+        Ok(())
     }
 
     async fn stop_camera(&self) -> zbus::fdo::Result<()> {
-        Err(not_yet("StopCamera"))
+        let tx = self.state.actions.as_ref().ok_or_else(|| {
+            zbus::fdo::Error::Failed("daemon action channel not wired".into())
+        })?;
+        tx.send(DaemonAction::StopCamera {
+            device: self.id.clone(),
+        })
+        .map_err(|e| zbus::fdo::Error::Failed(format!("send action: {e}")))?;
+        Ok(())
     }
 
     async fn start_microphone(&self) -> zbus::fdo::Result<()> {

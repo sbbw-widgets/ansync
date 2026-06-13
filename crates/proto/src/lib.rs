@@ -54,7 +54,7 @@ pub enum PermissionMessage {
 pub enum ControlMessage {
     StartScreen { codec: VideoCodec, max_bitrate_kbps: u32, max_fps: u8 },
     StopScreen,
-    StartCamera { codec: VideoCodec },
+    StartCamera(CameraConfig),
     StopCamera,
     StartMic,
     StopMic,
@@ -66,6 +66,34 @@ pub enum ControlMessage {
 pub enum VideoCodec {
     H264,
     H265,
+}
+
+/// Per-call camera capture parameters negotiated host → companion.
+/// `camera_id` is an Android `cameraId` string ("0" = primary back,
+/// "1" = primary front on most devices). Width/height are the
+/// *encoder output* dimensions; the companion may letterbox or
+/// downscale the sensor frame to fit, honouring `aspect`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CameraConfig {
+    pub camera_id: String,
+    pub width: u32,
+    pub height: u32,
+    pub fps: u8,
+    pub bitrate_kbps: u32,
+    pub codec: VideoCodec,
+    pub aspect: CameraAspect,
+    pub stabilization: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub enum CameraAspect {
+    /// Crop sensor frame to match `width`/`height` exactly.
+    Crop,
+    /// Letterbox sensor frame inside `width`/`height` keeping
+    /// sensor's native AR.
+    Letterbox,
+    /// Stretch sensor frame to fill output dimensions ignoring AR.
+    Stretch,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]

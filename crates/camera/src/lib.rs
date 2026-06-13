@@ -8,6 +8,12 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 
+#[cfg(feature = "v4l2loopback")]
+pub mod v4l2loopback;
+
+#[cfg(feature = "v4l2loopback")]
+pub use v4l2loopback::V4l2LoopbackSink;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CameraPixelFormat {
     Yuyv,

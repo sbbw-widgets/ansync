@@ -11,7 +11,15 @@
     <!-- Persistent foreground for capture + input dispatch (Step 7d/e). -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CAMERA" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!-- Virtual camera relay (Step 10): host streams sensor frames
+         from the Android camera into a v4l2loopback device. The
+         user-facing permission grant is the standard runtime CAMERA
+         prompt the first time MainActivity routes a StartCamera. -->
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-feature android:name="android.hardware.camera.any" android:required="false" />
 
     <!-- Required to draw the persistent companion notification widget
          in Step 11 (audio routing controls). -->
@@ -47,7 +55,7 @@
         <service
             android:name=".AnsyncCompanionService"
             android:exported="false"
-            android:foregroundServiceType="mediaProjection" />
+            android:foregroundServiceType="mediaProjection|camera" />
 
         <!-- Cable-pairing entry point. Invoked by the host via
              `adb shell am broadcast`. Exported so the ADB shell can

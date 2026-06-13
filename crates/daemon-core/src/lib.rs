@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::collections::HashMap;
 use std::sync::Mutex as StdMutex;
 
+use ansync_camera::{CameraFormat, CameraPixelFormat, VirtualCameraSink};
 use ansync_core::{Capabilities, DeviceId, DeviceName, Permission};
 use ansync_crypto::IdentityKeypair;
 use ansync_dbus::{DaemonAction, DaemonState, serve};
@@ -24,13 +25,16 @@ use ansync_files::{
 use ansync_input::{InputDeviceFactory, InputSession, UinputFactory};
 use ansync_pairing::PeerStore;
 use ansync_permissions::FilePermissionsStore;
-use ansync_proto::InputMessage;
+use ansync_proto::{
+    CameraConfig, ControlMessage, Envelope, InputMessage, Message, PROTOCOL_VERSION,
+    VideoCodec as ProtoVideoCodec,
+};
 use ansync_transport::pinning::TrustedPeers;
 use ansync_transport::{
     Connection, QuicConnection, QuicServer, QuicStream, QuicTransport, Stream as _, StreamKind,
 };
 use ansync_video::sink_egui::{FrameSlot, new_slot};
-use ansync_video::{HostDecoder, VideoCodec, VideoDecoder};
+use ansync_video::{HostDecoder, PixelFormat, VideoCodec, VideoDecoder};
 use directories::BaseDirs;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::Mutex;
@@ -95,7 +99,9 @@ impl DaemonConfig {
             permissions_dir: None,
             listen_addr: "0.0.0.0:0".parse().expect("hard-coded addr parses"),
             download_dir: None,
-            capabilities: Capabilities::INPUT_FROM_DEV | Capabilities::FILES,
+            capabilities: Capabilities::INPUT_FROM_DEV
+                | Capabilities::FILES
+                | Capabilities::CAMERA_VIDEO,
         }
     }
 }
@@ -168,7 +174,13 @@ impl Daemon {
         info!(service = ansync_dbus::SERVICE_NAME, "D-Bus surface ready");
 
         let mirrors = Arc::new(MirrorRegistry::default());
-        let action_handle = tokio::spawn(action_loop(action_rx, mirrors.clone()));
+        let cameras = Arc::new(CameraRegistry::default());
+        let action_handle = tokio::spawn(action_loop(
+            action_rx,
+            mirrors.clone(),
+            cameras.clone(),
+            permissions.clone(),
+        ));
 
         let device_name = DeviceName(self.config.device_name.clone());
         mdns.announce(&device_name, listen.port(), self.config.capabilities)
@@ -183,6 +195,7 @@ impl Daemon {
             factory,
             download_dir,
             mirrors: mirrors.clone(),
+            cameras: cameras.clone(),
         }));
 
         wait_for_shutdown().await?;
@@ -230,6 +243,7 @@ struct AcceptCtx {
     factory: Arc<dyn InputDeviceFactory>,
     download_dir: PathBuf,
     mirrors: Arc<MirrorRegistry>,
+    cameras: Arc<CameraRegistry>,
 }
 
 /// Per-peer mirror state: frame slot the decoder populates and the
@@ -248,6 +262,53 @@ pub struct MirrorEntry {
     /// to open an outbound Input stream on ShowScreen. Cleared by
     /// `handle_connection` on disconnect.
     pub conn: StdMutex<Option<Arc<QuicConnection>>>,
+}
+
+/// Per-peer camera pipeline state. Lives across connect / disconnect
+/// cycles so a `StopCamera` from D-Bus after a brief drop still finds
+/// the sink it owns.
+#[derive(Default)]
+pub struct CameraRegistry {
+    entries: StdMutex<HashMap<DeviceId, Arc<CameraEntry>>>,
+}
+
+pub struct CameraEntry {
+    pub peer_name: String,
+    /// The v4l2loopback sink. Lazily created on the first StartCamera
+    /// and reused across reconfigures within the same peer.
+    sink: tokio::sync::Mutex<Option<Arc<dyn VirtualCameraSink>>>,
+    /// `Some` while a camera stream is alive. Dropping it stops the
+    /// decoder feed loop.
+    handle: StdMutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Bridges the per-peer `StreamKind::Camera` accept handler (which
+    /// owns the QuicStream) to the decode → sink loop. Set when
+    /// StartCamera arrives, cleared on StopCamera. The accept handler
+    /// pushes raw encoded packets here.
+    frame_tx: StdMutex<Option<tokio::sync::mpsc::UnboundedSender<bytes::Bytes>>>,
+}
+
+impl CameraRegistry {
+    pub fn ensure(&self, id: &DeviceId, name: &str) -> Arc<CameraEntry> {
+        let mut entries = self.entries.lock().expect("camera registry poisoned");
+        entries
+            .entry(id.clone())
+            .or_insert_with(|| {
+                Arc::new(CameraEntry {
+                    peer_name: name.to_string(),
+                    sink: tokio::sync::Mutex::new(None),
+                    handle: StdMutex::new(None),
+                    frame_tx: StdMutex::new(None),
+                })
+            })
+            .clone()
+    }
+
+    pub fn get(&self, id: &DeviceId) -> Option<Arc<CameraEntry>> {
+        self.entries
+            .lock()
+            .ok()
+            .and_then(|e| e.get(id).cloned())
+    }
 }
 
 impl MirrorRegistry {
@@ -279,9 +340,23 @@ impl MirrorRegistry {
 async fn action_loop(
     mut rx: UnboundedReceiver<DaemonAction>,
     mirrors: Arc<MirrorRegistry>,
+    cameras: Arc<CameraRegistry>,
+    permissions: Arc<dyn ansync_permissions::PermissionsStore>,
 ) {
     while let Some(action) = rx.recv().await {
         match action {
+            DaemonAction::StartCamera { device, config } => {
+                if let Err(e) =
+                    handle_start_camera(&mirrors, &cameras, &permissions, &device, config).await
+                {
+                    warn!(%device, error = %e, "StartCamera failed");
+                }
+            }
+            DaemonAction::StopCamera { device } => {
+                if let Err(e) = handle_stop_camera(&cameras, &device).await {
+                    warn!(%device, error = %e, "StopCamera failed");
+                }
+            }
             DaemonAction::ShowScreen { device } => {
                 let Some(entry) = mirrors.get(&device) else {
                     warn!(%device, "ShowScreen: no mirror entry (peer not connected?)");
@@ -351,10 +426,18 @@ async fn accept_loop(ctx: AcceptCtx) {
                 let factory = ctx.factory.clone();
                 let download_dir = ctx.download_dir.clone();
                 let mirrors = ctx.mirrors.clone();
+                let cameras = ctx.cameras.clone();
                 tokio::spawn(async move {
-                    if let Err(e) =
-                        handle_connection(conn, peers, permissions, factory, download_dir, mirrors)
-                            .await
+                    if let Err(e) = handle_connection(
+                        conn,
+                        peers,
+                        permissions,
+                        factory,
+                        download_dir,
+                        mirrors,
+                        cameras,
+                    )
+                    .await
                     {
                         warn!(error = %e, "peer connection errored");
                     }
@@ -375,6 +458,7 @@ async fn handle_connection(
     factory: Arc<dyn InputDeviceFactory>,
     download_dir: PathBuf,
     mirrors: Arc<MirrorRegistry>,
+    cameras: Arc<CameraRegistry>,
 ) -> Result<(), DaemonError> {
     let pubkey = conn.peer_identity().as_bytes();
     let mut id_bytes = [0u8; 16];
@@ -400,6 +484,7 @@ async fn handle_connection(
     // Video bidi stream.
     let mirror_entry = mirrors.ensure(&peer_id, &peer.name.0);
     *mirror_entry.conn.lock().expect("conn slot poisoned") = Some(conn_arc.clone());
+    let camera_entry = cameras.ensure(&peer_id, &peer.name.0);
 
     // Auto-mount FUSE if the peer's `files_mount` flag is on. The
     // BackgroundSession is held on the stack so dropping it on
@@ -434,6 +519,11 @@ async fn handle_connection(
                 let pid = peer_id.clone();
                 tokio::spawn(video_stream_loop(stream, slot, pid));
             }
+            StreamKind::Camera => {
+                let entry = camera_entry.clone();
+                let pid = peer_id.clone();
+                tokio::spawn(camera_stream_loop(stream, entry, pid));
+            }
             other => {
                 warn!(kind = ?other, "stream kind accepted but not wired yet — dropping");
                 drop(stream);
@@ -444,7 +534,64 @@ async fn handle_connection(
     // Clear the conn slot so ShowScreen won't try to open streams on
     // a closed connection until the peer reconnects.
     *mirror_entry.conn.lock().expect("conn slot poisoned") = None;
+    // Camera pipeline is per-action; if it was running, kill its
+    // task and unregister the sink so the v4l2 device is free.
+    if let Some(handle) = camera_entry
+        .handle
+        .lock()
+        .expect("handle slot poisoned")
+        .take()
+    {
+        handle.abort();
+    }
+    *camera_entry.frame_tx.lock().expect("frame tx slot poisoned") = None;
+    if let Some(sink) = camera_entry.sink.lock().await.take() {
+        if let Err(e) = sink.unregister().await {
+            warn!(%peer_id, error = %e, "camera sink unregister on disconnect failed");
+        }
+    }
     Ok(())
+}
+
+async fn camera_stream_loop(
+    mut stream: QuicStream,
+    entry: Arc<CameraEntry>,
+    peer_id: DeviceId,
+) {
+    info!(%peer_id, "camera stream wired");
+    loop {
+        let bytes = match stream.recv().await {
+            Ok(b) => b,
+            Err(ansync_transport::TransportError::Closed) => {
+                info!(%peer_id, "camera stream closed");
+                return;
+            }
+            Err(e) => {
+                warn!(%peer_id, error = %e, "camera stream recv error");
+                return;
+            }
+        };
+        let tx = match entry
+            .frame_tx
+            .lock()
+            .expect("frame tx slot poisoned")
+            .clone()
+        {
+            Some(tx) => tx,
+            None => {
+                // StartCamera hasn't fired yet (companion opened its
+                // stream first) or StopCamera already cleared the
+                // sender. Drop frames silently — when StartCamera
+                // arrives it spawns a fresh decoder loop that picks
+                // up subsequent frames.
+                continue;
+            }
+        };
+        if tx.send(bytes).is_err() {
+            info!(%peer_id, "camera frame receiver dropped; exiting");
+            return;
+        }
+    }
 }
 
 async fn maybe_auto_mount(
@@ -513,6 +660,177 @@ fn sanitize(name: &str) -> String {
             }
         })
         .collect()
+}
+
+async fn handle_start_camera(
+    mirrors: &MirrorRegistry,
+    cameras: &CameraRegistry,
+    permissions: &Arc<dyn ansync_permissions::PermissionsStore>,
+    device: &DeviceId,
+    config: CameraConfig,
+) -> Result<(), DaemonError> {
+    if !permissions
+        .check(device, Permission::CameraVideo)
+        .await
+        .unwrap_or(false)
+    {
+        warn!(%device, "camera_video permission off; refusing StartCamera");
+        return Ok(());
+    }
+    let mirror = mirrors
+        .get(device)
+        .ok_or_else(|| DaemonError::Startup(format!("no mirror entry for {device}")))?;
+    let conn = mirror
+        .conn
+        .lock()
+        .expect("conn slot poisoned")
+        .clone()
+        .ok_or_else(|| DaemonError::Startup(format!("peer {device} not connected")))?;
+    let entry = cameras.ensure(device, &mirror.peer_name);
+
+    // Tear down any previous pipeline before re-bootstrapping so a
+    // second StartCamera with a different config doesn't leak a task.
+    if let Some(handle) = entry.handle.lock().expect("handle slot poisoned").take() {
+        handle.abort();
+    }
+    {
+        let mut sink_guard = entry.sink.lock().await;
+        if sink_guard.is_none() {
+            let sink: Arc<dyn VirtualCameraSink> = build_camera_sink()?;
+            *sink_guard = Some(sink);
+        }
+    }
+
+    // Push the StartCamera control message to the companion. The
+    // Control stream is opener-writes, so the host opens it for this
+    // outbound message.
+    let mut ctrl = conn.open(StreamKind::Control).await?;
+    let env = Envelope {
+        version: PROTOCOL_VERSION,
+        message: Message::Control(ControlMessage::StartCamera(config.clone())),
+    };
+    let bytes = postcard::to_allocvec(&env)
+        .map_err(|e| DaemonError::Startup(format!("encode StartCamera: {e}")))?;
+    ctrl.send(bytes::Bytes::from(bytes)).await?;
+    info!(%device, camera = %config.camera_id, "StartCamera control sent");
+
+    // Spawn the decode → sink loop. The companion will open
+    // `StreamKind::Camera` in response; we wait for it on the
+    // per-peer accept loop and dispatch into a temporary channel.
+    let entry_clone = entry.clone();
+    let codec = match config.codec {
+        ProtoVideoCodec::H264 => VideoCodec::H264,
+        ProtoVideoCodec::H265 => VideoCodec::H265,
+    };
+    let width = config.width;
+    let height = config.height;
+    let (frame_tx, frame_rx) = unbounded_channel::<bytes::Bytes>();
+    *entry.frame_tx.lock().expect("frame tx slot poisoned") = Some(frame_tx);
+    let handle = tokio::spawn(camera_decode_loop(
+        entry_clone,
+        codec,
+        width,
+        height,
+        frame_rx,
+    ));
+    *entry.handle.lock().expect("handle slot poisoned") = Some(handle);
+    Ok(())
+}
+
+async fn handle_stop_camera(
+    cameras: &CameraRegistry,
+    device: &DeviceId,
+) -> Result<(), DaemonError> {
+    let entry = match cameras.get(device) {
+        Some(e) => e,
+        None => return Ok(()),
+    };
+    if let Some(handle) = entry.handle.lock().expect("handle slot poisoned").take() {
+        handle.abort();
+    }
+    *entry.frame_tx.lock().expect("frame tx slot poisoned") = None;
+    let mut sink_guard = entry.sink.lock().await;
+    if let Some(sink) = sink_guard.take() {
+        if let Err(e) = sink.unregister().await {
+            warn!(%device, error = %e, "camera sink unregister failed");
+        }
+    }
+    info!(%device, "StopCamera done");
+    Ok(())
+}
+
+fn build_camera_sink() -> Result<Arc<dyn VirtualCameraSink>, DaemonError> {
+    Ok(Arc::new(ansync_camera::V4l2LoopbackSink::new()))
+}
+
+async fn camera_decode_loop(
+    entry: Arc<CameraEntry>,
+    codec: VideoCodec,
+    width: u32,
+    height: u32,
+    mut frame_rx: UnboundedReceiver<bytes::Bytes>,
+) {
+    let mut decoder = match HostDecoder::configure(codec, width, height) {
+        Ok(d) => d,
+        Err(e) => {
+            warn!(error = %e, "camera decoder unavailable; aborting");
+            return;
+        }
+    };
+    // Lazy-register the sink on the first decoded frame so we know the
+    // actual frame dimensions (decoder may re-derive from SPS).
+    let mut sink_registered = false;
+    while let Some(bytes) = frame_rx.recv().await {
+        if let Err(e) = decoder.feed(bytes).await {
+            warn!(error = %e, "camera decoder feed failed; continuing");
+            continue;
+        }
+        let frame = match decoder.take().await {
+            Ok(Some(f)) => f,
+            Ok(None) => continue,
+            Err(e) => {
+                warn!(error = %e, "camera decoder take failed");
+                continue;
+            }
+        };
+        let pixel = match frame.format {
+            PixelFormat::Nv12 => CameraPixelFormat::Nv12,
+            PixelFormat::I420 => CameraPixelFormat::Nv12,
+            // BGRA / RGBA decoders should be exceedingly rare for
+            // companion camera streams (Android encodes NV12 from the
+            // HW pipeline); if it does happen we drop the frame
+            // rather than do a CPU repack — v4l2loopback wouldn't
+            // present BGRA correctly to most consumers anyway.
+            PixelFormat::Bgra8 | PixelFormat::Rgba8 => {
+                warn!("camera decoder emitted packed RGB; dropping (sink wants NV12)");
+                continue;
+            }
+        };
+        let sink = match entry.sink.lock().await.clone() {
+            Some(s) => s,
+            None => {
+                warn!("camera sink missing while decoder running; bailing");
+                return;
+            }
+        };
+        if !sink_registered {
+            let fmt = CameraFormat {
+                width: frame.width,
+                height: frame.height,
+                fps: 30,
+                pixel_format: pixel,
+            };
+            if let Err(e) = sink.register(&entry.peer_name, fmt).await {
+                warn!(error = %e, "camera sink register failed");
+                return;
+            }
+            sink_registered = true;
+        }
+        if let Err(e) = sink.write_frame(frame.data).await {
+            warn!(error = %e, "camera sink write_frame failed");
+        }
+    }
+    info!(name = %entry.peer_name, "camera_decode_loop: channel closed");
 }
 
 async fn input_writer_loop(

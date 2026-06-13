@@ -193,7 +193,10 @@ dependencies = [
  "ansync-core",
  "async-trait",
  "bytes",
+ "libc",
  "thiserror 2.0.18",
+ "tokio",
+ "tracing",
  "v4l",
 ]
 
@@ -234,6 +237,7 @@ dependencies = [
 name = "ansync-daemon-core"
 version = "0.1.0"
 dependencies = [
+ "ansync-camera",
  "ansync-core",
  "ansync-crypto",
  "ansync-dbus",
@@ -262,6 +266,7 @@ dependencies = [
  "ansync-crypto",
  "ansync-pairing",
  "ansync-permissions",
+ "ansync-proto",
  "async-trait",
  "serde",
  "thiserror 2.0.18",
@@ -414,6 +419,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "zbus",
 ]
 
 [[package]]

@@ -19,7 +19,7 @@ use ansync_crypto::IdentityKeypair;
 use ansync_files::{AutoAcceptPolicy, receive_file};
 use ansync_pairing::cable::bootstrap_companion;
 use ansync_permissions::{PermissionsError, PermissionsStore};
-use ansync_proto::{FsOpMessage, InputMessage};
+use ansync_proto::{ControlMessage, Envelope, FsOpMessage, InputMessage, Message};
 use ansync_transport::{
     Connection, QuicConnection, QuicStream, QuicTransport, Stream as _, StreamKind,
 };
@@ -111,6 +111,15 @@ struct ActiveSession {
     /// the SAF op. Sequential per stream.
     fs_req_rx: Arc<AsyncMutex<UnboundedReceiver<Vec<u8>>>>,
     fs_reply_tx: Arc<UnboundedSender<Vec<u8>>>,
+    /// Outbound device→host Camera stream. Lazy-opened on first
+    /// `nativeSendCameraChunk` call (typically right after Kotlin
+    /// processes a StartCamera control message).
+    outbound_camera: Arc<AsyncMutex<Option<QuicStream>>>,
+    /// Inbound `ControlMessage::StartCamera` / `StopCamera` decoded
+    /// from the host's Control stream. Encoded as tag-binary blobs
+    /// for the Kotlin polling loop. Mirrors the FS request channel
+    /// pattern.
+    camera_ctrl_rx: Arc<AsyncMutex<UnboundedReceiver<Vec<u8>>>>,
 }
 
 #[unsafe(no_mangle)]
@@ -286,6 +295,9 @@ pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativeOpenConnection
     let fs_reply_tx = Arc::new(fs_reply_tx);
     let fs_reply_rx = Arc::new(AsyncMutex::new(fs_reply_rx));
 
+    let (camera_ctrl_tx, camera_ctrl_rx) = unbounded_channel::<Vec<u8>>();
+    let camera_ctrl_tx = Arc::new(camera_ctrl_tx);
+
     let conn_arc = Arc::new(conn);
     let download_dir = {
         let slot = state_slot().lock().expect("state mutex poisoned");
@@ -308,6 +320,7 @@ pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativeOpenConnection
         fs_req_tx.clone(),
         fs_reply_rx.clone(),
         input_tx_arc.clone(),
+        camera_ctrl_tx.clone(),
     ));
 
     let session = ActiveSession {
@@ -317,6 +330,8 @@ pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativeOpenConnection
         input_rx: Arc::new(AsyncMutex::new(input_rx)),
         fs_req_rx: Arc::new(AsyncMutex::new(fs_req_rx)),
         fs_reply_tx,
+        outbound_camera: Arc::new(AsyncMutex::new(None)),
+        camera_ctrl_rx: Arc::new(AsyncMutex::new(camera_ctrl_rx)),
     };
     let mut slot = state_slot().lock().expect("state mutex poisoned");
     if let Some(s) = slot.as_mut() {
@@ -332,6 +347,7 @@ async fn streams_accept_loop(
     fs_req_tx: Arc<UnboundedSender<Vec<u8>>>,
     fs_reply_rx: Arc<AsyncMutex<UnboundedReceiver<Vec<u8>>>>,
     input_inbound_tx: Arc<UnboundedSender<Vec<u8>>>,
+    camera_ctrl_tx: Arc<UnboundedSender<Vec<u8>>>,
 ) {
     let permissions: Arc<dyn PermissionsStore> = Arc::new(PermissivePermissions);
     loop {
@@ -374,6 +390,10 @@ async fn streams_accept_loop(
                 let tx = fs_req_tx.clone();
                 let rx = fs_reply_rx.clone();
                 tokio::spawn(fs_serve_loop(stream, tx, rx));
+            }
+            StreamKind::Control => {
+                let tx = camera_ctrl_tx.clone();
+                tokio::spawn(control_recv_loop(stream, (*tx).clone()));
             }
             other => {
                 warn!("streams_accept_loop: dropping unexpected stream {other:?}");
@@ -652,6 +672,72 @@ impl<'a> Cursor<'a> {
     fn take_blob(&mut self) -> Result<Vec<u8>, String> {
         let n = self.take_u32()? as usize;
         Ok(self.take(n)?.to_vec())
+    }
+}
+
+/// Decode `Envelope`s off the Control stream and surface the
+/// `ControlMessage::StartCamera` / `StopCamera` ones to Kotlin via
+/// a tag-binary blob.
+///
+/// Layout (mirrored in `WireCameraControl.kt`):
+///   tag 0  StartCamera : str camera_id | u32 w | u32 h | u8 fps |
+///                        u32 bitrate_kbps | u8 codec(0=H264,1=H265) |
+///                        u8 aspect(0=Crop,1=Letterbox,2=Stretch) |
+///                        u8 stabilization
+///   tag 1  StopCamera  : (no payload)
+async fn control_recv_loop(mut stream: QuicStream, tx: UnboundedSender<Vec<u8>>) {
+    loop {
+        let bytes = match stream.recv().await {
+            Ok(b) => b,
+            Err(ansync_transport::TransportError::Closed) => {
+                info!("control_recv_loop: stream closed");
+                return;
+            }
+            Err(e) => {
+                warn!("control_recv_loop: recv error: {e}");
+                return;
+            }
+        };
+        let env: Envelope = match postcard::from_bytes(&bytes) {
+            Ok(e) => e,
+            Err(e) => {
+                warn!("control_recv_loop: malformed Envelope: {e}");
+                continue;
+            }
+        };
+        let blob = match env.message {
+            Message::Control(ControlMessage::StartCamera(cfg)) => {
+                let mut out = Vec::with_capacity(32);
+                out.push(0u8);
+                let id = cfg.camera_id.as_bytes();
+                out.extend_from_slice(&(id.len() as u32).to_le_bytes());
+                out.extend_from_slice(id);
+                out.extend_from_slice(&cfg.width.to_le_bytes());
+                out.extend_from_slice(&cfg.height.to_le_bytes());
+                out.push(cfg.fps);
+                out.extend_from_slice(&cfg.bitrate_kbps.to_le_bytes());
+                out.push(match cfg.codec {
+                    ansync_proto::VideoCodec::H264 => 0,
+                    ansync_proto::VideoCodec::H265 => 1,
+                });
+                out.push(match cfg.aspect {
+                    ansync_proto::CameraAspect::Crop => 0,
+                    ansync_proto::CameraAspect::Letterbox => 1,
+                    ansync_proto::CameraAspect::Stretch => 2,
+                });
+                out.push(if cfg.stabilization { 1 } else { 0 });
+                out
+            }
+            Message::Control(ControlMessage::StopCamera) => vec![1u8],
+            other => {
+                warn!("control_recv_loop: ignoring non-camera Control message {other:?}");
+                continue;
+            }
+        };
+        if tx.send(blob).is_err() {
+            info!("control_recv_loop: receiver dropped; exiting");
+            return;
+        }
     }
 }
 
@@ -1027,6 +1113,100 @@ pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativeFsReply<'local
         warn!("nativeFsReply: reply channel closed");
         return jni::sys::JNI_FALSE;
     }
+    jni::sys::JNI_TRUE
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativePollCameraControl<'local>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+) -> jni::sys::jbyteArray {
+    let camera_ctrl_rx = {
+        let slot = state_slot().lock().expect("state mutex poisoned");
+        match slot.as_ref().and_then(|s| s.session.as_ref()) {
+            Some(sess) => sess.camera_ctrl_rx.clone(),
+            None => return std::ptr::null_mut(),
+        }
+    };
+    let bytes = runtime().block_on(async move {
+        let mut guard = camera_ctrl_rx.lock().await;
+        guard.recv().await
+    });
+    match bytes {
+        Some(b) => match env.byte_array_from_slice(&b) {
+            Ok(arr) => arr.into_raw(),
+            Err(e) => {
+                error!("nativePollCameraControl: byte_array_from_slice: {e}");
+                std::ptr::null_mut()
+            }
+        },
+        None => std::ptr::null_mut(),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativeSendCameraChunk<'local>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    chunk: JByteArray<'local>,
+    _pts_us: jlong,
+) -> jboolean {
+    let bytes = match env.convert_byte_array(&chunk) {
+        Ok(b) => b,
+        Err(e) => {
+            error!("nativeSendCameraChunk: convert_byte_array: {e}");
+            return jni::sys::JNI_FALSE;
+        }
+    };
+    let (conn, outbound_camera) = {
+        let slot = state_slot().lock().expect("state mutex poisoned");
+        match slot.as_ref().and_then(|s| s.session.as_ref()) {
+            Some(sess) => (sess.conn.clone(), sess.outbound_camera.clone()),
+            None => {
+                warn!("nativeSendCameraChunk: no active session");
+                return jni::sys::JNI_FALSE;
+            }
+        }
+    };
+    let result = runtime().block_on(async move {
+        let mut guard = outbound_camera.lock().await;
+        if guard.is_none() {
+            let stream = conn.open(StreamKind::Camera).await?;
+            *guard = Some(stream);
+        }
+        guard
+            .as_mut()
+            .expect("just inserted")
+            .send(Bytes::from(bytes))
+            .await
+    });
+    match result {
+        Ok(()) => jni::sys::JNI_TRUE,
+        Err(e) => {
+            warn!("nativeSendCameraChunk: stream send failed: {e}");
+            jni::sys::JNI_FALSE
+        }
+    }
+}
+
+/// Tear down the outbound camera stream — typically called by Kotlin
+/// after the encoder drains in response to a StopCamera control.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativeStopCameraStream<'local>(
+    _env: JNIEnv<'local>,
+    _class: JClass<'local>,
+) -> jboolean {
+    let outbound_camera = {
+        let slot = state_slot().lock().expect("state mutex poisoned");
+        match slot.as_ref().and_then(|s| s.session.as_ref()) {
+            Some(sess) => sess.outbound_camera.clone(),
+            None => return jni::sys::JNI_FALSE,
+        }
+    };
+    runtime().block_on(async move {
+        let mut guard = outbound_camera.lock().await;
+        *guard = None;
+    });
     jni::sys::JNI_TRUE
 }
 

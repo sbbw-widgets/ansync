@@ -34,6 +34,7 @@ fn stream_kind_tag(kind: StreamKind) -> u8 {
         StreamKind::Files => 0x04,
         StreamKind::Fs => 0x05,
         StreamKind::Input => 0x06,
+        StreamKind::Camera => 0x07,
     }
 }
 
@@ -45,6 +46,7 @@ fn stream_kind_from_tag(tag: u8) -> Result<StreamKind, TransportError> {
         0x04 => Ok(StreamKind::Files),
         0x05 => Ok(StreamKind::Fs),
         0x06 => Ok(StreamKind::Input),
+        0x07 => Ok(StreamKind::Camera),
         _ => Err(TransportError::Handshake(format!("unknown stream tag {tag:#x}"))),
     }
 }

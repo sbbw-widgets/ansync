@@ -43,6 +43,7 @@ pub enum StreamKind {
     Files,
     Fs,
     Input,
+    Camera,
 }
 
 #[async_trait]

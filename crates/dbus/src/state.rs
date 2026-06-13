@@ -8,6 +8,7 @@ use ansync_core::DeviceId;
 use ansync_crypto::IdentityKeypair;
 use ansync_pairing::PeerStore;
 use ansync_permissions::PermissionsStore;
+use ansync_proto::CameraConfig;
 use tokio::sync::mpsc::UnboundedSender;
 
 /// Actions D-Bus interfaces dispatch back into `daemon-core`. Sent on
@@ -24,6 +25,14 @@ pub enum DaemonAction {
     ShowScreen { device: DeviceId },
     /// Close the mirror window for `device`.
     HideScreen { device: DeviceId },
+    /// Push a `ControlMessage::StartCamera` to `device` and bring up
+    /// the v4l2loopback sink + decoder pipeline for it. Idempotent —
+    /// a second StartCamera with a different config tears the old
+    /// pipeline down and re-bootstraps.
+    StartCamera { device: DeviceId, config: CameraConfig },
+    /// Stop the camera pipeline for `device` (sink unregistered,
+    /// stream closed).
+    StopCamera { device: DeviceId },
 }
 
 pub struct DaemonState {

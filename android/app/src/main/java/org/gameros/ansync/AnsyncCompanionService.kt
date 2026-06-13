@@ -11,6 +11,8 @@ import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
 import android.net.Uri
 import android.os.Build
+import android.os.Handler
+import android.os.HandlerThread
 import android.os.IBinder
 import android.util.Log
 import androidx.core.app.NotificationCompat
@@ -32,12 +34,53 @@ class AnsyncCompanionService : Service() {
     private var projection: MediaProjection? = null
     private var capture: CaptureSession? = null
     private var fsServer: AnsyncFsServer? = null
+    private var camera: CameraSession? = null
+    private var cameraPollThread: HandlerThread? = null
+    private var cameraPollHandler: Handler? = null
+    @Volatile private var cameraPollRunning = false
 
     override fun onCreate() {
         super.onCreate()
         ensureChannel(this)
         NativeBridge.nativeInit(filesDir.absolutePath)
         maybeStartFsServer()
+        startCameraControlPoller()
+    }
+
+    private fun startCameraControlPoller() {
+        if (cameraPollThread != null) return
+        val ht = HandlerThread("ansync-cam-ctrl").also { it.start() }
+        cameraPollThread = ht
+        cameraPollHandler = Handler(ht.looper)
+        cameraPollRunning = true
+        cameraPollHandler?.post(object : Runnable {
+            override fun run() {
+                while (cameraPollRunning) {
+                    val blob = NativeBridge.nativePollCameraControl() ?: return
+                    when (val msg = WireCameraControl.decode(blob)) {
+                        is WireCameraControl.StartCamera -> handleStartCamera(msg)
+                        WireCameraControl.StopCamera -> handleStopCamera()
+                        null -> Log.w(TAG, "bad camera control blob")
+                    }
+                }
+            }
+        })
+    }
+
+    private fun handleStartCamera(cfg: WireCameraControl.StartCamera) {
+        if (camera != null) {
+            Log.i(TAG, "camera already running; tearing down before re-bootstrap")
+            camera?.stop()
+            camera = null
+        }
+        camera = CameraSession(this, cfg).also { it.start() }
+        Log.i(TAG, "camera session started for ${cfg.cameraId} (${cfg.width}x${cfg.height}@${cfg.fps})")
+    }
+
+    private fun handleStopCamera() {
+        camera?.stop()
+        camera = null
+        Log.i(TAG, "camera session stopped")
     }
 
     private fun maybeStartFsServer() {
@@ -100,6 +143,12 @@ class AnsyncCompanionService : Service() {
     }
 
     override fun onDestroy() {
+        cameraPollRunning = false
+        camera?.stop()
+        camera = null
+        cameraPollThread?.quitSafely()
+        cameraPollThread = null
+        cameraPollHandler = null
         stopCapture()
         fsServer?.stop()
         fsServer = null

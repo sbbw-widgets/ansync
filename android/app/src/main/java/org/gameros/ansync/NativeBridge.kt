@@ -82,6 +82,25 @@ object NativeBridge {
      */
     external fun nativeSendInputMessage(blob: ByteArray): Boolean
 
+    /**
+     * Block (in native) until the next camera control message arrives
+     * from the host (StartCamera / StopCamera), then return the
+     * tag-binary encoding (see `WireCameraControl`). Returns `null`
+     * on session teardown.
+     */
+    external fun nativePollCameraControl(): ByteArray?
+
+    /**
+     * Push one encoded camera frame (H.264 / H.265 access unit) over
+     * the outbound Camera stream. Lazy-opens the stream on first
+     * call. Returns `false` if the stream is unhealthy — caller
+     * should tear the encoder down.
+     */
+    external fun nativeSendCameraChunk(chunk: ByteArray, ptsUs: Long): Boolean
+
+    /** Close the outbound camera stream. Idempotent. */
+    external fun nativeStopCameraStream(): Boolean
+
     /** Tear the active session down. Safe to call when no session is open. */
     external fun nativeClose()
 }
