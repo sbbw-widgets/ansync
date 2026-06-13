@@ -44,9 +44,9 @@ El `flake.nix` pinea `nixpkgs` a `549bd84d6279f9852cae6225e372cc67fb91a4c1` para
 
 ## Estado actual
 
-**Step 5 completo**: `ferricast-core` con `H265Profile` + `max_h265_profile`. `ferricast-encoder::nvenc::NvencEncoder<C>` generic (sealed `NvencCodec`, H.264 + HEVC markers, feature `nvenc-hevc`). VAAPI HEVC encoder completo en `ferricast-encoder::h265` (bitstream + VPS/SPS/PPS HEVC + parameter buffers + packed headers, feature `vaapi-hevc`). `H265Encoder` facade NVENC → VAAPI sin SW fallback. `ferricast-decoder::nvdec::NvdecDecoder<C>` con markers H.264 + HEVC (features `nvdec-decode` / `nvdec-hevc-decode`), NVDEC ahora wired en el chain del `H264Decoder` facade. `H265Decoder` facade NVDEC → VAAPI + `VaapiH265Decoder` scaffold (probe + surface pool listos; slice submission marcado como pending, mismo patrón opt-in que el H.264 VAAPI decoder). `ansync_video` con `negotiate_codec`, `local_decoder_caps`, `HostDecoder` enum dispatch.
+**Step 6 completo**: `HostDecoder` ahora instance-owned (slot `Arc<Mutex<Option<CapturedFrame>>>`), `DecodedFrame` con `stride` + `Bgra8`/`Rgba8`. `ansync_video::feed::AnnexBFile` itera Access Units desde `.h264`/`.h265` para alimentar al decoder sin companion Android. `ansyncd::mirror_window` levanta `eframe` con `Renderer::Wgpu`, convierte NV12/I420/BGRA/RGBA → `ColorImage` y sube vía `Context::load_texture`. Nuevo flag `--play-file PATH` en `ansyncd` corre solo decode + window (D-Bus skip). `flake.nix` exporta `LIBCLANG_PATH` para bindgen.
 
-**Próximo**: Step 6 — `ansync_video` decode hot path + `ansyncd` egui window + wgpu texture upload — screen mirror end-to-end H.264 → render.
+**Próximo**: Step 7 — `ansync_input` uinput (Android como kbd/touch/stylus/gamepad del PC) + reverse vía AccessibilityService en el companion Kotlin. Acá arranca formalmente la app Android en `android/` — el companion se vuelve necesario para producir streams reales de input + capture H.264 (Step 6 ya quedó probado vía `--play-file`).
 
 Ver `PLAN.md` § Roadmap para la lista completa.
 

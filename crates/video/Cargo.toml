@@ -12,6 +12,7 @@ ansync-core.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
 tracing.workspace = true
 
 # Step 5 wires ferricast-decoder in directly. The H.264 facade picks

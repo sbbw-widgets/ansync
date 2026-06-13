@@ -194,7 +194,7 @@ ansync/
 - [x] **Step 3** — `discovery` mDNS + `pairing` cable bootstrap → llave Ed25519 persistida en `$XDG_DATA_HOME/ansync/peers/`
 - [x] **Step 4** — `permissions` storage + `dbus` Manager + Device + Permissions interfaces + systemd user unit + journald
 - [x] **Step 5** — Extender `ferricast-encoder/decoder` con HEVC (NVENC + VAAPI) + wirear `ansync_video`
-- [ ] **Step 6** — `video` decode + `ansyncd` egui window — screen mirror end-to-end H.264 → wgpu texture
+- [x] **Step 6** — `video` decode + `ansyncd` egui window — screen mirror end-to-end H.264 → wgpu texture
 - [ ] **Step 7** — `input` uinput — Android como kbd/touch/stylus para PC + reverse para controlar Android vía AccessibilityService
 - [ ] **Step 8** — `files` transfer push/pull (sin mount)
 - [ ] **Step 9** — `files` FUSE mount + SAF integration Android side
@@ -305,6 +305,17 @@ Entregables:
 - `daemon-core::Daemon` carga identity, abre stores, anuncia mDNS, levanta dbus, bloquea en SIGTERM/SIGINT.
 - `bins/ansyncd`: CLI con `--device-name --identity --peers-dir --permissions-dir`, `tracing-journald` activo.
 - `bins/ansyncd/contrib/ansyncd.service`: user unit con sandboxing (`ProtectSystem=strict`, `ProtectHome=read-only`, `NoNewPrivileges`), journald stdout.
+
+### Step 6 — cerrado
+
+Entregables:
+
+- `ansync_video`: `HostDecoder` ya no usa thread-local cache — la "última frame" vive en `Arc<Mutex<Option<CapturedFrame>>>` propiedad de la instancia, así el productor (decoder loop) y el consumidor (sink GUI) pueden vivir en tasks distintas. `DecodedFrame` ahora carga `stride` y diferencia `Bgra8` / `Rgba8`.
+- `ansync_video::feed::AnnexBFile`: lector streaming de `.h264` / `.h265` Annex-B sobre `tokio::fs`. Detecta start-codes 3/4 bytes, agrupa NALs por Access Unit (AUD-delimited o primer VCL post-NAL no-VCL), expone `next_packet() -> AnnexBPacket`. Suficiente para alimentar al decoder en Step 6 sin companion Android.
+- `ansyncd::mirror_window`: `eframe::run_native` con `Renderer::Wgpu`. `MirrorApp` peekea el slot compartido, convierte NV12 / I420 / BGRA / RGBA → `egui::ColorImage` (BT.601 limited range, Q8 integer math), `ctx.load_texture` lo sube al texture manager de egui (wgpu por debajo). El widget mantiene aspect ratio centrando la imagen.
+- `ansyncd::mirror_window::run_play_file_loop`: bombea `AnnexBFile` → `HostDecoder::feed` → `take` → slot compartido, paced a ~30 fps. Falla limpio si `local_decoder_caps()` no soporta el codec.
+- `bins/ansyncd` CLI: nuevo flag `--play-file PATH`. Sin él se ejecuta el daemon como antes; con él se levanta solo la mirror window + decode loop (D-Bus / mDNS skip por simplicidad — Step 6 es path de test standalone).
+- `flake.nix`: `LIBCLANG_PATH` exportado para que `bindgen` (transitivo vía VA-API + NVDEC en ferricast) parsee headers dentro del shell de nix.
 
 ### Step 5 — cerrado
 

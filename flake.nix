@@ -80,6 +80,12 @@
             '';
 
             LD_LIBRARY_PATH = lib.makeLibraryPath runtimeDeps;
+
+            # bindgen (used transitively by ferricast's VA-API and NVDEC
+            # build scripts) needs libclang to parse system headers.
+            # Without LIBCLANG_PATH it falls back to scanning /usr/lib
+            # and panics inside a pure nix shell.
+            LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
           };
 
           # Build derivations (ansyncd / ansyncctl) get wired in Step 14

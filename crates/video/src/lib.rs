@@ -5,10 +5,18 @@
 //! auto-selects NVDEC → VA-API and refuses to bring up without HW
 //! decode (no SW fallback exists for HEVC).
 //!
-//! Step 5 wires the codec negotiation + decoder dispatch. Step 6 will
-//! plug a wgpu / eframe sink into [`FrameSink::present`].
+//! Step 6 wires the decode hot path: callers drive the decoder by
+//! pushing `Bytes` packets through [`VideoDecoder::feed`] and pull
+//! decoded frames out via [`VideoDecoder::take`]. The latest-frame
+//! buffer is owned by the decoder instance (no thread-local state),
+//! so the producer and consumer can live on different tokio tasks.
+//!
+//! Presentation lives outside this crate today: `ansyncd` consumes
+//! [`DecodedFrame`] and uploads it to a wgpu / egui texture. The
+//! [`FrameSink`] trait is defined here so future presenters (e.g. a
+//! virtual camera v4l2loopback sink) share the same plumbing.
 
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -18,6 +26,8 @@ use ferricast_core::{
 };
 use ferricast_decoder::{H264Decoder, H265Decoder};
 use tracing::{debug, info, warn};
+
+pub mod feed;
 
 /// Codecs the ansync video pipeline ever produces / consumes. Strict
 /// subset of `ferricast_core::Codec` — VP8 / VP9 are out of scope
@@ -40,15 +50,33 @@ impl VideoCodec {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PixelFormat {
+    /// 8-bit Y plane (`width × height`) followed by interleaved UV
+    /// plane (`width × height/2`). Stride applies to both planes
+    /// equally — backends that align the pitch to 256 / 512 bytes
+    /// preserve that alignment for the UV plane as well.
     Nv12,
+    /// 8-bit Y, U, V planes, each at half-stride for U / V.
     I420,
+    /// Packed BGRA8, one byte per channel, B first in memory. This is
+    /// what `openh264` and the VA-API H.264 readback emit.
+    Bgra8,
+    /// Packed RGBA8, R first. Reserved for paths that already speak
+    /// RGB order — the decoder facade does not emit this today, but a
+    /// future converter or test feeder may.
     Rgba8,
 }
 
+/// A single decoded frame, ready for the presentation sink. `data`
+/// length is `stride * height` for packed formats and `stride *
+/// height * 3 / 2` for NV12 / I420 (Y plane in-stride, UV plane
+/// directly after).
 #[derive(Debug, Clone)]
 pub struct DecodedFrame {
     pub width: u32,
     pub height: u32,
+    /// Y-plane stride for NV12 / I420; packed-pixel row stride for
+    /// BGRA / RGBA. Always `>= width * bytes_per_pixel_y`.
+    pub stride: u32,
     pub format: PixelFormat,
     pub data: Bytes,
     pub pts_us: u64,
@@ -134,22 +162,13 @@ pub fn negotiate_codec(
 /// add latency for no benefit (the answer can't change without a
 /// driver swap).
 pub fn local_decoder_caps() -> &'static CodecCapabilities {
+    use std::sync::OnceLock;
     static CACHE: OnceLock<CodecCapabilities> = OnceLock::new();
     CACHE.get_or_init(|| {
         let mut caps = CodecCapabilities {
-            // H.264 is always present — `ferricast-decoder` ships an
-            // openh264 SW fallback, so the facade can always bring up
-            // some backend.
             can_decode: vec![VideoCodec::H264],
-            // ansync today only ever decodes inbound video. Encoding
-            // is the Android side's job; leave the local "can_encode"
-            // empty so [`negotiate_codec`] doesn't accidentally claim
-            // we encode.
             can_encode: Vec::new(),
         };
-        // Probe H.265. We just try to bring up the facade with a
-        // small config and tear it down — successful `configure()`
-        // implies at least one HW backend is available.
         let mut probe = H265Decoder::new();
         let probe_cfg = FerricastDecoderConfig {
             codec: FerricastCodec::H265,
@@ -175,11 +194,20 @@ pub fn local_decoder_caps() -> &'static CodecCapabilities {
 /// Either variant satisfies [`VideoDecoder`]; outer code dispatches on
 /// the codec but doesn't need to care which HW backend ferricast picked
 /// underneath. Frames come back as `CapturedFrame` and are converted to
-/// ansync's [`DecodedFrame`] shape on the way out — pixel format /
-/// stride / pts mapping is straight passthrough today (NVDEC and VA-API
-/// both emit NV12; openh264 emits BGRA, mapped to `Rgba8` as the closest
-/// match the sink consumes).
-pub enum HostDecoder {
+/// ansync's [`DecodedFrame`] shape on the way out.
+///
+/// The "latest frame" slot is owned by the instance, not a
+/// thread-local, so the decoder can be driven from one tokio task
+/// while another task pulls frames out for the sink. Live screen
+/// mirror prefers latency over completeness: when the decoder
+/// produces frames faster than the sink consumes them, [`feed`]
+/// overwrites the slot rather than queueing.
+pub struct HostDecoder {
+    inner: HostDecoderInner,
+    latest: Arc<Mutex<Option<CapturedFrame>>>,
+}
+
+enum HostDecoderInner {
     H264(H264Decoder),
     H265(H265Decoder),
 }
@@ -195,39 +223,42 @@ impl HostDecoder {
             height,
             pixel_format: FerricastPixelFormat::Nv12,
         };
-        match codec {
+        let inner = match codec {
             VideoCodec::H264 => {
                 let mut d = H264Decoder::new();
                 d.configure(&cfg)
                     .map_err(|e| VideoError::DecoderUnavailable(format!("H.264: {e}")))?;
-                Ok(Self::H264(d))
+                HostDecoderInner::H264(d)
             }
             VideoCodec::H265 => {
                 let mut d = H265Decoder::new();
                 d.configure(&cfg)
                     .map_err(|e| VideoError::DecoderUnavailable(format!("H.265: {e}")))?;
-                Ok(Self::H265(d))
+                HostDecoderInner::H265(d)
             }
-        }
+        };
+        Ok(Self {
+            inner,
+            latest: Arc::new(Mutex::new(None)),
+        })
     }
 }
 
 #[async_trait]
 impl VideoDecoder for HostDecoder {
     fn codec(&self) -> VideoCodec {
-        match self {
-            HostDecoder::H264(_) => VideoCodec::H264,
-            HostDecoder::H265(_) => VideoCodec::H265,
+        match &self.inner {
+            HostDecoderInner::H264(_) => VideoCodec::H264,
+            HostDecoderInner::H265(_) => VideoCodec::H265,
         }
     }
 
     async fn feed(&mut self, packet: Bytes) -> Result<(), VideoError> {
         // ferricast decoders consume one EncodedFrame at a time and
         // may return zero or one frame per packet (HW pipelines often
-        // buffer the first IDR). We pump synchronously inside a
-        // blocking task — `cros-libva` is non-Send and shiguredo's
-        // NVDEC consumes a CUDA context that's bound to its creator
-        // thread; spinning them off would need a worker thread.
+        // buffer the first IDR). The call is synchronous — cros-libva
+        // is non-Send and shiguredo's NVDEC consumes a CUDA context
+        // bound to its creator thread, so we don't spawn a worker.
         let frame = EncodedFrame {
             codec: self.codec().to_ferricast(),
             data: packet,
@@ -236,18 +267,15 @@ impl VideoDecoder for HostDecoder {
             duration_us: None,
             pts_dts: (0, 0),
         };
-        let outcome = match self {
-            HostDecoder::H264(d) => d.decode(frame),
-            HostDecoder::H265(d) => d.decode(frame),
+        let outcome = match &mut self.inner {
+            HostDecoderInner::H264(d) => d.decode(frame),
+            HostDecoderInner::H265(d) => d.decode(frame),
         };
         match outcome {
             Ok(Some(captured)) => {
-                // Stash the latest frame on the decoder so the next
-                // `take` can return it. Today we only carry the
-                // newest decoded frame — pacing is the sink's job, so
-                // dropping older queued frames is the right policy
-                // for a live mirror.
-                cache_latest(captured);
+                if let Ok(mut slot) = self.latest.lock() {
+                    *slot = Some(captured);
+                }
                 Ok(())
             }
             Ok(None) => Ok(()),
@@ -259,54 +287,35 @@ impl VideoDecoder for HostDecoder {
     }
 
     async fn take(&mut self) -> Result<Option<DecodedFrame>, VideoError> {
-        Ok(take_latest().map(captured_to_decoded))
+        let captured = match self.latest.lock() {
+            Ok(mut slot) => slot.take(),
+            Err(_) => None,
+        };
+        Ok(captured.map(captured_to_decoded))
     }
 }
 
-// ── Latest-frame buffer ───────────────────────────────────────────
-//
-// Single-slot, thread-local cache. Live screen mirror prefers latency
-// over completeness — when the decoder produces frames faster than the
-// sink consumes them, the right policy is to drop everything but the
-// freshest. A `RefCell<Option<CapturedFrame>>` keyed thread-local
-// gives us O(1) feed / take without contention; the decoder and sink
-// run on the same tokio task in the daemon today.
-
-thread_local! {
-    static LATEST: std::cell::RefCell<Option<CapturedFrame>> =
-        const { std::cell::RefCell::new(None) };
-}
-
-fn cache_latest(frame: CapturedFrame) {
-    LATEST.with(|cell| *cell.borrow_mut() = Some(frame));
-}
-
-fn take_latest() -> Option<CapturedFrame> {
-    LATEST.with(|cell| cell.borrow_mut().take())
-}
-
 fn captured_to_decoded(frame: CapturedFrame) -> DecodedFrame {
-    // Ferricast hands us either a CPU NV12 (NVDEC / openh264 with our
-    // conversion) or a GPU surface. The CPU readback path materialises
-    // bytes; we forward them with the same width / height / stride
-    // semantics. The pts is whatever the source frame carried.
     let timestamp_us = frame.timestamp_us();
-    let pixel = match frame.pixel_format() {
-        FerricastPixelFormat::Nv12 => PixelFormat::Nv12,
-        FerricastPixelFormat::I420 => PixelFormat::I420,
-        FerricastPixelFormat::Bgra | FerricastPixelFormat::Rgba => PixelFormat::Rgba8,
-    };
     let width = frame.width();
     let height = frame.height();
-    let bytes = match frame.into_cpu() {
-        Ok(raw) => raw.data,
-        Err(_) => Bytes::new(),
+    let src_format = frame.pixel_format();
+    let (data, stride) = match frame.into_cpu() {
+        Ok(raw) => (raw.data, raw.stride),
+        Err(_) => (Bytes::new(), 0),
+    };
+    let format = match src_format {
+        FerricastPixelFormat::Nv12 => PixelFormat::Nv12,
+        FerricastPixelFormat::I420 => PixelFormat::I420,
+        FerricastPixelFormat::Bgra => PixelFormat::Bgra8,
+        FerricastPixelFormat::Rgba => PixelFormat::Rgba8,
     };
     DecodedFrame {
         width,
         height,
-        format: pixel,
-        data: bytes,
+        stride,
+        format,
+        data,
         pts_us: timestamp_us,
     }
 }
