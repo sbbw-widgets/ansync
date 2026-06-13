@@ -1,0 +1,12 @@
+# udev rule for ansync's virtual input backend.
+#
+# The daemon runs as a user-systemd unit and so does not carry
+# CAP_SYS_ADMIN. Open access to /dev/uinput via the standard "input"
+# group + a 0660 mode is the canonical way to let userspace create
+# virtual evdev devices without root.
+#
+# `static_node=uinput` makes systemd-tmpfiles create the node at boot
+# even before the first open(), so the daemon can claim it
+# immediately on first input event.
+
+KERNEL=="uinput", MODE="0660", GROUP="input", OPTIONS+="static_node=uinput"

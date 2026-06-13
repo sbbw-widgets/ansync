@@ -196,7 +196,7 @@ ansync/
 - [x] **Step 5** — Extender `ferricast-encoder/decoder` con HEVC (NVENC + VAAPI) + wirear `ansync_video`
 - [x] **Step 6** — `video` decode + `ansyncd` egui window — screen mirror end-to-end H.264 → wgpu texture
 - [ ] **Step 7** — `input` uinput — Android como kbd/touch/stylus para PC + reverse para controlar Android vía AccessibilityService
-  - [x] **7a** — Host `ansync_input::uinput` impls (Keyboard / Mouse / Touchscreen MT-B / Stylus / Gamepad XInput-like) detrás del feature `uinput`
+  - [x] **7a** — Host `ansync_input::uinput` impls (Keyboard / Mouse / Touchscreen MT-B / Stylus / Gamepad XInput-like) detrás del feature `uinput`. Ships `bins/ansyncd/contrib/60-ansync-uinput.rules` + `nix/uinput.nix` partial module — Step 14 lo importa al módulo NixOS consolidado para que el install sea plug-and-play (kernel module + udev rule + nota de group `input`).
   - [ ] **7b** — Mensajes input en `ansync_proto` + stream QUIC dedicado + dispatch en `daemon-core` (permission `input_from_device` check antes de cualquier `send`)
   - [ ] **7c** — Companion Android scaffold (`android/`, Gradle KTS, AGP/Kotlin pin, manifest, MainActivity stub)
   - [ ] **7d** — Companion: MediaProjection capture → MediaCodec H.264 → QUIC client (cliente quinn-equivalente en Kotlin vía `java.net.DatagramChannel` o JNI a `quinn`?)
@@ -207,7 +207,7 @@ ansync/
 - [ ] **Step 11** — `audio` PipeWire bidireccional + notification widget Android (MediaSession)
 - [ ] **Step 12** — `clipboard` con privacy gates por device
 - [ ] **Step 13** — `input` BT HID secundario vía `bluer`
-- [ ] **Step 14** — Nix module (NixOS + home-manager) + `nix-bundle-app` integration + crane build derivation
+- [ ] **Step 14** — Nix module (NixOS + home-manager) + `nix-bundle-app` integration + crane build derivation. Importar `nix/uinput.nix` (Step 7a). Considerar fragmento similar para v4l2loopback (Step 10) y FUSE3 group `fuse` (Step 9).
 - [ ] **Step 15** — README detallado + docs site + binary releases
 
 ## Dependencias Cargo (workspace)
