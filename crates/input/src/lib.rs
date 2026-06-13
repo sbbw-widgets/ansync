@@ -8,6 +8,9 @@
 
 use async_trait::async_trait;
 
+#[cfg(feature = "uinput")]
+pub mod uinput;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputKind {
     Keyboard,

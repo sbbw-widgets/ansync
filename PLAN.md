@@ -196,6 +196,11 @@ ansync/
 - [x] **Step 5** — Extender `ferricast-encoder/decoder` con HEVC (NVENC + VAAPI) + wirear `ansync_video`
 - [x] **Step 6** — `video` decode + `ansyncd` egui window — screen mirror end-to-end H.264 → wgpu texture
 - [ ] **Step 7** — `input` uinput — Android como kbd/touch/stylus para PC + reverse para controlar Android vía AccessibilityService
+  - [x] **7a** — Host `ansync_input::uinput` impls (Keyboard / Mouse / Touchscreen MT-B / Stylus / Gamepad XInput-like) detrás del feature `uinput`
+  - [ ] **7b** — Mensajes input en `ansync_proto` + stream QUIC dedicado + dispatch en `daemon-core` (permission `input_from_device` check antes de cualquier `send`)
+  - [ ] **7c** — Companion Android scaffold (`android/`, Gradle KTS, AGP/Kotlin pin, manifest, MainActivity stub)
+  - [ ] **7d** — Companion: MediaProjection capture → MediaCodec H.264 → QUIC client (cliente quinn-equivalente en Kotlin vía `java.net.DatagramChannel` o JNI a `quinn`?)
+  - [ ] **7e** — Companion: AccessibilityService + `dispatchGesture` para recibir input reverso del host
 - [ ] **Step 8** — `files` transfer push/pull (sin mount)
 - [ ] **Step 9** — `files` FUSE mount + SAF integration Android side
 - [ ] **Step 10** — `camera` v4l2loopback con device name = nombre del Android

@@ -46,7 +46,10 @@ El `flake.nix` pinea `nixpkgs` a `549bd84d6279f9852cae6225e372cc67fb91a4c1` para
 
 **Step 6 completo**: `HostDecoder` ahora instance-owned (slot `Arc<Mutex<Option<CapturedFrame>>>`), `DecodedFrame` con `stride` + `Bgra8`/`Rgba8`. `ansync_video::feed::AnnexBFile` itera Access Units desde `.h264`/`.h265` para alimentar al decoder sin companion Android. `ansyncd::mirror_window` levanta `eframe` con `Renderer::Wgpu`, convierte NV12/I420/BGRA/RGBA → `ColorImage` y sube vía `Context::load_texture`. Flag `--play-file PATH` + módulo `mirror_window` viven detrás del feature **`dev-playback`** (off por default) — prod no linkea `eframe`/`egui`/`ansync-video` ni acepta el flag. `flake.nix` exporta `LIBCLANG_PATH` para bindgen.
 
-**Próximo**: Step 7 — `ansync_input` uinput (Android como kbd/touch/stylus/gamepad del PC) + reverse vía AccessibilityService en el companion Kotlin. Acá arranca formalmente la app Android en `android/` — el companion se vuelve necesario para producir streams reales de input + capture H.264 (Step 6 ya quedó probado vía `--play-file`).
+**Step 7 en progreso**:
+- **7a cerrado** — `ansync_input::uinput` con `Keyboard`, `Mouse`, `Touchscreen` (MT-B), `Stylus` (pen + tilt), `Gamepad` (XInput-like). Cada uno abre `/dev/uinput` en `create()`, advertiza evbits/keybits/absbits, y traduce `crate::InputEvent` → `input_linux::sys::input_event`. Feature `uinput` activa la pieza. Bus virtual + pid.codes vendor + product id por kind para que `udevadm` distinga el tipo.
+- **Próximo (7b)** — Stream input en `ansync_proto` + QUIC kind dedicado + dispatch desde `daemon-core` con permission gate `input_from_device`.
+- Después (7c–e) arranca companion Android en `android/`.
 
 Ver `PLAN.md` § Roadmap para la lista completa.
 

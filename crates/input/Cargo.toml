@@ -11,6 +11,7 @@ description = "ansync — virtual input devices (uinput default, BT-HID secondar
 ansync-core.workspace = true
 async-trait.workspace = true
 thiserror.workspace = true
+tracing.workspace = true
 
 input-linux = { workspace = true, optional = true }
 bluer = { workspace = true, optional = true }
