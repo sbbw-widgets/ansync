@@ -16,6 +16,8 @@ ansync-pairing.workspace = true
 ansync-permissions.workspace = true
 ansync-dbus.workspace = true
 ansync-proto.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["signal", "rt-multi-thread", "macros", "sync"] }
 tracing.workspace = true
 thiserror.workspace = true
+directories.workspace = true
+zbus.workspace = true
