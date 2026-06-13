@@ -244,6 +244,15 @@ ansync/
 - [ ] **Step 13** — `input` BT HID secundario vía `bluer`
 - [ ] **Step 14** — Nix module (NixOS + home-manager) + `nix-bundle-app` integration + crane build derivation. Importar `nix/uinput.nix` (Step 7a) + `nix/fuse.nix` (Step 9). Considerar fragmento similar para v4l2loopback (Step 10).
 - [ ] **Step 15** — README detallado + docs site + binary releases
+- [ ] **Step 16** — Reemplazar `adb` CLI shell-outs por crate Rust nativo. Candidatos: `adb_client` (pure-Rust ADB protocol), `forensic-adb` (async), o `mozdevice` (Mozilla). Migrar todos los `Command::new("adb")` actuales: `pair_host_via_adb` (reverse + shell broadcast + pm list + install), `list_adb_devices`. Beneficio: zero dep sobre binary ADB instalado por usuario; mejor error reporting estructurado; no más parsing de stdout/stderr.
+- [ ] **Step 17** — APK auto-fetch desde GitHub releases. Reemplazar flag `--apk` / env `ANSYNC_COMPANION_APK` por:
+  - Query a `https://api.github.com/repos/SergioRibera/ansync/releases/latest` vía `reqwest` (TLS via rustls puro).
+  - Comparar versión instalada en device (`adb_client` → `pm dump org.gameros.ansync | grep versionName`) contra `tag_name` del release.
+  - Cache local del APK descargado en `$XDG_CACHE_HOME/ansync/companion-{version}.apk` con SHA-256 verification contra el `digest` o asset hash del release.
+  - Si companion ausente → instala latest por default sin prompt.
+  - Si companion presente pero outdated → prompt CLI "upgrade? (y/N)" o flag `--auto-upgrade`.
+  - Si companion presente y al día → skip.
+  - Sin flag `--apk` salvo override explícito para dev local (`--apk path/to/local-build.apk` sigue funcionando para CI / nightlies).
 
 ## Dependencias Cargo (workspace)
 
