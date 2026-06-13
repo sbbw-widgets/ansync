@@ -238,11 +238,14 @@ dependencies = [
  "ansync-crypto",
  "ansync-dbus",
  "ansync-discovery",
+ "ansync-input",
  "ansync-pairing",
  "ansync-permissions",
  "ansync-proto",
  "ansync-transport",
+ "bytes",
  "directories",
+ "postcard",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -297,6 +300,8 @@ name = "ansync-input"
 version = "0.1.0"
 dependencies = [
  "ansync-core",
+ "ansync-permissions",
+ "ansync-proto",
  "async-trait",
  "bluer",
  "input-linux",

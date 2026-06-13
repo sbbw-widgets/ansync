@@ -17,7 +17,10 @@ use ed25519_dalek::pkcs8::EncodePrivateKey;
 use rustls::crypto::CryptoProvider;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
-use crate::pinning::{Ed25519ClientVerifier, Ed25519ServerVerifier};
+use crate::pinning::{
+    Ed25519AnyPeerVerifier, Ed25519ClientVerifier, Ed25519ServerVerifier, TrustedPeers,
+    extract_ed25519_pubkey,
+};
 use crate::{Connection, Stream, StreamKind, Transport, TransportError};
 
 const ALPN: &[u8] = b"ansync/1";
@@ -132,6 +135,24 @@ impl QuicTransport {
         Ok(quinn::ServerConfig::with_crypto(Arc::new(qsc)))
     }
 
+    fn make_server_config_any(
+        &self,
+        trust: Arc<dyn TrustedPeers>,
+    ) -> Result<quinn::ServerConfig, TransportError> {
+        let (cert_chain, key_der) = build_cert_chain(&self.identity)?;
+        let verifier = Arc::new(Ed25519AnyPeerVerifier::new(trust, self.provider.clone()));
+        let mut rustls_cfg = rustls::ServerConfig::builder_with_provider(self.provider.clone())
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .map_err(|e| TransportError::Handshake(format!("tls13: {e}")))?
+            .with_client_cert_verifier(verifier)
+            .with_single_cert(cert_chain, key_der)
+            .map_err(|e| TransportError::Handshake(format!("server cert: {e}")))?;
+        rustls_cfg.alpn_protocols = vec![ALPN.to_vec()];
+        let qsc = quinn::crypto::rustls::QuicServerConfig::try_from(rustls_cfg)
+            .map_err(|e| TransportError::Handshake(format!("quic server cfg: {e}")))?;
+        Ok(quinn::ServerConfig::with_crypto(Arc::new(qsc)))
+    }
+
     fn make_client_config(
         &self,
         expected_server: [u8; 32],
@@ -163,7 +184,28 @@ impl QuicTransport {
         let endpoint = quinn::Endpoint::server(server_config, addr)?;
         let peer = PeerIdentity::from_bytes(expected_client)
             .map_err(|_| TransportError::IdentityMismatch)?;
-        Ok(QuicServer { endpoint, peer })
+        Ok(QuicServer {
+            endpoint,
+            pinned_peer: Some(peer),
+        })
+    }
+
+    /// Bind a server that accepts any peer whose Ed25519 pubkey
+    /// passes `trust`. Used by the daemon's accept loop, which trusts
+    /// every entry in the `PeerStore`. The connecting peer's identity
+    /// is discovered post-handshake via
+    /// [`QuicConnection::peer_pubkey`].
+    pub fn bind_any(
+        &self,
+        addr: SocketAddr,
+        trust: Arc<dyn TrustedPeers>,
+    ) -> Result<QuicServer, TransportError> {
+        let server_config = self.make_server_config_any(trust)?;
+        let endpoint = quinn::Endpoint::server(server_config, addr)?;
+        Ok(QuicServer {
+            endpoint,
+            pinned_peer: None,
+        })
     }
 
     pub async fn connect(
@@ -187,7 +229,10 @@ impl QuicTransport {
 
 pub struct QuicServer {
     endpoint: quinn::Endpoint,
-    peer: PeerIdentity,
+    /// `Some` for single-peer `bind`, `None` for multi-peer
+    /// `bind_any`; in the latter case the connecting peer's identity
+    /// is recovered from the TLS leaf cert post-handshake.
+    pinned_peer: Option<PeerIdentity>,
 }
 
 impl QuicServer {
@@ -206,9 +251,13 @@ impl QuicServer {
             .await
             .ok_or(TransportError::Closed)?;
         let inner = incoming.await.map_err(map_conn_err)?;
+        let peer = match self.pinned_peer.clone() {
+            Some(p) => p,
+            None => peer_from_handshake(&inner)?,
+        };
         Ok(QuicConnection {
             inner,
-            peer: self.peer.clone(),
+            peer,
             _endpoint: None,
         })
     }
@@ -217,6 +266,23 @@ impl QuicServer {
         self.endpoint.close(0u32.into(), reason.as_bytes());
         self.endpoint.wait_idle().await;
     }
+}
+
+fn peer_from_handshake(conn: &quinn::Connection) -> Result<PeerIdentity, TransportError> {
+    let chain = conn
+        .peer_identity()
+        .ok_or_else(|| TransportError::Handshake("peer presented no identity".into()))?;
+    let certs = chain
+        .downcast::<Vec<rustls::pki_types::CertificateDer<'static>>>()
+        .map_err(|_| {
+            TransportError::Handshake("peer identity not a rustls cert chain".into())
+        })?;
+    let leaf = certs
+        .first()
+        .ok_or_else(|| TransportError::Handshake("peer cert chain empty".into()))?;
+    let key = extract_ed25519_pubkey(leaf.as_ref())
+        .map_err(|e| TransportError::Handshake(format!("extract pubkey: {e}")))?;
+    PeerIdentity::from_bytes(key).map_err(|_| TransportError::IdentityMismatch)
 }
 
 pub struct QuicConnection {

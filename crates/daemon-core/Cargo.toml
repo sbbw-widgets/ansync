@@ -16,6 +16,9 @@ ansync-pairing.workspace = true
 ansync-permissions.workspace = true
 ansync-dbus.workspace = true
 ansync-proto.workspace = true
+ansync-input = { workspace = true, features = ["uinput"] }
+bytes.workspace = true
+postcard.workspace = true
 tokio = { workspace = true, features = ["signal", "rt-multi-thread", "macros", "sync"] }
 tracing.workspace = true
 thiserror.workspace = true

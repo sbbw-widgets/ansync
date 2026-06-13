@@ -122,6 +122,83 @@ impl Ed25519ClientVerifier {
     }
 }
 
+/// Predicate that decides whether a connecting peer's Ed25519 pubkey
+/// is trusted. Daemon-side wiring backs this with a `PeerStore`
+/// lookup so any paired peer is accepted, anything else is rejected.
+pub trait TrustedPeers: Send + Sync + std::fmt::Debug + 'static {
+    fn is_trusted(&self, pubkey: &[u8; 32]) -> bool;
+}
+
+/// Multi-peer client cert verifier. Accepts any incoming cert whose
+/// leaf Ed25519 pubkey passes the [`TrustedPeers`] predicate. The
+/// daemon learns *which* peer connected by re-extracting the pubkey
+/// from `quinn::Connection::peer_identity()` after handshake.
+#[derive(Debug)]
+pub struct Ed25519AnyPeerVerifier {
+    trust: Arc<dyn TrustedPeers>,
+    provider: Arc<CryptoProvider>,
+    root_hint_subjects: Vec<DistinguishedName>,
+}
+
+impl Ed25519AnyPeerVerifier {
+    pub fn new(trust: Arc<dyn TrustedPeers>, provider: Arc<CryptoProvider>) -> Self {
+        Self {
+            trust,
+            provider,
+            root_hint_subjects: Vec::new(),
+        }
+    }
+}
+
+impl ClientCertVerifier for Ed25519AnyPeerVerifier {
+    fn root_hint_subjects(&self) -> &[DistinguishedName] {
+        &self.root_hint_subjects
+    }
+
+    fn offer_client_auth(&self) -> bool {
+        true
+    }
+
+    fn client_auth_mandatory(&self) -> bool {
+        true
+    }
+
+    fn verify_client_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _now: UnixTime,
+    ) -> Result<ClientCertVerified, TlsError> {
+        let key = extract_ed25519_pubkey(end_entity.as_ref())?;
+        if !self.trust.is_trusted(&key) {
+            return Err(PinningError::Mismatch.into());
+        }
+        Ok(ClientCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, TlsError> {
+        Err(TlsError::General("TLS 1.2 not supported".into()))
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, TlsError> {
+        verify_tls13_signature(message, cert, dss, &self.provider.signature_verification_algorithms)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.provider.signature_verification_algorithms.supported_schemes()
+    }
+}
+
 impl ClientCertVerifier for Ed25519ClientVerifier {
     fn root_hint_subjects(&self) -> &[DistinguishedName] {
         &self.root_hint_subjects

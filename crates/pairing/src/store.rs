@@ -58,6 +58,7 @@ impl StoredPeer {
     }
 }
 
+#[derive(Clone, Debug)]
 pub struct PeerStore {
     root: PathBuf,
 }
