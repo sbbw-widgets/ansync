@@ -9,6 +9,7 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 
+pub mod fs;
 pub mod transfer;
 
 pub use transfer::{

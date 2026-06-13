@@ -213,11 +213,20 @@ ansync/
   - `ansyncctl push <id> <path> [--addr host:port] [--seconds N]`: direct QUIC dial (bypass D-Bus por ahora), discovery vía mDNS si `--addr` ausente, abre `StreamKind::Files`, `send_file`.
   - Companion: `files_accept_loop` en cdylib spawnea recv tasks por inbound stream del daemon. `PermissivePermissions` in-memory store ("everything on" — pairing ya estableció trust). Inbound files land en `{filesDir}/incoming/{peer_id}/{name}`.
 - [ ] **Step 9** — `files` FUSE mount + SAF integration Android side
+  - [x] **9a** — `FsOpMessage` extendido: `Create`/`Unlink`/`Rename`/`Truncate`/`Chmod` + variante genérica `Ok` para acks de ops sin payload. `FsMeta`/`FsEntry` ganan `Clone`.
+  - [x] **9b** — `ansync_files::fs` module:
+    - `client::FsClient<S>` — async RPC sequential req/reply sobre un stream (Mutex around stream). Métodos: stat, readdir, open, create, read, write, close, unlink, rename, truncate, chmod.
+    - `cache::MetadataCache` TTL — 5s stat, 5s readdir, 1s negative. Sin cache de contenido (kernel page cache cubre). `invalidate(path)` evicta path + parent (llamado tras writes). 4 tests pasan.
+    - `fuse_mount::FuseMount<S>` impl `fuser::Filesystem` — lookup, getattr, readdir, open, read, write, release, create, unlink, rename, setattr (truncate + chmod). `InodeTable` bi-mapa path↔ino, root inode 1 hardcoded. ATTR_TTL 5s, blksize 256 KiB matchea readahead recomendado. `spawn(mountpoint)` levanta sesión bg con `AutoUnmount + AllowOther + DefaultPermissions`.
+  - [x] **9c** — Daemon auto-mount al peer connect si `Permission::FilesMount` ON. Monta en `$XDG_RUNTIME_DIR/ansync/mounts/{sanitized_device_name}/`. `BackgroundSession` vive en stack frame de `handle_connection` — drop al disconnect umounta. Re-export `fuser::BackgroundSession` desde `ansync_files::fs` para no forzar dep directa.
+  - [x] **nix** — `nix/fuse.nix` partial: `fuse3` package + kernel module load + `userAllowOther = true` + reminder grupo `fuse`. Step 14 lo importa.
+  - [ ] **9d** — Companion native: receive `FsOpMessage` stream + JNI callbacks a Kotlin SAF (worker thread, `runtime.spawn_blocking`).
+  - [ ] **9e** — Companion Kotlin: SAF picker + `takePersistableUriPermission` + `ContentResolver` ops backing los JNI callbacks.
 - [ ] **Step 10** — `camera` v4l2loopback con device name = nombre del Android
 - [ ] **Step 11** — `audio` PipeWire bidireccional + notification widget Android (MediaSession)
 - [ ] **Step 12** — `clipboard` con privacy gates por device
 - [ ] **Step 13** — `input` BT HID secundario vía `bluer`
-- [ ] **Step 14** — Nix module (NixOS + home-manager) + `nix-bundle-app` integration + crane build derivation. Importar `nix/uinput.nix` (Step 7a). Considerar fragmento similar para v4l2loopback (Step 10) y FUSE3 group `fuse` (Step 9).
+- [ ] **Step 14** — Nix module (NixOS + home-manager) + `nix-bundle-app` integration + crane build derivation. Importar `nix/uinput.nix` (Step 7a) + `nix/fuse.nix` (Step 9). Considerar fragmento similar para v4l2loopback (Step 10).
 - [ ] **Step 15** — README detallado + docs site + binary releases
 
 ## Dependencias Cargo (workspace)

@@ -11,11 +11,13 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use ansync_core::{Capabilities, DeviceId, DeviceName};
+use ansync_core::{Capabilities, DeviceId, DeviceName, Permission};
 use ansync_crypto::IdentityKeypair;
 use ansync_dbus::{DaemonState, serve};
 use ansync_discovery::{Discovery, MdnsDiscovery};
-use ansync_files::{AutoAcceptPolicy, receive_file};
+use ansync_files::{
+    AutoAcceptPolicy, fs::client::FsClient, fs::fuse_mount::FuseMount, receive_file,
+};
 use ansync_input::{InputDeviceFactory, InputSession, UinputFactory};
 use ansync_pairing::PeerStore;
 use ansync_permissions::FilePermissionsStore;
@@ -27,7 +29,7 @@ use ansync_transport::{
 use directories::BaseDirs;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::Mutex;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 #[derive(Debug, thiserror::Error)]
 pub enum DaemonError {
@@ -262,6 +264,11 @@ async fn handle_connection(
         factory.clone(),
     )));
 
+    // Auto-mount FUSE if the peer's `files_mount` flag is on. The
+    // BackgroundSession is held on the stack so dropping it on
+    // peer-disconnect umounts cleanly.
+    let _fuse_session = maybe_auto_mount(&conn, &peer_id, &peer.name, permissions.as_ref()).await;
+
     loop {
         let (kind, stream) = match conn.accept().await {
             Ok(v) => v,
@@ -292,6 +299,74 @@ async fn handle_connection(
     }
     input_session.lock().await.shutdown().await;
     Ok(())
+}
+
+async fn maybe_auto_mount(
+    conn: &QuicConnection,
+    peer_id: &DeviceId,
+    peer_name: &DeviceName,
+    permissions: &dyn ansync_permissions::PermissionsStore,
+) -> Option<ansync_files::fs::BackgroundSession> {
+    match permissions.check(peer_id, Permission::FilesMount).await {
+        Ok(true) => {}
+        Ok(false) => {
+            debug!(%peer_id, "files_mount off; skip auto-mount");
+            return None;
+        }
+        Err(e) => {
+            warn!(error = %e, "files_mount perm check failed; skip auto-mount");
+            return None;
+        }
+    }
+    let stream = match conn.open(StreamKind::Fs).await {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(error = %e, "open Fs stream for auto-mount failed");
+            return None;
+        }
+    };
+    let client = FsClient::new(stream);
+    let runtime = tokio::runtime::Handle::current();
+    let mount_root = match runtime_mount_dir() {
+        Some(r) => r,
+        None => {
+            warn!("$XDG_RUNTIME_DIR not set; skip auto-mount");
+            return None;
+        }
+    };
+    let mount_point = mount_root.join(sanitize(&peer_name.0));
+    if let Err(e) = std::fs::create_dir_all(&mount_point) {
+        warn!(error = %e, path = %mount_point.display(), "create mount dir failed");
+        return None;
+    }
+    let mount = FuseMount::new(client, runtime);
+    match mount.spawn(&mount_point) {
+        Ok(session) => {
+            info!(path = %mount_point.display(), "FUSE mount up");
+            Some(session)
+        }
+        Err(e) => {
+            warn!(error = %e, "FUSE mount failed");
+            None
+        }
+    }
+}
+
+fn runtime_mount_dir() -> Option<PathBuf> {
+    let base = std::env::var("XDG_RUNTIME_DIR").ok()?;
+    Some(PathBuf::from(base).join("ansync").join("mounts"))
+}
+
+fn sanitize(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 async fn files_stream_loop(

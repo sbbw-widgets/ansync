@@ -108,10 +108,20 @@ pub enum FsOpMessage {
     Write { handle: u64, offset: u64, data: Vec<u8> },
     WriteReply { written: u32 },
     Close { handle: u64 },
+    Create { path: String, mode: u32 },
+    CreateReply { handle: u64 },
+    Unlink { path: String },
+    Rename { from: String, to: String },
+    Truncate { path: String, size: u64 },
+    Chmod { path: String, mode: u32 },
+    /// Returned by the receiver in place of the matching Reply
+    /// variant when an op fails. `code` mirrors `errno` so the FUSE
+    /// glue layer can translate cleanly.
+    Ok,
     Error { code: i32, message: String },
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FsMeta {
     pub size: u64,
     pub mode: u32,
@@ -119,7 +129,7 @@ pub struct FsMeta {
     pub is_dir: bool,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FsEntry {
     pub name: String,
     pub meta: FsMeta,

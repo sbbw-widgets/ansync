@@ -21,7 +21,8 @@ tokio = { workspace = true, features = ["fs", "sync", "io-util"] }
 tracing.workspace = true
 
 fuser = { workspace = true, optional = true }
+libc = { version = "0.2", optional = true }
 
 [features]
 default = []
-fuse = ["dep:fuser"]
+fuse = ["dep:fuser", "dep:libc"]
