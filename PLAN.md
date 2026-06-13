@@ -192,7 +192,7 @@ ansync/
 - [x] **Step 1** — Skeleton workspace + flake + crates con traits + Cargo wiring + docs
 - [x] **Step 2** — `proto` + `crypto` + `transport` QUIC echo end-to-end con pinning Ed25519
 - [x] **Step 3** — `discovery` mDNS + `pairing` cable bootstrap → llave Ed25519 persistida en `$XDG_DATA_HOME/ansync/peers/`
-- [ ] **Step 4** — `permissions` storage + `dbus` Manager + Device + Permissions interfaces + systemd user unit + journald
+- [x] **Step 4** — `permissions` storage + `dbus` Manager + Device + Permissions interfaces + systemd user unit + journald
 - [ ] **Step 5** — Extender `ferricast-encoder/decoder` con HEVC (NVENC + VAAPI)
 - [ ] **Step 6** — `video` decode + `ansyncd` egui window — screen mirror end-to-end H.264 → wgpu texture
 - [ ] **Step 7** — `input` uinput — Android como kbd/touch/stylus para PC + reverse para controlar Android vía AccessibilityService
@@ -294,9 +294,20 @@ Entregables:
 - `ansyncctl discover [--seconds N]` browse mDNS por N segundos (default 5).
 - `ansyncctl pair [--serial …] [--name …]` auto-selecciona si hay 1 device adb, exige `--serial` si hay varios.
 
-### Step 4 — arranque
+### Step 4 — cerrado
 
-- `ansync_permissions::PermissionsStore` envuelve `DevicePermissions` por device id, toml en `$XDG_CONFIG_HOME/ansync/devices/{id}.toml`.
-- `ansync_dbus`: interfaces `org.gameros.Ansync1.Manager`, `.Device.{id}`, `.Permissions.{id}` con zbus 5 (tokio). Daemon expone, CLI consume.
-- `ansync_daemon_core::Daemon::run()` enciende mdns announce, dbus server, accept loop QUIC, dispatch a handlers por device.
-- systemd user unit (`ansyncd.service`) + `tracing-journald` activado por defecto en `bins/ansyncd`.
+Entregables:
+
+- `permissions::FilePermissionsStore` toml en `$XDG_CONFIG_HOME/ansync/devices/{id}.toml` con writes atómicos (tmp + rename), dir 0700 / files 0600. `check`/`load`/`save`/`delete` async. Helpers `parse_permission`/`apply_permission`/`permission_value` para bridging hacia D-Bus.
+- `dbus::DaemonState` posee identity + peer store + permissions store + device name. Vive en el crate dbus para evitar el ciclo con `daemon-core`.
+- `dbus::Manager`, `Device`, `PermissionsIface` con `#[interface]` de zbus 5. Manager.ListDevices/ForgetDevice wired contra `PeerStore` + `PermissionsStore`; StartPairing devuelve `NotSupported` (D-Bus pairing en step posterior). Device expone props read-only, métodos retornan `NotSupported` hasta que aterricen los pipelines de media. Permissions.Get/Set/Reset persisten via store.
+- `dbus::serve(state)` claim `org.gameros.Ansync1`, registra Manager + un par Device/PermissionsIface por cada peer ya pareado. `register_device`/`unregister_device` exportados para el flujo de pairing futuro.
+- `daemon-core::Daemon` carga identity, abre stores, anuncia mDNS, levanta dbus, bloquea en SIGTERM/SIGINT.
+- `bins/ansyncd`: CLI con `--device-name --identity --peers-dir --permissions-dir`, `tracing-journald` activo.
+- `bins/ansyncd/contrib/ansyncd.service`: user unit con sandboxing (`ProtectSystem=strict`, `ProtectHome=read-only`, `NoNewPrivileges`), journald stdout.
+
+### Step 5 — arranque
+
+- Sumar HEVC al pipeline NVENC y VAAPI dentro de `ferricast-encoder` y `ferricast-decoder`.
+- Activar las path deps `ferricast-*` en `Cargo.toml`.
+- Wiring inicial en `ansync_video` (encoder host-side + decoder client-side) sin renderizar todavía.

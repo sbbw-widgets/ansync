@@ -44,9 +44,9 @@ El `flake.nix` pinea `nixpkgs` a `549bd84d6279f9852cae6225e372cc67fb91a4c1` para
 
 ## Estado actual
 
-**Step 3 completo**: `MdnsDiscovery` anuncio + browse, `PeerStore` toml en `$XDG_DATA_HOME/ansync/peers/`, protocolo cable `bootstrap_host`/`bootstrap_companion` + orquestación `pair_host_via_adb`, subcomandos `ansyncctl discover` y `ansyncctl pair`.
+**Step 4 completo**: `FilePermissionsStore` (toml, 0600/0700), `ansync_dbus` zbus 5 con `DaemonState` + interfaces `Manager`/`Device`/`PermissionsIface` registrando un par por peer al startup, `daemon-core::Daemon` orquesta identity + stores + mdns announce + dbus serve + handler de SIGTERM/SIGINT, `ansyncd` con flags CLI y `contrib/ansyncd.service` (user unit sandboxed).
 
-**Próximo**: Step 4 — `permissions` storage + `ansync_dbus` Manager/Device/Permissions + integración con `ansyncd` (systemd user unit, journald activo).
+**Próximo**: Step 5 — extender `ferricast-encoder`/`ferricast-decoder` con HEVC (NVENC + VAAPI) y wirear `ansync_video`.
 
 Ver `PLAN.md` § Roadmap para la lista completa.
 
