@@ -35,6 +35,11 @@
             </intent-filter>
         </activity>
 
+        <activity
+            android:name=".TouchpadActivity"
+            android:exported="false"
+            android:configChanges="orientation|screenSize|keyboardHidden" />
+
         <!-- Foreground service hosting the QUIC client, MediaProjection
              capture surface, and the audio route. Brought up by the
              user after granting MediaProjection. Step 7d wires the

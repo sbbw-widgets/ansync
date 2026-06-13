@@ -75,6 +75,13 @@ object NativeBridge {
      */
     external fun nativePairOverCable(port: Int, companionName: String): String?
 
+    /**
+     * Push one device→host `InputMessage` (tag-binary encoded —
+     * mirror of `WireInputMessage.encode()`). Lazy-opens the
+     * outbound Input stream on first call.
+     */
+    external fun nativeSendInputMessage(blob: ByteArray): Boolean
+
     /** Tear the active session down. Safe to call when no session is open. */
     external fun nativeClose()
 }

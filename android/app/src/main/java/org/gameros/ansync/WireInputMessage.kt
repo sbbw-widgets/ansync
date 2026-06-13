@@ -41,6 +41,35 @@ sealed class WireInputMessage {
         val rt: Byte,
     ) : WireInputMessage()
 
+    fun encode(): ByteArray {
+        val buf = mutableListOf<Byte>()
+        fun u8(v: Int) = buf.add(v.toByte())
+        fun i32(v: Int) {
+            val b = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(v).array()
+            b.forEach { buf.add(it) }
+        }
+        fun u16(v: Int) {
+            val b = ByteBuffer.allocate(2).order(ByteOrder.LITTLE_ENDIAN).putShort(v.toShort()).array()
+            b.forEach { buf.add(it) }
+        }
+        when (this) {
+            is KeyPress -> { u8(0); i32(keycode); u8(if (pressed) 1 else 0) }
+            is MouseMove -> { u8(1); i32(dx); i32(dy) }
+            is MouseButton -> { u8(2); u8(button.toInt() and 0xFF); u8(if (pressed) 1 else 0) }
+            is MouseWheel -> { u8(3); i32(dx); i32(dy) }
+            is TouchSlot -> {
+                u8(4)
+                u8(slot.toInt() and 0xFF)
+                i32(x)
+                i32(y)
+                u16(pressure)
+                i32(trackingId)
+            }
+            is Stylus, is Gamepad -> throw IllegalStateException("device→host not supported for ${this::class.simpleName}")
+        }
+        return buf.toByteArray()
+    }
+
     companion object {
         fun decode(bytes: ByteArray): WireInputMessage {
             require(bytes.isNotEmpty()) { "empty payload" }

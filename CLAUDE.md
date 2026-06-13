@@ -65,7 +65,17 @@ El `flake.nix` pinea `nixpkgs` a `549bd84d6279f9852cae6225e372cc67fb91a4c1` para
   - **9.5c cerrado** — Companion `streams_accept_loop` maneja Input inbound → mpsc → AccessibilityService. Convención: opener escribe, accepter lee. `nativeOpenConnection` ya no pre-abre Input.
   - **9.5d cerrado** — `ShowScreen` action handler abre Input outbound; `MirrorApp` mapea pointer egui → `InputMessage::TouchSlot` con coords absolutas; `input_writer_loop` postcard + write_frame.
   - **9.5f cerrado** — Cable pairing companion side: `pair_host_via_adb` dispara `adb shell am broadcast` post-reverse → `PairingReceiver` extrae port → `nativePairOverCable(port, name)` → `bootstrap_companion` sobre TCP 127.0.0.1:port → persist `host_pubkey_hex` + `host_name` en SharedPreferences. Sin AlertDialog: cable es security guarantee. `MainActivity` muestra paired host.
-  - **Pendiente (9.5e)**: device→host input (Android overlay capture transparente).
+  - **9.5e cerrado** — `TouchpadActivity` Compose full-screen MotionEvent capture → `WireInputMessage.encode()` tag-binary → `nativeSendInputMessage(blob)`. Native `decode_input_from_kotlin` → postcard → outbound Input stream lazy-open. Touch-down → MouseButton{1,true}, move → MouseMove{dx,dy}, up → MouseButton{1,false}.
+- **Step 9.5 cerrado end-to-end**. Ya se puede:
+  1. Daemon corriendo (`ansyncd` con FUSE + uinput perms + identity inicial).
+  2. `ansyncctl pair --serial XXX` con Android conectado vía USB → auto-wake del companion vía broadcast → bootstrap → ambos lados persistidos.
+  3. Restart daemon (D-Bus surface ve nuevo peer).
+  4. Companion app → "Start screen capture" → MediaProjection grant → push H.264 → daemon decode + slot.
+  5. `dbus-send` o `gdbus call /org/gameros/Ansync1/Device/{id} org.gameros.Ansync1.Device.ShowScreen` → ventana eframe + outbound Input.
+  6. Click en ventana host → TouchSlot al Android → AccessibilityService dispatchGesture.
+  7. Companion "Open touchpad" → MotionEvent → daemon uinput Mouse.
+  8. FUSE auto-mount si `files_mount` perm on; ls del mount → SAF.
+  9. `ansyncctl push id path` → transferencia + sha256 verify.
 - **Próximo (Step 10)** — camera + D-Bus control (camera_id, w/h, fps, bitrate, codec, aspect, stabilization).
 - Después (7c–e) arranca companion Android en `android/`.
 

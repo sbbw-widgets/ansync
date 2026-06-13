@@ -130,6 +130,12 @@ private fun StatusScreen() {
         Button(onClick = { treePicker.launch(null) }) {
             Text("Pick shared folder")
         }
+        Spacer(modifier = Modifier.height(12.dp))
+        Button(onClick = {
+            ctx.startActivity(Intent(ctx, TouchpadActivity::class.java))
+        }) {
+            Text("Open touchpad")
+        }
         Spacer(modifier = Modifier.height(8.dp))
         Text(
             text = sharedFolder?.let { "shared: ${it.lastPathSegment ?: it}" } ?: "no shared folder",

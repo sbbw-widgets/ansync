@@ -95,8 +95,12 @@ impl PermissionsStore for PermissivePermissions {
 struct ActiveSession {
     /// Held purely for its drop-side teardown — the connection
     /// closes when this is taken.
-    _conn: Arc<QuicConnection>,
+    conn: Arc<QuicConnection>,
     video_stream: Arc<AsyncMutex<QuicStream>>,
+    /// Outbound device→host Input stream. Lazy-opened on first
+    /// `nativeSendInputMessage` call so the wire is only used when
+    /// the user actually drives the touchpad activity.
+    outbound_input: Arc<AsyncMutex<Option<QuicStream>>>,
     /// Receiver side of the reverse-input pump. `Mutex<>` so Kotlin
     /// can call `nativePollInputMessage` from any thread without
     /// reading-while-spawning races against the recv task.
@@ -307,8 +311,9 @@ pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativeOpenConnection
     ));
 
     let session = ActiveSession {
-        _conn: conn_arc,
+        conn: conn_arc,
         video_stream: Arc::new(AsyncMutex::new(video_stream)),
+        outbound_input: Arc::new(AsyncMutex::new(None)),
         input_rx: Arc::new(AsyncMutex::new(input_rx)),
         fs_req_rx: Arc::new(AsyncMutex::new(fs_req_rx)),
         fs_reply_tx,
@@ -867,6 +872,105 @@ pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativePairOverCable<
         Err(e) => {
             error!("nativePairOverCable: env.new_string failed: {e}");
             std::ptr::null_mut()
+        }
+    }
+}
+
+/// Decode a tag-binary `InputMessage` (same layout as
+/// `encode_for_kotlin`) emitted by the Kotlin touchpad activity.
+fn decode_input_from_kotlin(bytes: &[u8]) -> Result<InputMessage, String> {
+    let mut c = Cursor::new(bytes);
+    let tag = c.take(1)?[0];
+    match tag {
+        0 => Ok(InputMessage::KeyPress {
+            keycode: c.take_u32()?,
+            pressed: c.take(1)?[0] != 0,
+        }),
+        1 => Ok(InputMessage::MouseMove {
+            dx: c.take_i32()?,
+            dy: c.take_i32()?,
+        }),
+        2 => Ok(InputMessage::MouseButton {
+            button: c.take(1)?[0],
+            pressed: c.take(1)?[0] != 0,
+        }),
+        3 => Ok(InputMessage::MouseWheel {
+            dx: c.take_i32()?,
+            dy: c.take_i32()?,
+        }),
+        4 => {
+            let slot = c.take(1)?[0];
+            let x = c.take_i32()?;
+            let y = c.take_i32()?;
+            let pressure_lo = c.take(1)?[0];
+            let pressure_hi = c.take(1)?[0];
+            let tracking_id = c.take_i32()?;
+            Ok(InputMessage::TouchSlot {
+                slot,
+                x,
+                y,
+                pressure: u16::from_le_bytes([pressure_lo, pressure_hi]),
+                tracking_id,
+            })
+        }
+        other => Err(format!("unknown InputMessage tag {other}")),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativeSendInputMessage<'local>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    blob: JByteArray<'local>,
+) -> jboolean {
+    let bytes = match env.convert_byte_array(&blob) {
+        Ok(b) => b,
+        Err(e) => {
+            error!("nativeSendInputMessage: convert_byte_array: {e}");
+            return jni::sys::JNI_FALSE;
+        }
+    };
+    let msg = match decode_input_from_kotlin(&bytes) {
+        Ok(m) => m,
+        Err(e) => {
+            warn!("nativeSendInputMessage: bad blob: {e}");
+            return jni::sys::JNI_FALSE;
+        }
+    };
+    let (conn, outbound_input) = {
+        let slot = state_slot().lock().expect("state mutex poisoned");
+        match slot.as_ref().and_then(|s| s.session.as_ref()) {
+            Some(sess) => (sess.conn.clone(), sess.outbound_input.clone()),
+            None => {
+                warn!("nativeSendInputMessage: no active session");
+                return jni::sys::JNI_FALSE;
+            }
+        }
+    };
+    let postcard_bytes = match postcard::to_allocvec(&msg) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!("nativeSendInputMessage: postcard encode: {e}");
+            return jni::sys::JNI_FALSE;
+        }
+    };
+    let result = runtime().block_on(async move {
+        let mut guard = outbound_input.lock().await;
+        if guard.is_none() {
+            let stream = conn.open(StreamKind::Input).await?;
+            *guard = Some(stream);
+        }
+        guard
+            .as_mut()
+            .expect("just inserted")
+            .send(bytes::Bytes::from(postcard_bytes))
+            .await
+    });
+    match result {
+        Ok(()) => jni::sys::JNI_TRUE,
+        Err(e) => {
+            warn!("nativeSendInputMessage: send failed: {e}");
+            jni::sys::JNI_FALSE
         }
     }
 }
