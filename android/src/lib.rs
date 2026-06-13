@@ -247,14 +247,14 @@ async fn input_recv_loop(mut stream: QuicStream, tx: UnboundedSender<Vec<u8>>) {
     loop {
         match stream.recv().await {
             Ok(bytes) => {
-                // Verify the frame parses as an InputMessage before
-                // handing to Kotlin; otherwise the host violated the
-                // wire contract and we should not enqueue garbage.
-                if postcard::from_bytes::<InputMessage>(&bytes).is_err() {
-                    warn!("input_recv_loop: dropping malformed InputMessage");
-                    continue;
-                }
-                if tx.send(bytes.to_vec()).is_err() {
+                let msg: InputMessage = match postcard::from_bytes(&bytes) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        warn!("input_recv_loop: malformed InputMessage: {e}");
+                        continue;
+                    }
+                };
+                if tx.send(encode_for_kotlin(&msg)).is_err() {
                     info!("input_recv_loop: receiver dropped; exiting");
                     return;
                 }
@@ -269,6 +269,72 @@ async fn input_recv_loop(mut stream: QuicStream, tx: UnboundedSender<Vec<u8>>) {
             }
         }
     }
+}
+
+/// Flat binary tag+payload format consumed by `WireInputMessage`
+/// on the Kotlin side. All multi-byte integers are little-endian.
+/// Defined in one place so the Kotlin decoder can mirror it exactly.
+///
+/// Layout per tag (in bytes):
+///   0  KeyPress     : tag(1) u32 keycode | u8 pressed
+///   1  MouseMove    : tag(1) i32 dx | i32 dy
+///   2  MouseButton  : tag(1) u8 button | u8 pressed
+///   3  MouseWheel   : tag(1) i32 dx | i32 dy
+///   4  TouchSlot    : tag(1) u8 slot | i32 x | i32 y | u16 pressure | i32 tracking_id
+///   5  Stylus       : tag(1) i32 x | i32 y | u16 pressure | i16 tilt_x | i16 tilt_y | u8 btn
+///   6  Gamepad      : tag(1) u32 buttons | i16 lx | i16 ly | i16 rx | i16 ry | u8 lt | u8 rt
+fn encode_for_kotlin(msg: &InputMessage) -> Vec<u8> {
+    let mut out = Vec::with_capacity(24);
+    match msg {
+        InputMessage::KeyPress { keycode, pressed } => {
+            out.push(0);
+            out.extend_from_slice(&keycode.to_le_bytes());
+            out.push(if *pressed { 1 } else { 0 });
+        }
+        InputMessage::MouseMove { dx, dy } => {
+            out.push(1);
+            out.extend_from_slice(&dx.to_le_bytes());
+            out.extend_from_slice(&dy.to_le_bytes());
+        }
+        InputMessage::MouseButton { button, pressed } => {
+            out.push(2);
+            out.push(*button);
+            out.push(if *pressed { 1 } else { 0 });
+        }
+        InputMessage::MouseWheel { dx, dy } => {
+            out.push(3);
+            out.extend_from_slice(&dx.to_le_bytes());
+            out.extend_from_slice(&dy.to_le_bytes());
+        }
+        InputMessage::TouchSlot { slot, x, y, pressure, tracking_id } => {
+            out.push(4);
+            out.push(*slot);
+            out.extend_from_slice(&x.to_le_bytes());
+            out.extend_from_slice(&y.to_le_bytes());
+            out.extend_from_slice(&pressure.to_le_bytes());
+            out.extend_from_slice(&tracking_id.to_le_bytes());
+        }
+        InputMessage::Stylus { x, y, pressure, tilt_x, tilt_y, btn } => {
+            out.push(5);
+            out.extend_from_slice(&x.to_le_bytes());
+            out.extend_from_slice(&y.to_le_bytes());
+            out.extend_from_slice(&pressure.to_le_bytes());
+            out.extend_from_slice(&tilt_x.to_le_bytes());
+            out.extend_from_slice(&tilt_y.to_le_bytes());
+            out.push(*btn);
+        }
+        InputMessage::Gamepad(state) => {
+            out.push(6);
+            out.extend_from_slice(&state.buttons.to_le_bytes());
+            out.extend_from_slice(&state.lx.to_le_bytes());
+            out.extend_from_slice(&state.ly.to_le_bytes());
+            out.extend_from_slice(&state.rx.to_le_bytes());
+            out.extend_from_slice(&state.ry.to_le_bytes());
+            out.push(state.lt);
+            out.push(state.rt);
+        }
+    }
+    out
 }
 
 #[unsafe(no_mangle)]
