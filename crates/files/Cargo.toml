@@ -10,9 +10,15 @@ description = "ansync — file transfer + remote filesystem (FUSE3)"
 [dependencies]
 ansync-core.workspace = true
 ansync-proto.workspace = true
+ansync-permissions.workspace = true
+ansync-transport.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
+postcard.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
+tokio = { workspace = true, features = ["fs", "sync", "io-util"] }
+tracing.workspace = true
 
 fuser = { workspace = true, optional = true }
 

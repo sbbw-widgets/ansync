@@ -33,10 +33,15 @@ crate-type = ["cdylib"]
 # JNI bridge into Kotlin.
 jni = "0.21"
 
+# Needed for the in-memory PermissionsStore impl in lib.rs.
+async-trait = "0.1"
+
 # Shared wire format + pinning helpers from the host workspace.
 ansync-core = { path = "../crates/core" }
 ansync-proto = { path = "../crates/proto" }
 ansync-crypto = { path = "../crates/crypto" }
+ansync-files = { path = "../crates/files" }
+ansync-permissions = { path = "../crates/permissions" }
 ansync-transport = { path = "../crates/transport" }
 
 # QUIC client mirrors the host's `quinn` + `rustls` stack — same

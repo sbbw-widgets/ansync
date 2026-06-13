@@ -15,6 +15,7 @@ use ansync_core::{Capabilities, DeviceId, DeviceName};
 use ansync_crypto::IdentityKeypair;
 use ansync_dbus::{DaemonState, serve};
 use ansync_discovery::{Discovery, MdnsDiscovery};
+use ansync_files::{AutoAcceptPolicy, receive_file};
 use ansync_input::{InputDeviceFactory, InputSession, UinputFactory};
 use ansync_pairing::PeerStore;
 use ansync_permissions::FilePermissionsStore;
@@ -66,9 +67,14 @@ pub struct DaemonConfig {
     /// a random unused port — that port is then announced via mDNS
     /// so peers can connect on the LAN.
     pub listen_addr: SocketAddr,
+    /// Root directory where inbound file transfers land. Each peer
+    /// gets a `{peer_id}/` subdir to namespace concurrent senders
+    /// against each other. Defaults to
+    /// `$XDG_DATA_HOME/ansync/incoming/` if unset.
+    pub download_dir: Option<PathBuf>,
     /// Capabilities the host can serve to remote peers. Step 7 turns
     /// on `INPUT_FROM_DEV` by default since uinput is the first
-    /// capability wired end-to-end.
+    /// capability wired end-to-end. Step 8 adds `FILES`.
     pub capabilities: Capabilities,
 }
 
@@ -80,7 +86,8 @@ impl DaemonConfig {
             peers_dir: None,
             permissions_dir: None,
             listen_addr: "0.0.0.0:0".parse().expect("hard-coded addr parses"),
-            capabilities: Capabilities::INPUT_FROM_DEV,
+            download_dir: None,
+            capabilities: Capabilities::INPUT_FROM_DEV | Capabilities::FILES,
         }
     }
 }
@@ -113,6 +120,11 @@ impl Daemon {
             .permissions_dir
             .clone()
             .unwrap_or(default_config_dir()?.join("devices"));
+        let download_dir = self
+            .config
+            .download_dir
+            .clone()
+            .unwrap_or(default_data_dir()?.join("incoming"));
 
         let identity = IdentityKeypair::load_or_generate(&identity_path)?;
         info!(device_id = %identity.device_id(), "identity loaded");
@@ -154,6 +166,7 @@ impl Daemon {
             peers,
             permissions: permissions.clone(),
             factory,
+            download_dir,
         }));
 
         wait_for_shutdown().await?;
@@ -198,6 +211,7 @@ struct AcceptCtx {
     peers: PeerStore,
     permissions: Arc<dyn ansync_permissions::PermissionsStore>,
     factory: Arc<dyn InputDeviceFactory>,
+    download_dir: PathBuf,
 }
 
 async fn accept_loop(ctx: AcceptCtx) {
@@ -207,8 +221,11 @@ async fn accept_loop(ctx: AcceptCtx) {
                 let peers = ctx.peers.clone();
                 let permissions = ctx.permissions.clone();
                 let factory = ctx.factory.clone();
+                let download_dir = ctx.download_dir.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_connection(conn, peers, permissions, factory).await {
+                    if let Err(e) =
+                        handle_connection(conn, peers, permissions, factory, download_dir).await
+                    {
                         warn!(error = %e, "peer connection errored");
                     }
                 });
@@ -226,6 +243,7 @@ async fn handle_connection(
     peers: PeerStore,
     permissions: Arc<dyn ansync_permissions::PermissionsStore>,
     factory: Arc<dyn InputDeviceFactory>,
+    download_dir: PathBuf,
 ) -> Result<(), DaemonError> {
     let pubkey = conn.peer_identity().as_bytes();
     let mut id_bytes = [0u8; 16];
@@ -258,6 +276,14 @@ async fn handle_connection(
                 let session = input_session.clone();
                 tokio::spawn(input_stream_loop(stream, session));
             }
+            StreamKind::Files => {
+                let perms = permissions.clone();
+                let peer_id_inbound = peer_id.clone();
+                let policy = Arc::new(AutoAcceptPolicy {
+                    root: download_dir.clone(),
+                });
+                tokio::spawn(files_stream_loop(stream, peer_id_inbound, perms, policy));
+            }
             other => {
                 warn!(kind = ?other, "stream kind accepted but not wired yet — dropping");
                 drop(stream);
@@ -266,6 +292,18 @@ async fn handle_connection(
     }
     input_session.lock().await.shutdown().await;
     Ok(())
+}
+
+async fn files_stream_loop(
+    mut stream: QuicStream,
+    peer_id: DeviceId,
+    permissions: Arc<dyn ansync_permissions::PermissionsStore>,
+    policy: Arc<AutoAcceptPolicy>,
+) {
+    match receive_file(&peer_id, permissions.as_ref(), &mut stream, policy.as_ref()).await {
+        Ok(path) => info!(%peer_id, dest = %path.display(), "inbound transfer ok"),
+        Err(e) => warn!(%peer_id, error = %e, "inbound transfer failed"),
+    }
 }
 
 async fn input_stream_loop(mut stream: QuicStream, session: Arc<Mutex<InputSession>>) {

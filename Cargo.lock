@@ -238,6 +238,7 @@ dependencies = [
  "ansync-crypto",
  "ansync-dbus",
  "ansync-discovery",
+ "ansync-files",
  "ansync-input",
  "ansync-pairing",
  "ansync-permissions",
@@ -288,11 +289,17 @@ name = "ansync-files"
 version = "0.1.0"
 dependencies = [
  "ansync-core",
+ "ansync-permissions",
  "ansync-proto",
+ "ansync-transport",
  "async-trait",
  "bytes",
  "fuser",
+ "postcard",
+ "sha2",
  "thiserror 2.0.18",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -392,7 +399,10 @@ dependencies = [
  "ansync-crypto",
  "ansync-dbus",
  "ansync-discovery",
+ "ansync-files",
  "ansync-pairing",
+ "ansync-permissions",
+ "ansync-transport",
  "clap",
  "directories",
  "futures",

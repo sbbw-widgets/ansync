@@ -14,7 +14,10 @@
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
+use ansync_core::{DeviceId, DevicePermissions, Permission};
 use ansync_crypto::IdentityKeypair;
+use ansync_files::{AutoAcceptPolicy, receive_file};
+use ansync_permissions::{PermissionsError, PermissionsStore};
 use ansync_proto::InputMessage;
 use ansync_transport::{
     Connection, QuicConnection, QuicStream, QuicTransport, Stream as _, StreamKind,
@@ -50,7 +53,42 @@ fn runtime() -> &'static Runtime {
 
 struct CompanionState {
     identity: IdentityKeypair,
+    /// Path the inbound files accept loop writes received files
+    /// into. Defaults to the app's `filesDir/incoming/` until the
+    /// Kotlin side picks a SAF tree URI.
+    download_dir: PathBuf,
     session: Option<ActiveSession>,
+}
+
+/// In-memory permissions store the companion uses for the single
+/// paired daemon. Defaults to "everything on" because the daemon's
+/// pubkey was already accepted at pairing time; mid-session revoke
+/// UX surfaces in Step 12 (clipboard) and onward.
+#[derive(Debug)]
+struct PermissivePermissions;
+
+#[async_trait::async_trait]
+impl PermissionsStore for PermissivePermissions {
+    async fn load(&self, _id: &DeviceId) -> Result<DevicePermissions, PermissionsError> {
+        Ok(DevicePermissions::default())
+    }
+    async fn save(
+        &self,
+        _id: &DeviceId,
+        _perms: &DevicePermissions,
+    ) -> Result<(), PermissionsError> {
+        Ok(())
+    }
+    async fn delete(&self, _id: &DeviceId) -> Result<(), PermissionsError> {
+        Ok(())
+    }
+    async fn check(
+        &self,
+        _id: &DeviceId,
+        _permission: Permission,
+    ) -> Result<bool, PermissionsError> {
+        Ok(true)
+    }
 }
 
 struct ActiveSession {
@@ -108,8 +146,10 @@ pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativeInit(
         identity.device_id()
     );
     let mut slot = state_slot().lock().expect("state mutex poisoned");
+    let download_dir = files_dir.join("incoming");
     *slot = Some(CompanionState {
         identity,
+        download_dir,
         session: None,
     });
     jni::sys::JNI_TRUE
@@ -231,8 +271,29 @@ pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativeOpenConnection
     let (input_tx, input_rx) = unbounded_channel::<Vec<u8>>();
     runtime().spawn(input_recv_loop(input_stream, input_tx));
 
+    let conn_arc = Arc::new(conn);
+    let download_dir = {
+        let slot = state_slot().lock().expect("state mutex poisoned");
+        slot.as_ref()
+            .map(|s| s.download_dir.clone())
+            .unwrap_or_else(|| PathBuf::from("/data/local/tmp/ansync-incoming"))
+    };
+    // Companion's peer identity for permission checks. We use the
+    // host's pubkey-derived DeviceId so the permissive store sees the
+    // same id the host would query against.
+    let host_device_id = {
+        let mut id_bytes = [0u8; 16];
+        id_bytes.copy_from_slice(&expected_server[..16]);
+        DeviceId(id_bytes)
+    };
+    runtime().spawn(files_accept_loop(
+        conn_arc.clone(),
+        host_device_id,
+        download_dir,
+    ));
+
     let session = ActiveSession {
-        _conn: Arc::new(conn),
+        _conn: conn_arc,
         video_stream: Arc::new(AsyncMutex::new(video_stream)),
         input_rx: Arc::new(AsyncMutex::new(input_rx)),
     };
@@ -241,6 +302,43 @@ pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativeOpenConnection
         s.session = Some(session);
     }
     jni::sys::JNI_TRUE
+}
+
+async fn files_accept_loop(
+    conn: Arc<QuicConnection>,
+    host_id: DeviceId,
+    download_dir: PathBuf,
+) {
+    let permissions: Arc<dyn PermissionsStore> = Arc::new(PermissivePermissions);
+    loop {
+        let (kind, mut stream) = match conn.accept().await {
+            Ok(v) => v,
+            Err(ansync_transport::TransportError::Closed) => {
+                info!("files_accept_loop: connection closed");
+                return;
+            }
+            Err(e) => {
+                warn!("files_accept_loop: accept failed: {e}");
+                return;
+            }
+        };
+        if kind != StreamKind::Files {
+            warn!("files_accept_loop: dropping unexpected stream {kind:?}");
+            drop(stream);
+            continue;
+        }
+        let policy = Arc::new(AutoAcceptPolicy {
+            root: download_dir.clone(),
+        });
+        let host_id = host_id.clone();
+        let perms = permissions.clone();
+        tokio::spawn(async move {
+            match receive_file(&host_id, perms.as_ref(), &mut stream, policy.as_ref()).await {
+                Ok(p) => info!("inbound file -> {}", p.display()),
+                Err(e) => warn!("inbound file failed: {e}"),
+            }
+        });
+    }
 }
 
 async fn input_recv_loop(mut stream: QuicStream, tx: UnboundedSender<Vec<u8>>) {

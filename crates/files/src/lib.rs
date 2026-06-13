@@ -9,6 +9,13 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 
+pub mod transfer;
+
+pub use transfer::{
+    AutoAcceptPolicy, CHUNK_SIZE, InboundDecision, InboundPolicy, OfferSummary, TransferError,
+    receive_file, send_file,
+};
+
 #[derive(Debug, thiserror::Error)]
 pub enum FilesError {
     #[error("not found")]
