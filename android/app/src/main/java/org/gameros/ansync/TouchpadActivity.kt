@@ -117,6 +117,20 @@ private const val STYLUS_PRESSURE_MAX = 8191
 /// px of swipe — close to how a physical trackpad behaves on the
 /// same hardware.
 private const val WHEEL_HI_RES_PER_PIXEL = 4f
+/// Pixels of dominant axis travel before a 2-finger gesture commits
+/// to scroll-vs-pinch mode. Below this both are still being
+/// measured; whichever crossed first wins for the rest of the
+/// gesture.
+private const val MODE_LOCK_PX = 16f
+/// Hi-res wheel ticks emitted per pixel of pinch spread / contract.
+/// Pinch mode wraps the wheel in Ctrl press/release so apps see the
+/// universal `Ctrl+Scroll = zoom` shortcut.
+private const val PINCH_HI_RES_PER_PIXEL = 3f
+private const val TWO_FINGER_MODE_UNDECIDED = 0
+private const val TWO_FINGER_MODE_SCROLL = 1
+private const val TWO_FINGER_MODE_PINCH = 2
+/// Linux evdev `KEY_LEFTCTRL`.
+private const val EVDEV_LEFTCTRL = 29
 
 @OptIn(ExperimentalComposeUiApi::class)
 @Composable
@@ -211,6 +225,23 @@ private data class Gesture(
     var lastUpAt: Long = 0L,
     var wheelRemainderX: Float = 0f,
     var wheelRemainderY: Float = 0f,
+    /// 0 = undecided, 1 = scroll, 2 = pinch. Locked at the moment
+    /// either accumulator crosses `MODE_LOCK_PX`.
+    var twoFingerMode: Int = TWO_FINGER_MODE_UNDECIDED,
+    /// Sum of |center axis delta| since gesture start. Used to
+    /// classify scroll vs pinch during the undecided window.
+    var scrollAccum: Float = 0f,
+    /// Sum of |distance delta between the two pointers| since
+    /// gesture start.
+    var pinchAccum: Float = 0f,
+    /// Distance between the two pointers at the previous MOVE event.
+    var pinchLastDistance: Float = 0f,
+    /// Sub-tick carry for pinch → hi-res wheel conversion.
+    var pinchRemainder: Float = 0f,
+    /// Whether `KEY_LEFTCTRL` is currently held on the host because
+    /// the gesture is in pinch mode (released at UP / CANCEL /
+    /// POINTER_DOWN→scroll downgrade).
+    var ctrlHeld: Boolean = false,
 )
 
 private val gesture = Gesture()
@@ -243,71 +274,38 @@ private fun handlePointerEvent(event: MotionEvent, canvas: IntSize): String? {
         }
         MotionEvent.ACTION_POINTER_DOWN -> {
             // Second finger landed — promote the gesture to a
-            // two-finger scroll/middle-click stream. A drag-mode
-            // single-finger gesture in progress is cancelled (button
-            // release) before flipping to scroll.
+            // two-finger scroll / pinch / middle-click stream. Any
+            // drag-mode single-finger gesture in progress is
+            // cancelled (button release) before flipping.
             if (gesture.leftHeld) {
                 sendButton(button = 1, pressed = false)
                 gesture.leftHeld = false
             }
             gesture.twoFingerActive = true
-            gesture.twoFingerLastX = event.x
-            gesture.twoFingerLastY = event.y
-            gesture.twoFingerStartX = event.x
-            gesture.twoFingerStartY = event.y
+            val cx = if (event.pointerCount >= 2) (event.getX(0) + event.getX(1)) / 2 else event.x
+            val cy = if (event.pointerCount >= 2) (event.getY(0) + event.getY(1)) / 2 else event.y
+            gesture.twoFingerLastX = cx
+            gesture.twoFingerLastY = cy
+            gesture.twoFingerStartX = cx
+            gesture.twoFingerStartY = cy
             gesture.twoFingerMoved = false
             gesture.wheelRemainderX = 0f
             gesture.wheelRemainderY = 0f
+            gesture.twoFingerMode = TWO_FINGER_MODE_UNDECIDED
+            gesture.scrollAccum = 0f
+            gesture.pinchAccum = 0f
+            gesture.pinchRemainder = 0f
+            gesture.pinchLastDistance = if (event.pointerCount >= 2) {
+                kotlin.math.hypot(
+                    (event.getX(0) - event.getX(1)).toDouble(),
+                    (event.getY(0) - event.getY(1)).toDouble(),
+                ).toFloat()
+            } else 0f
             "two-finger active"
         }
         MotionEvent.ACTION_MOVE -> {
             if (gesture.twoFingerActive) {
-                // Wire semantics: `MouseWheel.dx/dy` are
-                // high-resolution wheel ticks (120 = 1 legacy
-                // notch). The host's uinput Mouse emits both
-                // `REL_WHEEL_HI_RES` and accumulator-driven
-                // `REL_WHEEL` notches, so smooth-scrolling
-                // consumers (libinput / Wayland compositors,
-                // GNOME, KDE, modern browsers, Electron apps) see
-                // per-pixel deltas while legacy consumers still
-                // step in notches.
-                //
-                // Companion → host scale: ~4 hi-res ticks per
-                // pixel of finger travel. Empirically a 100 px
-                // swipe ≈ 3 notches scrolled — close to how a
-                // physical trackpad feels on the same hardware.
-                // Sub-pixel remainder is carried in
-                // `wheelRemainderX/Y` so slow drags don't quantise
-                // to zero.
-                val dx = event.x - gesture.twoFingerLastX
-                val dy = event.y - gesture.twoFingerLastY
-                if (dx != 0f || dy != 0f) {
-                    // Track whether the gesture has actually moved
-                    // (vs micro-jitter while two fingers rest) so
-                    // the UP handler can still classify a small
-                    // settle as a 2-finger tap → middle click.
-                    val travelled = kotlin.math.hypot(
-                        (event.x - gesture.twoFingerStartX).toDouble(),
-                        (event.y - gesture.twoFingerStartY).toDouble(),
-                    )
-                    if (travelled > TAP_SLOP_PX) gesture.twoFingerMoved = true
-
-                    gesture.wheelRemainderX += dx * WHEEL_HI_RES_PER_PIXEL
-                    // Y-up == wheel-up == positive `REL_WHEEL`.
-                    gesture.wheelRemainderY += -dy * WHEEL_HI_RES_PER_PIXEL
-                    val wheelX = gesture.wheelRemainderX.toInt()
-                    val wheelY = gesture.wheelRemainderY.toInt()
-                    if (wheelX != 0 || wheelY != 0) {
-                        gesture.wheelRemainderX -= wheelX.toFloat()
-                        gesture.wheelRemainderY -= wheelY.toFloat()
-                        NativeBridge.nativeSendInputMessage(
-                            WireInputMessage.MouseWheel(dx = wheelX, dy = wheelY).encode()
-                        )
-                    }
-                    gesture.twoFingerLastX = event.x
-                    gesture.twoFingerLastY = event.y
-                }
-                "wheel"
+                handleTwoFingerMove(event)
             } else {
                 val dx = (event.x - gesture.lastX).toInt()
                 val dy = (event.y - gesture.lastY).toInt()
@@ -337,7 +335,14 @@ private fun handlePointerEvent(event: MotionEvent, canvas: IntSize): String? {
                 if (gesture.leftHeld) "drag" else if (gesture.rightHeld) "right-drag" else "move"
             }
         }
-        MotionEvent.ACTION_POINTER_UP -> "two-finger ending"
+        MotionEvent.ACTION_POINTER_UP -> {
+            // First of the two fingers lifted. Release Ctrl now so
+            // a stuck modifier never escapes the gesture, even if
+            // the user keeps the remaining finger down without ever
+            // hitting ACTION_UP.
+            releaseCtrlIfHeld()
+            "two-finger ending"
+        }
         MotionEvent.ACTION_UP -> {
             val now = SystemClock.uptimeMillis()
             val elapsed = now - gesture.downAt
@@ -360,6 +365,7 @@ private fun handlePointerEvent(event: MotionEvent, canvas: IntSize): String? {
                     gesture.lastUpAt = now
                 }
             }
+            releaseCtrlIfHeld()
             gesture.leftHeld = false
             gesture.rightHeld = false
             gesture.twoFingerActive = false
@@ -368,12 +374,103 @@ private fun handlePointerEvent(event: MotionEvent, canvas: IntSize): String? {
         MotionEvent.ACTION_CANCEL -> {
             if (gesture.leftHeld) sendButton(button = 1, pressed = false)
             if (gesture.rightHeld) sendButton(button = 2, pressed = false)
+            releaseCtrlIfHeld()
             gesture.leftHeld = false
             gesture.rightHeld = false
             gesture.twoFingerActive = false
             "cancelled"
         }
         else -> null
+    }
+}
+
+/**
+ * Two-finger ACTION_MOVE branch. Resolves the gesture into either
+ * a scroll (emit `MouseWheel` from the centroid delta) or a pinch
+ * (emit `Ctrl+MouseWheel` from the inter-finger distance delta).
+ * The decision is locked the first time either accumulator crosses
+ * [MODE_LOCK_PX] so the mid-gesture intent is stable.
+ */
+private fun handleTwoFingerMove(event: MotionEvent): String {
+    if (event.pointerCount < 2) return "wheel"
+    val p0x = event.getX(0); val p0y = event.getY(0)
+    val p1x = event.getX(1); val p1y = event.getY(1)
+    val cx = (p0x + p1x) / 2; val cy = (p0y + p1y) / 2
+    val distance = kotlin.math.hypot((p0x - p1x).toDouble(), (p0y - p1y).toDouble()).toFloat()
+
+    val centerDx = cx - gesture.twoFingerLastX
+    val centerDy = cy - gesture.twoFingerLastY
+    val distanceDelta = distance - gesture.pinchLastDistance
+
+    // Update mode-classification accumulators while still undecided.
+    if (gesture.twoFingerMode == TWO_FINGER_MODE_UNDECIDED) {
+        gesture.scrollAccum += kotlin.math.abs(centerDy)
+        gesture.pinchAccum += kotlin.math.abs(distanceDelta)
+        val travelled = kotlin.math.hypot(
+            (cx - gesture.twoFingerStartX).toDouble(),
+            (cy - gesture.twoFingerStartY).toDouble(),
+        )
+        if (travelled > TAP_SLOP_PX || gesture.pinchAccum > TAP_SLOP_PX) {
+            gesture.twoFingerMoved = true
+        }
+        if (gesture.scrollAccum >= MODE_LOCK_PX || gesture.pinchAccum >= MODE_LOCK_PX) {
+            gesture.twoFingerMode = if (gesture.pinchAccum > gesture.scrollAccum) {
+                TWO_FINGER_MODE_PINCH
+            } else {
+                TWO_FINGER_MODE_SCROLL
+            }
+            if (gesture.twoFingerMode == TWO_FINGER_MODE_PINCH && !gesture.ctrlHeld) {
+                sendKey(EVDEV_LEFTCTRL, true)
+                gesture.ctrlHeld = true
+            }
+        }
+    }
+
+    when (gesture.twoFingerMode) {
+        TWO_FINGER_MODE_SCROLL, TWO_FINGER_MODE_UNDECIDED -> {
+            // Pure scroll path — same smooth hi-res wheel emission
+            // as the previous single-mode implementation.
+            gesture.wheelRemainderX += centerDx * WHEEL_HI_RES_PER_PIXEL
+            // Y-up == wheel-up == positive `REL_WHEEL`.
+            gesture.wheelRemainderY += -centerDy * WHEEL_HI_RES_PER_PIXEL
+            val wheelX = gesture.wheelRemainderX.toInt()
+            val wheelY = gesture.wheelRemainderY.toInt()
+            if (wheelX != 0 || wheelY != 0) {
+                gesture.wheelRemainderX -= wheelX.toFloat()
+                gesture.wheelRemainderY -= wheelY.toFloat()
+                NativeBridge.nativeSendInputMessage(
+                    WireInputMessage.MouseWheel(dx = wheelX, dy = wheelY).encode()
+                )
+            }
+        }
+        TWO_FINGER_MODE_PINCH -> {
+            // Pinch path — Ctrl is already held; positive distance
+            // delta (spread) maps to wheel-up (zoom in).
+            gesture.pinchRemainder += distanceDelta * PINCH_HI_RES_PER_PIXEL
+            val zoom = gesture.pinchRemainder.toInt()
+            if (zoom != 0) {
+                gesture.pinchRemainder -= zoom.toFloat()
+                NativeBridge.nativeSendInputMessage(
+                    WireInputMessage.MouseWheel(dx = 0, dy = zoom).encode()
+                )
+            }
+        }
+    }
+
+    gesture.twoFingerLastX = cx
+    gesture.twoFingerLastY = cy
+    gesture.pinchLastDistance = distance
+    return when (gesture.twoFingerMode) {
+        TWO_FINGER_MODE_PINCH -> "pinch"
+        TWO_FINGER_MODE_SCROLL -> "wheel"
+        else -> "two-finger"
+    }
+}
+
+private fun releaseCtrlIfHeld() {
+    if (gesture.ctrlHeld) {
+        sendKey(EVDEV_LEFTCTRL, false)
+        gesture.ctrlHeld = false
     }
 }
 
