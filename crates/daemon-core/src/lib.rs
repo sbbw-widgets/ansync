@@ -19,7 +19,7 @@ use ansync_camera::{CameraFormat, CameraPixelFormat, VirtualCameraSink};
 use ansync_clipboard::{ClipboardBackend, ClipboardContent, WaylandClipboard};
 use ansync_core::{Capabilities, DeviceId, DeviceName, Permission};
 use ansync_crypto::IdentityKeypair;
-use ansync_dbus::{DaemonAction, DaemonState, serve};
+use ansync_dbus::{ConnState, DaemonAction, DaemonState, Device, serve};
 use ansync_discovery::{Discovery, MdnsDiscovery};
 use ansync_files::{
     AutoAcceptPolicy, fs::client::FsClient, fs::fuse_mount::FuseMount, receive_file,
@@ -29,14 +29,15 @@ use ansync_pairing::PeerStore;
 use ansync_permissions::FilePermissionsStore;
 use ansync_proto::{
     AudioDirection, AudioStreamInit, CameraConfig, ClipboardMessage, ControlMessage, Envelope,
-    InputMessage, Message, PROTOCOL_VERSION, VideoCodec as ProtoVideoCodec,
+    Hello, InputMessage, Message, NotificationMessage, PROTOCOL_VERSION,
+    VideoCodec as ProtoVideoCodec,
 };
 use ansync_transport::pinning::TrustedPeers;
 use ansync_transport::{
     Connection, QuicConnection, QuicServer, QuicStream, QuicTransport, Stream as _, StreamKind,
 };
 use ansync_video::sink_egui::{FrameSlot, new_slot};
-use ansync_video::{HostDecoder, PixelFormat, VideoCodec, VideoDecoder};
+use ansync_video::{DecodedFrame, HostDecoder, PixelFormat, VideoCodec, VideoDecoder};
 use directories::BaseDirs;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::Mutex;
@@ -65,6 +66,19 @@ pub enum DaemonError {
     Startup(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputBackend {
+    /// Local kernel uinput devices. The default; works on every
+    /// Linux host with the `uinput` module loaded + a udev rule that
+    /// lets the daemon's user write `/dev/uinput`.
+    Uinput,
+    /// Bluetooth HID Device. Turns the host into a BT-HID emitter
+    /// the peer (or any other paired host) consumes. Requires BlueZ
+    /// running + the adapter powered. SDP profile registration is
+    /// best-effort — see `ansync_input::bt_hid` for caveats.
+    BtHid,
+}
+
 #[derive(Debug, Clone)]
 pub struct DaemonConfig {
     pub device_name: String,
@@ -90,6 +104,9 @@ pub struct DaemonConfig {
     /// on `INPUT_FROM_DEV` by default since uinput is the first
     /// capability wired end-to-end. Step 8 adds `FILES`.
     pub capabilities: Capabilities,
+    /// Which `InputDeviceFactory` to plug into the per-peer input
+    /// session. Defaults to `Uinput`.
+    pub input_backend: InputBackend,
 }
 
 impl DaemonConfig {
@@ -99,7 +116,12 @@ impl DaemonConfig {
             identity_path: None,
             peers_dir: None,
             permissions_dir: None,
-            listen_addr: "0.0.0.0:0".parse().expect("hard-coded addr parses"),
+            // Fixed default port so cached companion endpoints
+            // (PREF_HOST_ADDR) survive daemon restarts. Override
+            // with `DaemonConfig.listen_addr` for tests / multi-host.
+            // 47215 picked from the IANA "user-assignable" range,
+            // unlikely to clash with anything common.
+            listen_addr: "0.0.0.0:47215".parse().expect("hard-coded addr parses"),
             download_dir: None,
             capabilities: Capabilities::INPUT_FROM_DEV
                 | Capabilities::FILES
@@ -108,6 +130,7 @@ impl DaemonConfig {
                 | Capabilities::AUDIO_OUT
                 | Capabilities::MIC
                 | Capabilities::CLIPBOARD,
+            input_backend: InputBackend::Uinput,
         }
     }
 }
@@ -165,16 +188,25 @@ impl Daemon {
         let listen = server.local_addr()?;
         info!(addr = %listen, "QUIC server bound");
 
+        let local_endpoints: Vec<(String, u16)> = enumerate_lan_ipv4()
+            .into_iter()
+            .map(|ip| (ip, listen.port()))
+            .collect();
+        info!(?local_endpoints, "LAN endpoints for direct-dial fallback");
+
         let (action_tx, action_rx) = unbounded_channel::<DaemonAction>();
         let state = Arc::new(
             DaemonState::new(
-                identity,
+                identity.clone(),
                 self.config.device_name.clone(),
                 peers.clone(),
                 permissions.clone(),
             )
             .with_actions(action_tx),
         );
+        if let Ok(mut g) = state.listen_endpoints.lock() {
+            *g = local_endpoints;
+        }
 
         let dbus_conn = serve(state.clone()).await?;
         info!(service = ansync_dbus::SERVICE_NAME, "D-Bus surface ready");
@@ -195,7 +227,22 @@ impl Daemon {
             .await?;
         info!(name = %device_name, port = listen.port(), "mDNS announce active");
 
-        let factory: Arc<dyn InputDeviceFactory> = Arc::new(UinputFactory);
+        let factory: Arc<dyn InputDeviceFactory> = match self.config.input_backend {
+            InputBackend::Uinput => Arc::new(UinputFactory),
+            InputBackend::BtHid => {
+                #[cfg(feature = "bt-hid")]
+                {
+                    Arc::new(ansync_input::BtHidFactory::new())
+                }
+                #[cfg(not(feature = "bt-hid"))]
+                {
+                    return Err(DaemonError::Startup(
+                        "input_backend = BtHid requires the `bt-hid` feature".into(),
+                    ));
+                }
+            }
+        };
+        let dbus_conn_arc = Arc::new(dbus_conn);
         let accept_handle = tokio::spawn(accept_loop(AcceptCtx {
             server,
             peers,
@@ -205,6 +252,11 @@ impl Daemon {
             mirrors: mirrors.clone(),
             cameras: cameras.clone(),
             audios: audios.clone(),
+            dbus_conn: dbus_conn_arc.clone(),
+            device_name: self.config.device_name.clone(),
+            capabilities: self.config.capabilities,
+            identity: identity.clone(),
+            dbus_state: state.clone(),
         }));
 
         wait_for_shutdown().await?;
@@ -214,7 +266,7 @@ impl Daemon {
         if let Err(e) = mdns.stop_announce().await {
             warn!(error = %e, "mDNS stop_announce failed");
         }
-        drop(dbus_conn);
+        drop(dbus_conn_arc);
         info!("daemon shut down");
         Ok(())
     }
@@ -254,6 +306,19 @@ struct AcceptCtx {
     mirrors: Arc<MirrorRegistry>,
     cameras: Arc<CameraRegistry>,
     audios: Arc<AudioRegistry>,
+    dbus_conn: Arc<zbus::Connection>,
+    /// Local host's human-readable name (e.g. `gethostname(2)` output).
+    /// Sent verbatim on the outbound `StreamKind::Hello` so the peer
+    /// can surface "connected to <name>" instead of a pubkey prefix.
+    device_name: String,
+    capabilities: Capabilities,
+    /// Our long-term identity. Only the public-key prefix is sent on
+    /// the wire (in the Hello frame so the peer can recover our
+    /// `DeviceId` for its own permission lookups).
+    identity: IdentityKeypair,
+    /// Shared with the D-Bus surface so transitions emit
+    /// `Device.State` PropertiesChanged + `Manager.DeviceConnectivityChanged`.
+    dbus_state: Arc<DaemonState>,
 }
 
 /// Per-peer mirror state: frame slot the decoder populates and the
@@ -435,6 +500,33 @@ async fn action_loop(
                     warn!(%device, error = %e, "SyncClipboard failed");
                 }
             }
+            DaemonAction::MountFiles { device } => {
+                let Some(entry) = mirrors.get(&device) else {
+                    warn!(%device, "MountFiles: no live connection");
+                    continue;
+                };
+                let conn = entry.conn.lock().expect("conn slot poisoned").clone();
+                if let Some(conn) = conn {
+                    if let Err(e) = send_control(&conn, ControlMessage::RequestFileAccess).await
+                    {
+                        warn!(%device, error = %e, "RequestFileAccess send failed");
+                    }
+                } else {
+                    warn!(%device, "MountFiles: peer not connected");
+                }
+            }
+            DaemonAction::UnmountFiles { device } => {
+                let Some(entry) = mirrors.get(&device) else {
+                    continue;
+                };
+                let conn = entry.conn.lock().expect("conn slot poisoned").clone();
+                if let Some(conn) = conn {
+                    if let Err(e) = send_control(&conn, ControlMessage::ReleaseFileAccess).await
+                    {
+                        warn!(%device, error = %e, "ReleaseFileAccess send failed");
+                    }
+                }
+            }
             DaemonAction::StartCamera { device, config } => {
                 if let Err(e) =
                     handle_start_camera(&mirrors, &cameras, &permissions, &device, config).await
@@ -462,7 +554,7 @@ async fn action_loop(
                 // Open the outbound Input stream so pointer events
                 // from the host window land on the peer.
                 let conn = entry.conn.lock().expect("conn slot poisoned").clone();
-                let input_tx = if let Some(conn) = conn {
+                let input_tx = if let Some(conn) = conn.clone() {
                     match conn.open(StreamKind::Input).await {
                         Ok(stream) => {
                             let (tx, rx) = unbounded_channel::<InputMessage>();
@@ -478,6 +570,15 @@ async fn action_loop(
                     warn!(%device, "ShowScreen: no live connection; window will be view-only");
                     None
                 };
+                // Ask the companion to actually start the capture pipe
+                // (MediaProjection grant + MediaCodec encoder + Video
+                // stream open). Without this the window stays blank
+                // until the user manually taps a tile on the device.
+                if let Some(conn) = conn {
+                    if let Err(e) = send_request_capture(&conn).await {
+                        warn!(%device, error = %e, "RequestScreenCapture send failed");
+                    }
+                }
                 let slot = entry.slot.clone();
                 let title = format!("ansync — {}", entry.peer_name);
                 let handle = std::thread::Builder::new()
@@ -495,12 +596,23 @@ async fn action_loop(
                 let Some(entry) = mirrors.get(&device) else {
                     continue;
                 };
-                let mut guard = entry.window.lock().expect("window slot poisoned");
                 // eframe doesn't expose a clean external close API; the
                 // user closes the window. Just clear our handle so the
                 // next ShowScreen can re-open. The thread terminates
-                // when the user closes the window.
-                *guard = None;
+                // when the user closes the window. Scope the StdMutex
+                // guard so it drops before any `await`.
+                {
+                    let mut guard = entry.window.lock().expect("window slot poisoned");
+                    *guard = None;
+                }
+                // Tell the companion to drop the encoder + projection
+                // too so the device's foreground notification clears.
+                let conn = entry.conn.lock().expect("conn slot poisoned").clone();
+                if let Some(conn) = conn {
+                    if let Err(e) = send_stop_capture(&conn).await {
+                        warn!(%device, error = %e, "StopScreenCapture send failed");
+                    }
+                }
                 info!(%device, "HideScreen: handle cleared");
             }
         }
@@ -518,6 +630,11 @@ async fn accept_loop(ctx: AcceptCtx) {
                 let mirrors = ctx.mirrors.clone();
                 let cameras = ctx.cameras.clone();
                 let audios = ctx.audios.clone();
+                let dbus_conn = ctx.dbus_conn.clone();
+                let device_name = ctx.device_name.clone();
+                let capabilities = ctx.capabilities;
+                let identity = ctx.identity.clone();
+                let dbus_state = ctx.dbus_state.clone();
                 tokio::spawn(async move {
                     if let Err(e) = handle_connection(
                         conn,
@@ -528,6 +645,11 @@ async fn accept_loop(ctx: AcceptCtx) {
                         mirrors,
                         cameras,
                         audios,
+                        dbus_conn,
+                        device_name,
+                        capabilities,
+                        identity,
+                        dbus_state,
                     )
                     .await
                     {
@@ -552,6 +674,11 @@ async fn handle_connection(
     mirrors: Arc<MirrorRegistry>,
     cameras: Arc<CameraRegistry>,
     audios: Arc<AudioRegistry>,
+    dbus_conn: Arc<zbus::Connection>,
+    device_name: String,
+    capabilities: Capabilities,
+    identity: IdentityKeypair,
+    dbus_state: Arc<DaemonState>,
 ) -> Result<(), DaemonError> {
     let pubkey = conn.peer_identity().as_bytes();
     let mut id_bytes = [0u8; 16];
@@ -559,6 +686,13 @@ async fn handle_connection(
     let peer_id = DeviceId(id_bytes);
     let peer = peers.get(&peer_id)?;
     info!(peer = %peer.name, %peer_id, "peer connected");
+
+    if let Err(e) =
+        Device::emit_state_changed(&dbus_conn, &dbus_state, &peer_id, ConnState::Authenticated)
+            .await
+    {
+        warn!(%peer_id, error = %e, "emit Authenticated state failed");
+    }
 
     // Per-peer InputSession lives behind an Arc<Mutex> so any future
     // input stream re-opened by the peer (e.g. after a brief
@@ -579,6 +713,28 @@ async fn handle_connection(
     *mirror_entry.conn.lock().expect("conn slot poisoned") = Some(conn_arc.clone());
     let camera_entry = cameras.ensure(&peer_id, &peer.name.0);
     let audio_entry = audios.ensure(&peer_id, &peer.name.0);
+
+    // Send our Hello on a dedicated one-shot stream so the peer
+    // refreshes its cached name + capability bitmap for this session.
+    // Done after registering the mirror entry so a fast-following
+    // ShowScreen sees the live conn slot.
+    match send_hello(&conn_arc, &peer_id, &identity, &device_name, capabilities).await {
+        Ok(()) => {
+            if let Err(e) = Device::emit_state_changed(
+                &dbus_conn,
+                &dbus_state,
+                &peer_id,
+                ConnState::Active,
+            )
+            .await
+            {
+                warn!(%peer_id, error = %e, "emit Active state failed");
+            }
+        }
+        Err(e) => {
+            warn!(%peer_id, error = %e, "outbound Hello failed; peer will keep stale name");
+        }
+    }
 
     // Auto-mount FUSE if the peer's `files_mount` flag is on. The
     // BackgroundSession is held on the stack so dropping it on
@@ -629,6 +785,17 @@ async fn handle_connection(
                 let perms = permissions.clone();
                 tokio::spawn(clipboard_inbound_loop(stream, pid, perms));
             }
+            StreamKind::Notifications => {
+                let pid = peer_id.clone();
+                let perms = permissions.clone();
+                let conn = dbus_conn.clone();
+                tokio::spawn(notification_inbound_loop(stream, pid, perms, conn));
+            }
+            StreamKind::Hello => {
+                let pid = peer_id.clone();
+                let store = peers.clone();
+                tokio::spawn(hello_inbound_loop(stream, pid, store));
+            }
             other => {
                 warn!(kind = ?other, "stream kind accepted but not wired yet — dropping");
                 drop(stream);
@@ -677,6 +844,12 @@ async fn handle_connection(
         .lock()
         .expect("audio inbound tx poisoned") = None;
     *audio_entry.sink.lock().await = None;
+    if let Err(e) =
+        Device::emit_state_changed(&dbus_conn, &dbus_state, &peer_id, ConnState::Disconnected)
+            .await
+    {
+        warn!(%peer_id, error = %e, "emit Disconnected state failed");
+    }
     Ok(())
 }
 
@@ -789,6 +962,112 @@ fn sanitize(name: &str) -> String {
         .collect()
 }
 
+/// Open a one-shot `StreamKind::Hello` outbound, send the local Hello
+/// envelope, drop the stream. The peer side reads it via
+/// `hello_inbound_loop`.
+async fn send_hello(
+    conn: &QuicConnection,
+    peer_id: &DeviceId,
+    identity: &IdentityKeypair,
+    device_name: &str,
+    capabilities: Capabilities,
+) -> Result<(), DaemonError> {
+    let pk = identity.public().as_bytes();
+    let mut our_id_bytes = [0u8; 16];
+    our_id_bytes.copy_from_slice(&pk[..16]);
+    let env = Envelope {
+        version: PROTOCOL_VERSION,
+        message: Message::Hello(Hello {
+            device_id: DeviceId(our_id_bytes),
+            name: DeviceName(device_name.to_string()),
+            capabilities,
+        }),
+    };
+    let bytes = postcard::to_allocvec(&env)
+        .map_err(|e| DaemonError::Startup(format!("encode Hello: {e}")))?;
+    let mut stream = conn.open(StreamKind::Hello).await?;
+    stream.send(bytes::Bytes::from(bytes)).await?;
+    // Closing the send half tells the peer "no more frames coming".
+    // quinn drops the rest on connection close.
+    let _ = stream.finish().await;
+    debug!(%peer_id, "outbound Hello sent");
+    Ok(())
+}
+
+/// Push `ControlMessage::RequestScreenCapture` to the companion.
+/// One-shot — the stream is dropped after the frame so each call
+/// stands on its own (matches how the companion's `control_recv_loop`
+/// treats Control: stream-per-message, no per-stream state).
+async fn send_request_capture(conn: &QuicConnection) -> Result<(), DaemonError> {
+    send_control(conn, ControlMessage::RequestScreenCapture).await
+}
+
+/// Inverse of [`send_request_capture`].
+async fn send_stop_capture(conn: &QuicConnection) -> Result<(), DaemonError> {
+    send_control(conn, ControlMessage::StopScreenCapture).await
+}
+
+/// One-shot Control envelope sender. Used by anything in the
+/// `action_loop` that needs to ask the companion to do something
+/// without opening a long-lived stream.
+async fn send_control(
+    conn: &QuicConnection,
+    message: ControlMessage,
+) -> Result<(), DaemonError> {
+    let env = Envelope {
+        version: PROTOCOL_VERSION,
+        message: Message::Control(message),
+    };
+    let bytes = postcard::to_allocvec(&env)
+        .map_err(|e| DaemonError::Startup(format!("encode Control: {e}")))?;
+    let mut stream = conn.open(StreamKind::Control).await?;
+    stream.send(bytes::Bytes::from(bytes)).await?;
+    let _ = stream.finish().await;
+    Ok(())
+}
+
+/// Consume the single Hello frame from a freshly accepted inbound
+/// stream and refresh `StoredPeer.name` if the peer's self-reported
+/// name has changed since pairing.
+async fn hello_inbound_loop(mut stream: QuicStream, peer_id: DeviceId, peers: PeerStore) {
+    let bytes = match stream.recv().await {
+        Ok(b) => b,
+        Err(e) => {
+            warn!(%peer_id, error = %e, "Hello recv failed");
+            return;
+        }
+    };
+    let env: Envelope = match postcard::from_bytes(&bytes) {
+        Ok(e) => e,
+        Err(e) => {
+            warn!(%peer_id, error = %e, "Hello postcard decode failed");
+            return;
+        }
+    };
+    let hello = match env.message {
+        Message::Hello(h) => h,
+        other => {
+            warn!(%peer_id, ?other, "Hello stream carried non-Hello envelope");
+            return;
+        }
+    };
+    let mut stored = match peers.get(&peer_id) {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(%peer_id, error = %e, "Hello: peer no longer in store");
+            return;
+        }
+    };
+    let new_name = hello.name.0;
+    if !new_name.is_empty() && stored.name.0 != new_name {
+        info!(%peer_id, old = %stored.name, new = %new_name, "peer name refreshed via Hello");
+        stored.name = DeviceName(new_name);
+        if let Err(e) = peers.put(&stored) {
+            warn!(%peer_id, error = %e, "PeerStore::put after Hello failed");
+        }
+    }
+}
+
 /// Read one `ClipboardMessage` per frame from the inbound stream and
 /// stamp it into the host Wayland clipboard, gated by
 /// `Permission::ClipboardIn`.
@@ -828,6 +1107,61 @@ async fn clipboard_inbound_loop(
         };
         if let Err(e) = backend.write(content).await {
             warn!(%peer_id, error = %e, "WaylandClipboard write failed");
+        }
+    }
+}
+
+async fn notification_inbound_loop(
+    mut stream: QuicStream,
+    peer_id: DeviceId,
+    permissions: Arc<dyn ansync_permissions::PermissionsStore>,
+    dbus_conn: Arc<zbus::Connection>,
+) {
+    let device_path = ansync_dbus::path_device(&peer_id);
+    let emitter =
+        match zbus::object_server::SignalEmitter::new(dbus_conn.as_ref(), device_path.clone()) {
+            Ok(e) => e,
+            Err(e) => {
+                warn!(%peer_id, error = %e, "build SignalEmitter failed; dropping notifications");
+                return;
+            }
+        };
+    loop {
+        let bytes = match stream.recv().await {
+            Ok(b) => b,
+            Err(ansync_transport::TransportError::Closed) => return,
+            Err(e) => {
+                warn!(%peer_id, error = %e, "notification recv error");
+                return;
+            }
+        };
+        let msg: NotificationMessage = match postcard::from_bytes(&bytes) {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(%peer_id, error = %e, "notification postcard decode failed");
+                continue;
+            }
+        };
+        // Per-message gate. Toggling `notifications` off mid-stream
+        // drops further events without killing the QUIC stream.
+        match permissions.check(&peer_id, Permission::Notifications).await {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(e) => {
+                warn!(%peer_id, error = %e, "notifications perm check failed; dropping event");
+                continue;
+            }
+        }
+        let result = match &msg {
+            NotificationMessage::Posted { id, app, title, body } => {
+                ansync_dbus::Device::notification_posted(&emitter, *id, app, title, body).await
+            }
+            NotificationMessage::Removed { id } => {
+                ansync_dbus::Device::notification_removed(&emitter, *id).await
+            }
+        };
+        if let Err(e) = result {
+            warn!(%peer_id, error = %e, "D-Bus signal emit failed");
         }
     }
 }
@@ -980,7 +1314,9 @@ async fn handle_start_audio(
                 return Ok(());
             }
         };
-        let handle = tokio::spawn(audio_pump_loop(stream, source));
+        let perms_pump = permissions.clone();
+        let peer_pump = device.clone();
+        let handle = tokio::spawn(audio_pump_loop(stream, source, peer_pump, perms_pump));
         *entry
             .pump_handle
             .lock()
@@ -1028,10 +1364,23 @@ async fn audio_render_loop(
     }
 }
 
-async fn audio_pump_loop(mut stream: QuicStream, mut source: ansync_audio::CpalSource) {
+async fn audio_pump_loop(
+    mut stream: QuicStream,
+    mut source: ansync_audio::CpalSource,
+    peer_id: DeviceId,
+    permissions: Arc<dyn ansync_permissions::PermissionsStore>,
+) {
     loop {
         match source.read().await {
             Ok(bytes) => {
+                match permissions.check(&peer_id, Permission::AudioOut).await {
+                    Ok(true) => {}
+                    Ok(false) => continue,
+                    Err(e) => {
+                        warn!(%peer_id, error = %e, "audio_pump_loop: perm check failed; dropping chunk");
+                        continue;
+                    }
+                }
                 if let Err(e) = stream.send(bytes).await {
                     warn!(error = %e, "audio_pump_loop: stream send failed");
                     return;
@@ -1049,7 +1398,7 @@ async fn audio_inbound_loop(
     mut stream: QuicStream,
     entry: Arc<AudioEntry>,
     peer_id: DeviceId,
-    _permissions: Arc<dyn ansync_permissions::PermissionsStore>,
+    permissions: Arc<dyn ansync_permissions::PermissionsStore>,
 ) {
     // First frame: the AudioStreamInit header. We log it but use the
     // host-side sink format the action handler already provisioned.
@@ -1073,6 +1422,17 @@ async fn audio_inbound_loop(
                 return;
             }
         };
+        // Per-chunk permission gate. Revoking `audio_in` mid-stream
+        // drops further chunks without tearing the QUIC stream; if the
+        // user flips it back on the flow resumes seamlessly.
+        match permissions.check(&peer_id, Permission::AudioIn).await {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(e) => {
+                warn!(%peer_id, error = %e, "audio inbound perm check failed; dropping chunk");
+                continue;
+            }
+        }
         let tx = match entry
             .inbound_tx
             .lock()
@@ -1308,15 +1668,39 @@ async fn video_stream_loop(mut stream: QuicStream, slot: FrameSlot, peer_id: Dev
             warn!(%peer_id, error = %e, "decoder feed failed; continuing");
             continue;
         }
+        // Drain every decoded frame the backend produced for this
+        // feed and keep only the latest. Live mirror prefers latency
+        // over completeness, and NVDEC's internal surface pool grows
+        // unbounded if decoded frames sit in its output queue
+        // (observed ~680 MB/s RSS growth at 1080p60). The first
+        // take blocks until at least one frame is ready; subsequent
+        // takes are bounded by a tight timeout so we don't deadlock
+        // when ferricast's `take().await` waits forever for more
+        // output — async take doesn't surface a non-blocking variant.
+        let mut latest: Option<DecodedFrame> = None;
         match decoder.take().await {
-            Ok(Some(frame)) => {
-                if let Ok(mut s) = slot.lock() {
-                    *s = Some(frame);
+            Ok(Some(frame)) => latest = Some(frame),
+            Ok(None) => {}
+            Err(e) => warn!(%peer_id, error = %e, "decoder take failed"),
+        }
+        // Drain remainder with a 1 ms budget — enough to mop up any
+        // frames already produced for this feed, not enough to stall
+        // the loop or hold the tokio worker thread.
+        while let Ok(res) =
+            tokio::time::timeout(std::time::Duration::from_millis(1), decoder.take()).await
+        {
+            match res {
+                Ok(Some(frame)) => latest = Some(frame),
+                Ok(None) => break,
+                Err(e) => {
+                    warn!(%peer_id, error = %e, "decoder drain failed");
+                    break;
                 }
             }
-            Ok(None) => {}
-            Err(e) => {
-                warn!(%peer_id, error = %e, "decoder take failed");
+        }
+        if let Some(frame) = latest {
+            if let Ok(mut s) = slot.lock() {
+                *s = Some(frame);
             }
         }
     }
@@ -1368,6 +1752,55 @@ fn default_config_dir() -> Result<PathBuf, DaemonError> {
     BaseDirs::new()
         .map(|b| b.config_dir().join("ansync"))
         .ok_or_else(|| DaemonError::Startup("$HOME not set; cannot resolve XDG paths".into()))
+}
+
+/// Enumerate IPv4 addresses on non-loopback / non-docker interfaces.
+/// Used to populate `DaemonState::listen_endpoints` so `ansyncctl
+/// pair` can hand a direct-dial fallback to the companion (works
+/// around mDNS multicast being dropped by Wi-Fi AP isolation).
+///
+/// Filters out `lo`, `docker*`, `br-*`, `veth*`, and tailscale —
+/// they're not the host's LAN identity from the peer's POV.
+fn enumerate_lan_ipv4() -> Vec<String> {
+    use std::ffi::CStr;
+    use std::net::Ipv4Addr;
+    let mut out = Vec::new();
+    let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
+    if unsafe { libc::getifaddrs(&mut ifap) } != 0 {
+        return out;
+    }
+    let mut cur = ifap;
+    while !cur.is_null() {
+        let ifa = unsafe { &*cur };
+        cur = ifa.ifa_next;
+        if ifa.ifa_addr.is_null() {
+            continue;
+        }
+        let sa = unsafe { &*ifa.ifa_addr };
+        if sa.sa_family != libc::AF_INET as libc::sa_family_t {
+            continue;
+        }
+        let name = unsafe { CStr::from_ptr(ifa.ifa_name) }
+            .to_string_lossy()
+            .to_string();
+        if name == "lo"
+            || name.starts_with("docker")
+            || name.starts_with("br-")
+            || name.starts_with("veth")
+            || name.starts_with("virbr")
+            || name == "tailscale0"
+        {
+            continue;
+        }
+        let sin = unsafe { &*(ifa.ifa_addr as *const libc::sockaddr_in) };
+        let ip = Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr));
+        if ip.is_loopback() || ip.is_link_local() || ip.is_unspecified() {
+            continue;
+        }
+        out.push(ip.to_string());
+    }
+    unsafe { libc::freeifaddrs(ifap) };
+    out
 }
 
 async fn wait_for_shutdown() -> Result<(), DaemonError> {
