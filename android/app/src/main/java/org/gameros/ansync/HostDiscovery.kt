@@ -16,8 +16,10 @@ import java.net.InetAddress
  *     name = <device name>
  *     caps = <u32 hex bitfield>
  *
- * Surfaces a `List<DiscoveredHost>` via callback so the MainActivity
- * Compose tree can recompose when entries appear / disappear.
+ * Surfaces a `List<DiscoveredHost>` via callback so the
+ * auto-reconnect worker (U4c) can re-dial as soon as the paired
+ * host's mDNS record appears (e.g. after the device returns from
+ * airplane mode or roams Wi-Fi).
  */
 data class DiscoveredHost(
     val name: String,
@@ -62,9 +64,26 @@ class HostDiscovery(private val ctx: Context) {
                     }
                     override fun onServiceResolved(resolved: NsdServiceInfo) {
                         val attrs = resolved.attributes ?: emptyMap()
-                        val pubkey = attrs["id"]?.let { String(it) } ?: return
+                        Log.i(
+                            TAG,
+                            "resolved ${resolved.serviceName}; attrs=${attrs.keys}; " +
+                                "host=${resolved.host?.hostAddress}; port=${resolved.port}",
+                        )
+                        val pubkey = attrs["id"]?.let { String(it) }
+                        if (pubkey == null) {
+                            Log.w(TAG, "resolved ${resolved.serviceName} but no 'id' TXT attr")
+                            return
+                        }
                         val name = attrs["name"]?.let { String(it) } ?: resolved.serviceName
-                        val host = resolved.host ?: return
+                        val host = resolved.host
+                        if (host == null) {
+                            Log.w(TAG, "resolved ${resolved.serviceName} but no host address")
+                            return
+                        }
+                        Log.i(
+                            TAG,
+                            "added host '$name' @ ${host.hostAddress}:${resolved.port} pubkey=${pubkey.take(16)}…",
+                        )
                         synchronized(state) {
                             state[pubkey] = DiscoveredHost(
                                 name = name,

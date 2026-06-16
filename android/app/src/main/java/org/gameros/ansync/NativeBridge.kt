@@ -28,6 +28,23 @@ object NativeBridge {
     external fun nativeOurPubkeyHex(): String?
 
     /**
+     * Stash the human-readable device name (typically
+     * `"${Build.MANUFACTURER} ${Build.MODEL}"`). The native side
+     * forwards it to the host inside every Hello frame so the
+     * daemon's `PeerStore.name` stays in sync with what the user
+     * renamed the device to in Android Settings.
+     */
+    external fun nativeSetDeviceName(name: String): Boolean
+
+    /**
+     * Latest host name learned from the inbound Hello frame, or
+     * `null` until the first session post-handshake completes.
+     * Surfaced on the paired-host card so it shows
+     * `gethostname(2)` instead of a pubkey prefix.
+     */
+    external fun nativePollHostName(): String?
+
+    /**
      * Dial the host at `host:port` and bring up the Video + Input
      * streams. `daemonPubkeyHex` is the 64-char hex of the daemon's
      * Ed25519 public key learned at pairing time — used for cert
@@ -91,6 +108,23 @@ object NativeBridge {
     external fun nativePollCameraControl(): ByteArray?
 
     /**
+     * Block (in native) until the host sends a screen-capture
+     * control: `RequestScreenCapture` (single byte 0x00) or
+     * `StopScreenCapture` (single byte 0x01). Returns `null` on
+     * session teardown.
+     */
+    external fun nativePollCaptureControl(): ByteArray?
+
+    /**
+     * Block until the host sends a file-access control:
+     * `RequestFileAccess` (0x00) or `ReleaseFileAccess` (0x01).
+     * The service decides whether to silently start the FS server
+     * (URI already picked) or pop a notif asking the user to pick
+     * a folder.
+     */
+    external fun nativePollFileControl(): ByteArray?
+
+    /**
      * Push one encoded camera frame (H.264 / H.265 access unit) over
      * the outbound Camera stream. Lazy-opens the stream on first
      * call. Returns `false` if the stream is unhealthy — caller
@@ -139,6 +173,39 @@ object NativeBridge {
      * messages are tiny.
      */
     external fun nativeSendClipboardText(text: String): Boolean
+
+    /**
+     * Block (in native) until the next inbound clipboard blob arrives
+     * from the host. Returns `null` on session teardown. Layout:
+     *   `[mime_len u32 LE | mime utf8 | data]`.
+     */
+    external fun nativePollClipboardBlob(): ByteArray?
+
+    /**
+     * Push a binary clipboard payload (e.g. `image/png`) to the host.
+     * Wraps in `ClipboardMessage::Blob`. The host gates on
+     * `Permission::ClipboardOut` and writes to Wayland via the
+     * matching MIME type.
+     */
+    external fun nativeSendClipboardBlob(mime: String, data: ByteArray): Boolean
+
+    /**
+     * Forward a `NotificationListenerService.onNotificationPosted`
+     * event to the host. Lazy-opens the outbound
+     * `StreamKind::Notifications` stream on first call.
+     */
+    external fun nativeSendNotificationPosted(
+        id: Long,
+        app: String,
+        title: String,
+        body: String,
+    ): Boolean
+
+    /**
+     * Forward a `NotificationListenerService.onNotificationRemoved`
+     * event to the host using the same `id` the post used.
+     */
+    external fun nativeSendNotificationRemoved(id: Long): Boolean
 
     /** Tear the active session down. Safe to call when no session is open. */
     external fun nativeClose()
