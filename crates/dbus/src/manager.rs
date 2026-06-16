@@ -46,6 +46,32 @@ impl Manager {
         ))
     }
 
+    /// Fired by `daemon-core` whenever a peer transitions through the
+    /// connectivity lifecycle (`disconnected | pairing | authenticated
+    /// | active`). Subscribers (DMS widget, ansyncctl status) listen
+    /// here for a single fan-out path instead of subscribing per
+    /// `/Device/{id}`.
+    #[zbus(signal)]
+    pub async fn device_connectivity_changed(
+        ctxt: &zbus::object_server::SignalEmitter<'_>,
+        id: &str,
+        state: &str,
+    ) -> zbus::Result<()>;
+
+    /// Return the (ip, port) pairs the QUIC listener is reachable on
+    /// across non-loopback interfaces. `ansyncctl pair` queries this
+    /// before kicking the cable bootstrap so the host can hand the
+    /// companion a direct-dial fallback (used when Wi-Fi AP isolation
+    /// blocks mDNS multicast).
+    #[zbus(name = "ListenEndpoints")]
+    async fn listen_endpoints(&self) -> Vec<(String, u16)> {
+        self.state
+            .listen_endpoints
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default()
+    }
+
     /// Re-scan the PeerStore and register Device/Permissions
     /// interfaces for any peer that doesn't already have one. Called
     /// by `ansyncctl pair` immediately after persisting a freshly

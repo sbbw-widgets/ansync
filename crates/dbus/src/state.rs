@@ -2,7 +2,8 @@
 //! interface impl. Kept in the `dbus` crate so the interfaces don't
 //! need to depend on `daemon-core` (which would be a cycle).
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex as StdMutex};
 
 use ansync_core::DeviceId;
 use ansync_crypto::IdentityKeypair;
@@ -10,6 +11,39 @@ use ansync_pairing::PeerStore;
 use ansync_permissions::PermissionsStore;
 use ansync_proto::{AudioDirection, CameraConfig};
 use tokio::sync::mpsc::UnboundedSender;
+
+/// Lifecycle of a per-peer connection as surfaced over D-Bus.
+///
+/// Transitions are linear forward (Disconnected → Pairing →
+/// Authenticated → Active) with `Disconnected` re-entered on
+/// connection drop. The DMS widget pinta semáforo: gris para
+/// Disconnected, amarillo para Pairing/Authenticated, verde para
+/// Active.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ConnState {
+    #[default]
+    Disconnected,
+    /// Cable / Wi-Fi pair handshake in progress. Set by `ansyncctl
+    /// pair` via the pairing surface — daemon-core only sees post-pair
+    /// connections.
+    Pairing,
+    /// QUIC + Noise handshake complete; peer trusted but no Hello yet.
+    Authenticated,
+    /// Hello frame received in either direction — peer reachable and
+    /// caps are fresh. Streams may or may not be open.
+    Active,
+}
+
+impl ConnState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ConnState::Disconnected => "disconnected",
+            ConnState::Pairing => "pairing",
+            ConnState::Authenticated => "authenticated",
+            ConnState::Active => "active",
+        }
+    }
+}
 
 /// Actions D-Bus interfaces dispatch back into `daemon-core`. Sent on
 /// [`DaemonState::actions`]; the daemon spawns an action loop that
@@ -47,6 +81,15 @@ pub enum DaemonAction {
     /// over a fresh `StreamKind::Clipboard`. Gated by
     /// `Permission::ClipboardOut`.
     SyncClipboard { device: DeviceId },
+    /// Ask the companion to expose its SAF tree as the FUSE-mount
+    /// backend. Triggers a `ControlMessage::RequestFileAccess` push;
+    /// the companion either has a folder ready or pops a notif on
+    /// the device asking the user to pick one.
+    MountFiles { device: DeviceId },
+    /// Inverse of [`MountFiles`] — tells the companion to tear its
+    /// `AnsyncFsServer` down (releases the SAF tree handle but the
+    /// persisted URI stays so the next mount is one tap away).
+    UnmountFiles { device: DeviceId },
 }
 
 pub struct DaemonState {
@@ -58,6 +101,19 @@ pub struct DaemonState {
     /// calls. `None` only during the brief construction window — D-Bus
     /// interfaces panic if they try to send without it wired.
     pub actions: Option<UnboundedSender<DaemonAction>>,
+    /// Per-peer live connectivity state. `daemon-core::handle_connection`
+    /// flips entries through Authenticated → Active → Disconnected;
+    /// `Device.State` reads from here. Missing entries imply
+    /// `Disconnected` — saves an explicit `Forget`-time cleanup.
+    pub connectivity: Arc<StdMutex<HashMap<DeviceId, ConnState>>>,
+    /// LAN endpoints (`(ip, port)`) the QUIC listener is reachable on.
+    /// Populated by `daemon-core` at startup by enumerating non-
+    /// loopback interfaces × the bound port. Exposed via
+    /// `Manager.ListenEndpoints()` so `ansyncctl pair` can embed
+    /// them in the cable bootstrap reply — that lets the companion
+    /// fall back to a direct unicast dial when the host's mDNS
+    /// multicast doesn't reach (Wi-Fi AP isolation, hotspots, etc.).
+    pub listen_endpoints: Arc<StdMutex<Vec<(String, u16)>>>,
 }
 
 impl DaemonState {
@@ -73,11 +129,30 @@ impl DaemonState {
             peers,
             permissions,
             actions: None,
+            connectivity: Arc::new(StdMutex::new(HashMap::new())),
+            listen_endpoints: Arc::new(StdMutex::new(Vec::new())),
         }
     }
 
     pub fn with_actions(mut self, tx: UnboundedSender<DaemonAction>) -> Self {
         self.actions = Some(tx);
         self
+    }
+
+    /// Snapshot the current `ConnState` for `device`. Defaults to
+    /// `Disconnected` when the peer has never connected this session.
+    pub fn conn_state(&self, device: &DeviceId) -> ConnState {
+        self.connectivity
+            .lock()
+            .ok()
+            .and_then(|g| g.get(device).copied())
+            .unwrap_or(ConnState::Disconnected)
+    }
+
+    /// Atomically write the new state and return the previous one so
+    /// the caller can decide whether to emit a D-Bus signal.
+    pub fn set_conn_state(&self, device: &DeviceId, next: ConnState) -> ConnState {
+        let mut guard = self.connectivity.lock().expect("connectivity poisoned");
+        guard.insert(device.clone(), next).unwrap_or_default()
     }
 }

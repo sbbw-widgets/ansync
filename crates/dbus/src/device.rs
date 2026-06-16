@@ -6,7 +6,7 @@ use ansync_core::{Capabilities, DeviceId};
 use ansync_proto::{AudioDirection, CameraAspect, CameraConfig, VideoCodec};
 use zbus::interface;
 
-use crate::state::{DaemonAction, DaemonState};
+use crate::state::{ConnState, DaemonAction, DaemonState};
 
 #[derive(Clone)]
 pub struct Device {
@@ -65,9 +65,7 @@ impl Device {
 
     #[zbus(property)]
     async fn state(&self) -> String {
-        // Real session tracking lands in Step 6; expose the static
-        // "paired but never connected" state for now.
-        "disconnected".to_string()
+        self.state.conn_state(&self.id).as_str().to_string()
     }
 
     #[zbus(property)]
@@ -245,11 +243,94 @@ impl Device {
         Err(not_yet("SendFile"))
     }
 
+    /// Ask the companion to share its filesystem. Sends a
+    /// `ControlMessage::RequestFileAccess` over the existing QUIC
+    /// connection; the device side either silently brings up its
+    /// SAF-backed FS server (if a tree URI was previously picked)
+    /// or posts a notif asking the user to pick a folder.
+    ///
+    /// The `mountpoint` argument is kept in the signature for
+    /// forward compat but ignored today — auto-mount handles the
+    /// host-side mount path.
     async fn mount(&self, _mountpoint: String) -> zbus::fdo::Result<()> {
-        Err(not_yet("Mount"))
+        let tx = self.state.actions.as_ref().ok_or_else(|| {
+            zbus::fdo::Error::Failed("daemon action channel not wired".into())
+        })?;
+        tx.send(DaemonAction::MountFiles { device: self.id.clone() })
+            .map_err(|e| zbus::fdo::Error::Failed(format!("send action: {e}")))?;
+        Ok(())
     }
 
     async fn unmount(&self) -> zbus::fdo::Result<()> {
-        Err(not_yet("Unmount"))
+        let tx = self.state.actions.as_ref().ok_or_else(|| {
+            zbus::fdo::Error::Failed("daemon action channel not wired".into())
+        })?;
+        tx.send(DaemonAction::UnmountFiles { device: self.id.clone() })
+            .map_err(|e| zbus::fdo::Error::Failed(format!("send action: {e}")))?;
+        Ok(())
+    }
+
+    /// Fired once for every `NotificationListenerService.onNotificationPosted`
+    /// the companion forwards. Subscribers (e.g. a desktop notification
+    /// daemon bridge) receive `(id, app, title, body)`.
+    #[zbus(signal)]
+    pub async fn notification_posted(
+        ctxt: &zbus::object_server::SignalEmitter<'_>,
+        id: u64,
+        app: &str,
+        title: &str,
+        body: &str,
+    ) -> zbus::Result<()>;
+
+    /// Fired when the companion's
+    /// `NotificationListenerService.onNotificationRemoved` reports the
+    /// notification `id` was dismissed.
+    #[zbus(signal)]
+    pub async fn notification_removed(
+        ctxt: &zbus::object_server::SignalEmitter<'_>,
+        id: u64,
+    ) -> zbus::Result<()>;
+}
+
+impl Device {
+    /// Helper for `daemon-core`: flip the connectivity state for one
+    /// peer and emit the auto-generated `PropertiesChanged` signal for
+    /// the `State` property + the global `Manager.DeviceConnectivityChanged`.
+    /// No-op when the new state matches the current cached value.
+    pub async fn emit_state_changed(
+        conn: &zbus::Connection,
+        state: &Arc<DaemonState>,
+        device: &DeviceId,
+        next: ConnState,
+    ) -> zbus::Result<()> {
+        let previous = state.set_conn_state(device, next);
+        if previous == next {
+            return Ok(());
+        }
+        let path = crate::path_device(device);
+        let object_path = zbus::zvariant::ObjectPath::try_from(path.as_str())
+            .map_err(|e| zbus::Error::Failure(format!("bad path {path}: {e}")))?;
+        // PropertiesChanged for the `State` property. zbus auto-derives
+        // a `state_changed` method that emits the spec-compliant
+        // signal; generic property watchers refresh from this.
+        if let Ok(iface) = conn
+            .object_server()
+            .interface::<_, Device>(object_path)
+            .await
+        {
+            iface.get().await.state_changed(iface.signal_emitter()).await?;
+        }
+        // Manager-level fan-out so DMS widgets / ansyncctl can listen on
+        // a single object path instead of subscribing per-device.
+        let mgr_path = zbus::zvariant::ObjectPath::try_from(crate::PATH_MANAGER)
+            .map_err(|e| zbus::Error::Failure(format!("bad manager path: {e}")))?;
+        let mgr_emitter = zbus::object_server::SignalEmitter::new(conn, mgr_path)?;
+        crate::manager::Manager::device_connectivity_changed(
+            &mgr_emitter,
+            &device.to_string(),
+            next.as_str(),
+        )
+        .await?;
+        Ok(())
     }
 }
