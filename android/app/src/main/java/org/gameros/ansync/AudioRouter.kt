@@ -30,7 +30,7 @@ import kotlin.concurrent.thread
  * provisions; changing one side requires changing the other in the
  * same commit.
  */
-class AudioRouter(private val direction: WireAudioControl.Direction) {
+class AudioRouter(val direction: WireAudioControl.Direction) {
     @Volatile private var running = false
     private var captureThread: Thread? = null
     private var playbackThread: Thread? = null

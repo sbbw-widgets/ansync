@@ -2,8 +2,12 @@ package org.gameros.ansync
 
 import android.content.ClipData
 import android.content.ClipboardManager
+import android.content.ContentValues
 import android.content.Context
+import android.provider.MediaStore
 import android.util.Log
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import kotlin.concurrent.thread
 
 /**
@@ -18,20 +22,47 @@ import kotlin.concurrent.thread
  */
 class ClipboardBridge(private val context: Context) {
     @Volatile private var running = false
-    private var thread: Thread? = null
+    private var textThread: Thread? = null
+    private var blobThread: Thread? = null
 
     fun start() {
         if (running) return
         running = true
-        thread = thread(name = "ansync-clipboard") {
+        textThread = thread(name = "ansync-clipboard-text") {
             val mgr = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
             while (running) {
-                val text = NativeBridge.nativePollClipboardText() ?: return@thread
+                val text = NativeBridge.nativePollClipboardText()
+                if (text == null) {
+                    // Session not yet wired or peer dropped — back off
+                    // + retry rather than killing the bridge.
+                    try { Thread.sleep(500) } catch (_: InterruptedException) {}
+                    continue
+                }
                 val clip = ClipData.newPlainText("ansync", text)
                 try {
                     mgr.setPrimaryClip(clip)
                 } catch (e: Exception) {
-                    Log.w(TAG, "setPrimaryClip threw", e)
+                    Log.w(TAG, "setPrimaryClip text threw", e)
+                }
+            }
+        }
+        blobThread = thread(name = "ansync-clipboard-blob") {
+            val mgr = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+            while (running) {
+                val blob = NativeBridge.nativePollClipboardBlob()
+                if (blob == null) {
+                    try { Thread.sleep(500) } catch (_: InterruptedException) {}
+                    continue
+                }
+                val (mime, data) = decodeBlob(blob) ?: continue
+                if (!mime.startsWith("image/")) {
+                    Log.w(TAG, "ignoring non-image blob mime=$mime")
+                    continue
+                }
+                try {
+                    publishImage(mgr, mime, data)
+                } catch (e: Exception) {
+                    Log.w(TAG, "publishImage threw mime=$mime", e)
                 }
             }
         }
@@ -39,8 +70,10 @@ class ClipboardBridge(private val context: Context) {
 
     fun stop() {
         running = false
-        thread?.join(TIMEOUT_JOIN_MS)
-        thread = null
+        textThread?.join(TIMEOUT_JOIN_MS)
+        blobThread?.join(TIMEOUT_JOIN_MS)
+        textThread = null
+        blobThread = null
     }
 
     /**
@@ -52,8 +85,52 @@ class ClipboardBridge(private val context: Context) {
         val mgr = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
         val clip = mgr.primaryClip ?: return false
         if (clip.itemCount == 0) return false
-        val text = clip.getItemAt(0).coerceToText(context)?.toString() ?: return false
+        val item = clip.getItemAt(0)
+        val uri = item.uri
+        val mime = clip.description.getMimeType(0)
+        if (uri != null && mime != null && mime.startsWith("image/")) {
+            val data = try {
+                context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
+            } catch (e: Exception) {
+                Log.w(TAG, "openInputStream threw uri=$uri", e)
+                null
+            } ?: return false
+            return NativeBridge.nativeSendClipboardBlob(mime, data)
+        }
+        val text = item.coerceToText(context)?.toString() ?: return false
         return NativeBridge.nativeSendClipboardText(text)
+    }
+
+    private fun decodeBlob(buf: ByteArray): Pair<String, ByteArray>? {
+        if (buf.size < 4) return null
+        val mimeLen = ByteBuffer.wrap(buf, 0, 4).order(ByteOrder.LITTLE_ENDIAN).int
+        if (mimeLen < 0 || 4 + mimeLen > buf.size) return null
+        val mime = String(buf, 4, mimeLen, Charsets.UTF_8)
+        val data = buf.copyOfRange(4 + mimeLen, buf.size)
+        return mime to data
+    }
+
+    private fun publishImage(mgr: ClipboardManager, mime: String, data: ByteArray) {
+        val ext = when (mime) {
+            "image/png" -> "png"
+            "image/jpeg", "image/jpg" -> "jpg"
+            "image/webp" -> "webp"
+            "image/gif" -> "gif"
+            else -> "bin"
+        }
+        val values = ContentValues().apply {
+            put(MediaStore.Images.Media.DISPLAY_NAME, "ansync-${System.currentTimeMillis()}.$ext")
+            put(MediaStore.Images.Media.MIME_TYPE, mime)
+        }
+        val resolver = context.contentResolver
+        val uri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
+            ?: run {
+                Log.w(TAG, "MediaStore.insert returned null mime=$mime")
+                return
+            }
+        resolver.openOutputStream(uri)?.use { it.write(data) }
+        val clip = ClipData.newUri(resolver, "ansync", uri)
+        mgr.setPrimaryClip(clip)
     }
 
     companion object {
