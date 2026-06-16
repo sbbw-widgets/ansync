@@ -45,6 +45,14 @@ pub enum StreamKind {
     Input,
     Camera,
     Clipboard,
+    Notifications,
+    /// One-shot greeting stream. First and only frame is an
+    /// `ansync_proto::Envelope` carrying `Message::Hello`. Both sides
+    /// open one immediately after the QUIC handshake completes so the
+    /// peer's human-readable name + capability bitmap are refreshed
+    /// each session without relying on whatever was stamped during
+    /// pairing.
+    Hello,
 }
 
 #[async_trait]

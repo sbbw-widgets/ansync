@@ -36,6 +36,8 @@ fn stream_kind_tag(kind: StreamKind) -> u8 {
         StreamKind::Input => 0x06,
         StreamKind::Camera => 0x07,
         StreamKind::Clipboard => 0x08,
+        StreamKind::Notifications => 0x09,
+        StreamKind::Hello => 0x0a,
     }
 }
 
@@ -49,6 +51,8 @@ fn stream_kind_from_tag(tag: u8) -> Result<StreamKind, TransportError> {
         0x06 => Ok(StreamKind::Input),
         0x07 => Ok(StreamKind::Camera),
         0x08 => Ok(StreamKind::Clipboard),
+        0x09 => Ok(StreamKind::Notifications),
+        0x0a => Ok(StreamKind::Hello),
         _ => Err(TransportError::Handshake(format!("unknown stream tag {tag:#x}"))),
     }
 }
@@ -103,6 +107,22 @@ fn default_provider() -> Arc<CryptoProvider> {
     Arc::new(rustls::crypto::ring::default_provider())
 }
 
+/// Transport-layer tuning shared by every QUIC endpoint we build.
+/// Idle streams pile up while the user walks through MediaProjection
+/// prompts or scrolls through Settings, so the 30-second default is
+/// way too aggressive. Bumping `max_idle_timeout` + adding a
+/// keep-alive ping keeps connections live across normal user pauses.
+fn tuned_transport_config() -> Arc<quinn::TransportConfig> {
+    let mut cfg = quinn::TransportConfig::default();
+    cfg.max_idle_timeout(Some(
+        std::time::Duration::from_secs(120)
+            .try_into()
+            .expect("120s fits in VarInt"),
+    ));
+    cfg.keep_alive_interval(Some(std::time::Duration::from_secs(15)));
+    Arc::new(cfg)
+}
+
 #[derive(Clone)]
 pub struct QuicTransport {
     identity: IdentityKeypair,
@@ -136,7 +156,9 @@ impl QuicTransport {
         rustls_cfg.alpn_protocols = vec![ALPN.to_vec()];
         let qsc = quinn::crypto::rustls::QuicServerConfig::try_from(rustls_cfg)
             .map_err(|e| TransportError::Handshake(format!("quic server cfg: {e}")))?;
-        Ok(quinn::ServerConfig::with_crypto(Arc::new(qsc)))
+        let mut server_cfg = quinn::ServerConfig::with_crypto(Arc::new(qsc));
+        server_cfg.transport_config(tuned_transport_config());
+        Ok(server_cfg)
     }
 
     fn make_server_config_any(
@@ -154,7 +176,9 @@ impl QuicTransport {
         rustls_cfg.alpn_protocols = vec![ALPN.to_vec()];
         let qsc = quinn::crypto::rustls::QuicServerConfig::try_from(rustls_cfg)
             .map_err(|e| TransportError::Handshake(format!("quic server cfg: {e}")))?;
-        Ok(quinn::ServerConfig::with_crypto(Arc::new(qsc)))
+        let mut server_cfg = quinn::ServerConfig::with_crypto(Arc::new(qsc));
+        server_cfg.transport_config(tuned_transport_config());
+        Ok(server_cfg)
     }
 
     fn make_client_config(
@@ -176,7 +200,9 @@ impl QuicTransport {
         rustls_cfg.alpn_protocols = vec![ALPN.to_vec()];
         let qcc = quinn::crypto::rustls::QuicClientConfig::try_from(rustls_cfg)
             .map_err(|e| TransportError::Handshake(format!("quic client cfg: {e}")))?;
-        Ok(quinn::ClientConfig::new(Arc::new(qcc)))
+        let mut client_cfg = quinn::ClientConfig::new(Arc::new(qcc));
+        client_cfg.transport_config(tuned_transport_config());
+        Ok(client_cfg)
     }
 
     pub fn bind(

@@ -60,6 +60,28 @@ pub enum ControlMessage {
     StopMic,
     StartAudioRoute { direction: AudioDirection },
     StopAudioRoute,
+    /// Host → companion: "I would like to mirror your screen now."
+    /// The companion's service decides how to handle the request — if
+    /// the user already granted MediaProjection for this session, it
+    /// starts capture immediately; otherwise it posts a high-priority
+    /// notification asking the user to grant. Either way the host
+    /// can't force capture without on-device consent (Android limit).
+    RequestScreenCapture,
+    /// Host → companion: "Stop mirroring." Stops capture on the
+    /// device side without waiting for the host to drop the QUIC
+    /// connection. Symmetric to `StopScreen` but on the
+    /// control-stream surface.
+    StopScreenCapture,
+    /// Host → companion: "I want to browse / mount your files." The
+    /// companion checks whether a SAF tree URI is already persisted
+    /// for the paired host; if so it brings up its `AnsyncFsServer`
+    /// silently. If not, it posts a heads-up notif asking the user
+    /// to pick a folder. This is the entry point for both ad-hoc
+    /// transfers and the daemon's FUSE auto-mount.
+    RequestFileAccess,
+    /// Host → companion: "Drop the FS server, nothing to share now."
+    /// Used when the host's `Device.Unmount` D-Bus method fires.
+    ReleaseFileAccess,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -118,8 +140,18 @@ pub struct AudioStreamInit {
 pub enum PairingMessage {
     /// Bootstrap channel announces this side's identity.
     BootstrapHello { identity_pubkey: [u8; 32], name: String },
-    /// Peer accepts and shares its identity back.
-    BootstrapAck { identity_pubkey: [u8; 32], name: String },
+    /// Peer accepts and shares its identity back. `lan_endpoints` is
+    /// the host's best-guess LAN reachability hint set — typically
+    /// the (ip, port) pairs the QUIC listener is bound on, picked
+    /// from non-loopback interfaces. The companion persists them so
+    /// `HostDialer` can fall back to a direct unicast dial when
+    /// mDNS multicast is blocked (AP isolation, hotspot subnets,
+    /// etc.).
+    BootstrapAck {
+        identity_pubkey: [u8; 32],
+        name: String,
+        lan_endpoints: Vec<(String, u16)>,
+    },
     /// PIN shown on Android, typed on host.
     PinChallenge { pin: [u8; 6] },
     PinResponse { pin: [u8; 6] },
