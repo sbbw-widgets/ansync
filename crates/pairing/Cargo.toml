@@ -17,14 +17,31 @@ serde.workspace = true
 tokio = { workspace = true, features = ["io-util", "net", "process", "fs", "macros", "time", "sync"] }
 toml.workspace = true
 tracing.workspace = true
-adb_client.workspace = true
 bytes.workspace = true
 directories.workspace = true
-reqwest.workspace = true
-serde_json.workspace = true
-sha2.workspace = true
-hex.workspace = true
-futures.workspace = true
+
+# `host` feature pulls in everything the desktop daemon / CLI needs to
+# drive ADB and fetch APK releases. Android (and any other non-host
+# embed of `ansync-pairing`) disables `default-features` to avoid
+# linking against `aws-lc-sys` / `getentropy` (NDK API ≥ 28 only), and
+# pulls only the wire-format halves of `cable.rs` + `store.rs`.
+adb_client = { workspace = true, optional = true }
+reqwest = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
+hex = { workspace = true, optional = true }
+futures = { workspace = true, optional = true }
+
+[features]
+default = ["host"]
+host = [
+    "dep:adb_client",
+    "dep:reqwest",
+    "dep:serde_json",
+    "dep:sha2",
+    "dep:hex",
+    "dep:futures",
+]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-util", "net"] }

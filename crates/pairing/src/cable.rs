@@ -11,9 +11,12 @@
 //! calls run inside `tokio::task::spawn_blocking` so they don't stall
 //! the runtime.
 
+#[cfg(feature = "host")]
 use std::net::SocketAddr;
+#[cfg(feature = "host")]
 use std::time::Duration;
 
+#[cfg(feature = "host")]
 use adb_client::{ADBDeviceExt, ADBServer, ADBServerDevice};
 use ansync_core::{Capabilities, DeviceName, DevicePermissions};
 use ansync_crypto::IdentityKeypair;
@@ -21,7 +24,9 @@ use ansync_proto::{
     Envelope, Message, PROTOCOL_VERSION, PairingMessage, read_envelope, write_envelope,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
+#[cfg(feature = "host")]
 use tokio::net::TcpListener;
+#[cfg(feature = "host")]
 use tokio::time::timeout;
 
 use crate::PairingError;
@@ -32,8 +37,12 @@ use crate::store::StoredPeer;
 const PAIRING_FRAME_MAX: usize = 4 * 1024;
 
 /// Wait at most this long for the companion to connect after the cable
-/// reverse has been set up.
-const COMPANION_TIMEOUT: Duration = Duration::from_secs(60);
+/// reverse has been set up. The companion side requires the user to
+/// tap a heads-up notification (Android 14+ Background Activity
+/// Launch restriction work-around), so the timeout has to cover
+/// human reaction time — 60s is borderline if the user is mid-task.
+#[cfg(feature = "host")]
+const COMPANION_TIMEOUT: Duration = Duration::from_secs(180);
 
 #[derive(Debug, Clone)]
 pub struct AdbDevice {
@@ -46,10 +55,12 @@ pub struct AdbDevice {
 /// before triggering the pairing broadcast.
 pub const COMPANION_PACKAGE: &str = "org.gameros.ansync";
 
+#[cfg(feature = "host")]
 fn server() -> ADBServer {
     ADBServer::default()
 }
 
+#[cfg(feature = "host")]
 fn pairing_err<E: std::fmt::Display>(ctx: &'static str, e: E) -> PairingError {
     PairingError::Protocol(format!("{ctx}: {e}"))
 }
@@ -62,11 +73,14 @@ pub async fn bootstrap_host<S>(
     stream: &mut S,
     local: &IdentityKeypair,
     local_name: &str,
+    lan_endpoints: Vec<(String, u16)>,
 ) -> Result<StoredPeer, PairingError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    tracing::debug!("bootstrap_host: waiting for BootstrapHello");
     let envelope = read_envelope(stream, PAIRING_FRAME_MAX).await?;
+    tracing::debug!("bootstrap_host: BootstrapHello received");
     let (peer_pubkey, peer_name) = match envelope.message {
         Message::Pairing(PairingMessage::BootstrapHello { identity_pubkey, name }) => {
             (identity_pubkey, name)
@@ -83,9 +97,17 @@ where
         message: Message::Pairing(PairingMessage::BootstrapAck {
             identity_pubkey: local.public().as_bytes(),
             name: local_name.to_string(),
+            lan_endpoints,
         }),
     };
     write_envelope(stream, &ack).await?;
+    // Flush + half-close write so the kernel sends FIN after the Ack.
+    // Without this, Tokio's `TcpStream` drop races the kernel's
+    // adb-USB forwarder — the companion reads zero bytes (early EOF)
+    // before the Ack ever crosses the wire.
+    use tokio::io::AsyncWriteExt;
+    let _ = stream.flush().await;
+    let _ = stream.shutdown().await;
 
     Ok(StoredPeer::new(
         DeviceName(peer_name),
@@ -98,11 +120,20 @@ where
 /// Drive the companion (device) side of the cable bootstrap. Symmetric
 /// to [`bootstrap_host`] — sends Hello, awaits Ack. Useful from tests
 /// and from a future host-as-companion CLI mode.
+/// Returned to the companion side after a successful cable bootstrap.
+/// Wraps the standard [`StoredPeer`] plus the host's LAN endpoints
+/// so the companion can persist them for direct-dial fallback.
+#[derive(Debug, Clone)]
+pub struct CompanionPairResult {
+    pub peer: StoredPeer,
+    pub lan_endpoints: Vec<(String, u16)>,
+}
+
 pub async fn bootstrap_companion<S>(
     stream: &mut S,
     local: &IdentityKeypair,
     local_name: &str,
-) -> Result<StoredPeer, PairingError>
+) -> Result<CompanionPairResult, PairingError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -114,11 +145,13 @@ where
         }),
     };
     write_envelope(stream, &hello).await?;
+    use tokio::io::AsyncWriteExt;
+    let _ = stream.flush().await;
 
     let envelope = read_envelope(stream, PAIRING_FRAME_MAX).await?;
-    let (peer_pubkey, peer_name) = match envelope.message {
-        Message::Pairing(PairingMessage::BootstrapAck { identity_pubkey, name }) => {
-            (identity_pubkey, name)
+    let (peer_pubkey, peer_name, lan_endpoints) = match envelope.message {
+        Message::Pairing(PairingMessage::BootstrapAck { identity_pubkey, name, lan_endpoints }) => {
+            (identity_pubkey, name, lan_endpoints)
         }
         other => {
             return Err(PairingError::Protocol(format!(
@@ -127,17 +160,21 @@ where
         }
     };
 
-    Ok(StoredPeer::new(
-        DeviceName(peer_name),
-        peer_pubkey,
-        Capabilities::empty(),
-        DevicePermissions::default(),
-    ))
+    Ok(CompanionPairResult {
+        peer: StoredPeer::new(
+            DeviceName(peer_name),
+            peer_pubkey,
+            Capabilities::empty(),
+            DevicePermissions::default(),
+        ),
+        lan_endpoints,
+    })
 }
 
 /// List ADB devices currently in the `device` state. Devices in
 /// `unauthorized` or `offline` are filtered out — the user must accept
 /// the USB-debugging prompt before they can pair.
+#[cfg(feature = "host")]
 pub async fn list_adb_devices() -> Result<Vec<AdbDevice>, PairingError> {
     tokio::task::spawn_blocking(|| {
         let mut srv = server();
@@ -166,11 +203,13 @@ pub async fn list_adb_devices() -> Result<Vec<AdbDevice>, PairingError> {
 ///    [`COMPANION_TIMEOUT`]).
 /// 4. Drive [`bootstrap_host`] over the resulting stream.
 /// 5. Tear the reverse mapping down regardless of outcome.
+#[cfg(feature = "host")]
 pub async fn pair_host_via_adb(
     serial: &str,
     local: &IdentityKeypair,
     local_name: &str,
     apk: Option<&std::path::Path>,
+    lan_endpoints: Vec<(String, u16)>,
 ) -> Result<StoredPeer, PairingError> {
     if !companion_installed(serial).await? {
         let apk_path = apk.ok_or_else(|| {
@@ -189,13 +228,21 @@ pub async fn pair_host_via_adb(
         let _ = remove_adb_reverse(serial, port).await;
         return Err(e);
     }
-    let result = wait_and_bootstrap(&listener, local, local_name).await;
+    let result =
+        wait_and_bootstrap(&listener, local, local_name, lan_endpoints).await;
     let _ = remove_adb_reverse(serial, port).await;
     result
 }
 
 /// Probe `pm list packages` for the companion. Returns
 /// `Ok(true)` if installed, `Ok(false)` if absent.
+///
+/// adb_client's `shell_v2` transport interleaves stdout/stderr framing
+/// bytes with the actual output, so a strict `line == "package:..."`
+/// check misses real installs. We match on substring instead — the
+/// fully qualified package name is unique enough that false positives
+/// are not a realistic concern.
+#[cfg(feature = "host")]
 pub async fn companion_installed(serial: &str) -> Result<bool, PairingError> {
     let serial = serial.to_string();
     tokio::task::spawn_blocking(move || {
@@ -208,9 +255,7 @@ pub async fn companion_installed(serial: &str) -> Result<bool, PairingError> {
             )
             .map_err(|e| pairing_err("pm list packages", e))?;
         let stdout = String::from_utf8_lossy(&buf);
-        Ok(stdout
-            .lines()
-            .any(|l| l.trim() == format!("package:{COMPANION_PACKAGE}")))
+        Ok(stdout.contains(&format!("package:{COMPANION_PACKAGE}")))
     })
     .await
     .map_err(|e| pairing_err("spawn_blocking pm list", e))?
@@ -218,6 +263,7 @@ pub async fn companion_installed(serial: &str) -> Result<bool, PairingError> {
 
 /// Install the companion APK on the device. Replaces an existing
 /// install if present.
+#[cfg(feature = "host")]
 pub async fn install_companion_apk(
     serial: &str,
     apk: &std::path::Path,
@@ -241,30 +287,53 @@ pub async fn install_companion_apk(
     .map_err(|e| pairing_err("spawn_blocking install", e))?
 }
 
+#[cfg(feature = "host")]
 async fn wait_and_bootstrap(
     listener: &TcpListener,
     local: &IdentityKeypair,
     local_name: &str,
+    lan_endpoints: Vec<(String, u16)>,
 ) -> Result<StoredPeer, PairingError> {
+    tracing::debug!("wait_and_bootstrap: listening for companion TCP connect");
     let accept = timeout(COMPANION_TIMEOUT, listener.accept())
         .await
         .map_err(|_| PairingError::Protocol("companion did not connect in time".into()))??;
-    let (mut stream, _peer) = accept;
-    bootstrap_host(&mut stream, local, local_name).await
+    let (mut stream, peer) = accept;
+    tracing::debug!("wait_and_bootstrap: companion connected from {peer}");
+    bootstrap_host(&mut stream, local, local_name, lan_endpoints).await
 }
 
+#[cfg(feature = "host")]
 async fn add_adb_reverse(serial: &str, port: u16) -> Result<(), PairingError> {
+    // adb_client 2.1.x ships a `reverse(...)` that sends the right
+    // wire bytes but never actually installs the listener on the
+    // device's adbd (verified empirically: the `adb reverse --list`
+    // mapping shows up host-side but the device never opens a
+    // matching `LISTEN` socket, so the companion's `connect("127.0.0.1",
+    // port)` ETIMEDOUTs). Until the upstream bug is fixed we shell out
+    // to the official `adb` binary — `Step 16` removed adb-stdout
+    // *parsing*, not adb-binary usage; reverse has no stdout to parse
+    // beyond an exit code so this stays clean.
     let serial = serial.to_string();
     tokio::task::spawn_blocking(move || {
-        let mut device = get_device(&serial)?;
-        device
-            .reverse(format!("tcp:{port}"), format!("tcp:{port}"))
-            .map_err(|e| pairing_err("adb reverse", e))
+        let output = std::process::Command::new("adb")
+            .args(["-s", &serial, "reverse", &format!("tcp:{port}"), &format!("tcp:{port}")])
+            .output()
+            .map_err(|e| pairing_err("spawn adb reverse", e))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(PairingError::Protocol(format!(
+                "adb reverse exited {}: {}",
+                output.status, stderr.trim()
+            )));
+        }
+        Ok(())
     })
     .await
     .map_err(|e| pairing_err("spawn_blocking reverse", e))?
 }
 
+#[cfg(feature = "host")]
 async fn trigger_companion_pair(
     serial: &str,
     port: u16,
@@ -305,18 +374,23 @@ async fn trigger_companion_pair(
     .map_err(|e| pairing_err("spawn_blocking broadcast", e))?
 }
 
+#[cfg(feature = "host")]
 async fn remove_adb_reverse(serial: &str, _port: u16) -> Result<(), PairingError> {
+    // Mirror of `add_adb_reverse`: shell out until adb_client's
+    // reverse impl is fixed upstream. Failure here is best-effort —
+    // we still return Ok so the pair-success path isn't shadowed by
+    // a cleanup hiccup.
     let serial = serial.to_string();
-    tokio::task::spawn_blocking(move || {
-        let mut device = get_device(&serial)?;
-        device
-            .reverse_remove_all()
-            .map_err(|e| pairing_err("adb reverse remove_all", e))
+    let _ = tokio::task::spawn_blocking(move || {
+        let _ = std::process::Command::new("adb")
+            .args(["-s", &serial, "reverse", "--remove-all"])
+            .output();
     })
-    .await
-    .map_err(|e| pairing_err("spawn_blocking reverse remove_all", e))?
+    .await;
+    Ok(())
 }
 
+#[cfg(feature = "host")]
 fn get_device(serial: &str) -> Result<ADBServerDevice, PairingError> {
     let mut srv = server();
     srv.get_device_by_name(serial)
@@ -341,9 +415,14 @@ mod tests {
         let companion_id_for_task = companion_id.clone();
 
         let host_task = tokio::spawn(async move {
-            bootstrap_host(&mut host_stream, &host_id_for_task, "host-test")
-                .await
-                .unwrap()
+            bootstrap_host(
+                &mut host_stream,
+                &host_id_for_task,
+                "host-test",
+                vec![("10.0.0.5".into(), 47000)],
+            )
+            .await
+            .unwrap()
         });
         let companion_task = tokio::spawn(async move {
             bootstrap_companion(
@@ -355,13 +434,14 @@ mod tests {
             .unwrap()
         });
 
-        let (h_peer, c_peer) = tokio::join!(host_task, companion_task);
+        let (h_peer, c_result) = tokio::join!(host_task, companion_task);
         let h_peer = h_peer.unwrap();
-        let c_peer = c_peer.unwrap();
+        let c_result = c_result.unwrap();
 
         assert_eq!(h_peer.pubkey, companion_pub);
         assert_eq!(h_peer.name.0, "companion-test");
-        assert_eq!(c_peer.pubkey, host_pub);
-        assert_eq!(c_peer.name.0, "host-test");
+        assert_eq!(c_result.peer.pubkey, host_pub);
+        assert_eq!(c_result.peer.name.0, "host-test");
+        assert_eq!(c_result.lan_endpoints, vec![("10.0.0.5".to_string(), 47000)]);
     }
 }

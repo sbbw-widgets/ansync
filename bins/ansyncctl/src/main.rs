@@ -55,6 +55,13 @@ enum Command {
         /// `/usr/share/ansync/companion.apk`.
         #[arg(long)]
         apk: Option<PathBuf>,
+        /// Skip prompt and install the latest release if the
+        /// companion is outdated.
+        #[arg(long)]
+        auto_upgrade: bool,
+        /// Skip the GitHub release check entirely (offline mode).
+        #[arg(long)]
+        skip_upgrade_check: bool,
     },
     /// Forget a previously paired device.
     Forget { id: String },
@@ -110,7 +117,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Identity { action } => identity(action)?,
         Command::Devices => list_devices()?,
         Command::Discover { seconds } => discover(seconds).await?,
-        Command::Pair { serial, name, apk } => pair(serial, name, apk).await?,
+        Command::Pair {
+            serial,
+            name,
+            apk,
+            auto_upgrade,
+            skip_upgrade_check,
+        } => pair(serial, name, apk, auto_upgrade, skip_upgrade_check).await?,
         Command::Forget { id } => println!("(skeleton) forget {id}"),
         Command::Show { id } => println!("(skeleton) show {id}"),
         Command::Push { id, path, addr, seconds } => push(id, path, addr, seconds).await?,
@@ -227,6 +240,8 @@ async fn pair(
     serial: Option<String>,
     name: Option<String>,
     apk: Option<PathBuf>,
+    auto_upgrade: bool,
+    skip_upgrade_check: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let identity = load_identity()?;
     let local_name = name
@@ -260,14 +275,16 @@ async fn pair(
             candidate.exists().then_some(candidate)
         });
 
-    // Step 17: if no explicit APK was supplied and the companion is
-    // missing, fall through to the GitHub release fetcher. The cache
-    // path is reused on subsequent runs, so re-pairing the same
-    // device after a clean shell is free.
-    let mut auto_apk: Option<PathBuf> = None;
+    // Step 17 + R1: resolve the APK to install when:
+    //   - companion is missing (install latest release), or
+    //   - companion is present but a newer release is available and
+    //     the user opts in (prompt by default, `--auto-upgrade` skips).
+    // `--skip-upgrade-check` bypasses the net call entirely for
+    // offline pairing.
+    let installed = ansync_pairing::companion_installed(&serial).await?;
     let resolved_apk = if apk_path.is_some() {
         apk_path
-    } else if !ansync_pairing::companion_installed(&serial).await? {
+    } else if !installed {
         match ansync_pairing::fetch_latest_companion().await {
             Ok(fetched) => {
                 println!(
@@ -275,7 +292,6 @@ async fn pair(
                     fetched.tag,
                     fetched.path.display()
                 );
-                auto_apk = Some(fetched.path.clone());
                 Some(fetched.path)
             }
             Err(e) => {
@@ -285,13 +301,56 @@ async fn pair(
                 None
             }
         }
-    } else {
+    } else if skip_upgrade_check {
         None
+    } else {
+        match ansync_pairing::fetch_latest_companion().await {
+            Ok(fetched) => {
+                let installed_version =
+                    ansync_pairing::query_installed_version(&serial, ansync_pairing::COMPANION_PACKAGE)
+                        .await
+                        .unwrap_or(None);
+                if needs_upgrade(installed_version.as_deref(), &fetched.tag) {
+                    let old = installed_version
+                        .as_deref()
+                        .unwrap_or("<unknown>");
+                    if auto_upgrade || prompt_upgrade(old, &fetched.tag)? {
+                        println!(
+                            "upgrading companion {old} → {} ({})",
+                            fetched.tag,
+                            fetched.path.display()
+                        );
+                        Some(fetched.path)
+                    } else {
+                        println!("keeping installed companion {old}");
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
+            Err(e) => {
+                eprintln!("warning: upgrade check failed ({e}); continuing with installed companion");
+                None
+            }
+        }
     };
-    let _ = auto_apk;
 
+    let lan_endpoints = query_listen_endpoints().await.unwrap_or_else(|e| {
+        eprintln!(
+            "warning: ListenEndpoints query failed ({e}); companion will rely on mDNS only"
+        );
+        Vec::new()
+    });
     println!("pairing with {serial} as `{local_name}` …");
-    let stored = pair_host_via_adb(&serial, &identity, &local_name, resolved_apk.as_deref()).await?;
+    let stored = pair_host_via_adb(
+        &serial,
+        &identity,
+        &local_name,
+        resolved_apk.as_deref(),
+        lan_endpoints,
+    )
+    .await?;
     println!("paired: device_id={} name={}", stored.id, stored.name);
 
     let store = PeerStore::open(default_peers_dir()?)?;
@@ -307,7 +366,96 @@ async fn pair(
     if let Err(e) = notify_daemon_refresh().await {
         eprintln!("note: daemon not running or unreachable: {e}");
     }
+    if let Err(e) = post_setup_notification(&stored.name.0).await {
+        // Non-fatal: pair already persisted. Just log so the user
+        // knows why no desktop notif popped.
+        eprintln!("note: failed to post desktop notification: {e}");
+    }
     Ok(())
+}
+
+/// Pop a freedesktop notification telling the user to walk through
+/// the setup guide that just appeared on their phone. Better UX than
+/// dumping a wall of `println!`s on stdout — the notif persists in
+/// the user's notification daemon (DMS / dunst / mako) until they
+/// finish the steps.
+async fn post_setup_notification(
+    device_name: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::collections::HashMap;
+    use zbus::zvariant::Value;
+    let conn = zbus::Connection::session().await?;
+    let proxy = zbus::Proxy::new(
+        &conn,
+        "org.freedesktop.Notifications",
+        "/org/freedesktop/Notifications",
+        "org.freedesktop.Notifications",
+    )
+    .await?;
+    let summary = format!("Ansync paired with {device_name}");
+    let body = "Finish setup on your phone. Pull down the shade and tap each \
+                ansync step (notifications, microphone, accessibility, …). \
+                The mirror window goes live once you're done.";
+    let actions: Vec<&str> = vec![];
+    let hints: HashMap<&str, Value<'_>> = HashMap::new();
+    let _id: u32 = proxy
+        .call(
+            "Notify",
+            &(
+                "ansync",
+                0u32,
+                "smartphone",
+                summary.as_str(),
+                body,
+                actions,
+                hints,
+                15_000i32,
+            ),
+        )
+        .await?;
+    Ok(())
+}
+
+/// Tag from GitHub looks like `v0.2.1`; Android `versionName` looks
+/// like `0.2.1`. Strip a leading `v` from the tag and compare for
+/// exact equality. Anything that doesn't match is treated as
+/// upgradeable — semver dance isn't worth it here, the goal is just
+/// "device should run the latest release".
+fn needs_upgrade(installed: Option<&str>, tag: &str) -> bool {
+    let Some(installed) = installed else {
+        return true;
+    };
+    let tag = tag.trim_start_matches(['v', 'V']);
+    installed.trim() != tag
+}
+
+fn prompt_upgrade(old: &str, new: &str) -> Result<bool, Box<dyn std::error::Error>> {
+    use std::io::{BufRead, Write};
+    print!("upgrade companion {old} → {new}? (y/N) ");
+    std::io::stdout().flush()?;
+    let stdin = std::io::stdin();
+    let mut line = String::new();
+    stdin.lock().read_line(&mut line)?;
+    Ok(matches!(line.trim(), "y" | "Y" | "yes" | "YES"))
+}
+
+/// Ask the running daemon for its LAN endpoints so we can embed them
+/// in the cable bootstrap reply. Used as a direct-dial fallback by
+/// the companion when mDNS multicast doesn't reach (Wi-Fi AP
+/// isolation, captive portals, etc.).
+async fn query_listen_endpoints()
+    -> Result<Vec<(String, u16)>, Box<dyn std::error::Error>>
+{
+    let conn = zbus::Connection::session().await?;
+    let proxy = zbus::Proxy::new(
+        &conn,
+        ansync_dbus::SERVICE_NAME,
+        ansync_dbus::PATH_MANAGER,
+        "org.gameros.Ansync1.Manager",
+    )
+    .await?;
+    let endpoints: Vec<(String, u16)> = proxy.call("ListenEndpoints", &()).await?;
+    Ok(endpoints)
 }
 
 async fn notify_daemon_refresh() -> Result<(), Box<dyn std::error::Error>> {

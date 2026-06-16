@@ -144,10 +144,18 @@ pub async fn query_installed_version(
             .shell_command(&["dumpsys", "package", &package], &mut buf)
             .map_err(|e| PairingError::Protocol(format!("dumpsys package: {e}")))?;
         let stdout = String::from_utf8_lossy(&buf);
-        for line in stdout.lines() {
-            let trimmed = line.trim();
-            if let Some(rest) = trimmed.strip_prefix("versionName=") {
-                return Ok(Some(rest.to_string()));
+        // shell_v2 transport interleaves stdout/stderr framing with the
+        // payload, so `lines().strip_prefix("versionName=")` misses
+        // matches that sit at the start of a frame chunk. Find the
+        // marker by substring, then read up to the next whitespace.
+        if let Some(idx) = stdout.find("versionName=") {
+            let rest = &stdout[idx + "versionName=".len()..];
+            let end = rest
+                .find(|c: char| c.is_whitespace() || c.is_control())
+                .unwrap_or(rest.len());
+            let version = rest[..end].trim();
+            if !version.is_empty() {
+                return Ok(Some(version.to_string()));
             }
         }
         Ok(None)
