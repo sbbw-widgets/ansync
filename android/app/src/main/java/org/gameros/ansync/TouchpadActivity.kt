@@ -139,6 +139,14 @@ private fun TouchpadScreen() {
     var canvasSize by remember { mutableStateOf(IntSize.Zero) }
     var imeOpen by remember { mutableStateOf(false) }
     var editTextRef by remember { mutableStateOf<HostKeyboardEditText?>(null) }
+    /// When `true`, every pointer in every `MotionEvent` is
+    /// forwarded straight to the host's uinput Touchscreen (MT-B)
+    /// device. The Android view becomes a 1:1 absolute-coord touch
+    /// overlay of the host display: pinch / pan / rotate are all
+    /// resolved by the host's compositor and apps natively, which
+    /// gives precise simultaneous control instead of the synthesised
+    /// `Ctrl+Wheel` zoom of trackpad mode.
+    var rawTouchMode by remember { mutableStateOf(false) }
 
     LaunchedEffect(imeOpen, editTextRef) {
         val et = editTextRef ?: return@LaunchedEffect
@@ -159,6 +167,9 @@ private fun TouchpadScreen() {
         ) {
             Button(onClick = { imeOpen = !imeOpen }) {
                 Text(if (imeOpen) "Hide keyboard" else "Show keyboard")
+            }
+            Button(onClick = { rawTouchMode = !rawTouchMode }) {
+                Text(if (rawTouchMode) "Trackpad mode" else "Raw touch mode")
             }
             Text(
                 text = status,
@@ -188,16 +199,30 @@ private fun TouchpadScreen() {
                 .background(Color(0xFF101418))
                 .onSizeChanged { canvasSize = it }
                 .pointerInteropFilter { event ->
-                    val update = handlePointerEvent(event, canvasSize)
-                    if (update != null) status = update
+                    if (rawTouchMode) {
+                        handleRawTouchEvent(event, canvasSize)
+                        status = "raw touch — ${event.pointerCount} fingers"
+                    } else {
+                        val update = handlePointerEvent(event, canvasSize)
+                        if (update != null) status = update
+                    }
                     true
                 },
         ) {
-            Text(
-                text = "drag → cursor  •  tap → click  •  long press → right\n" +
+            val helpText = if (rawTouchMode) {
+                "raw touch overlay → host MT-B Touchscreen\n" +
+                    "every finger forwarded with absolute coords\n" +
+                    "pinch / pan / rotate handled by the host compositor\n" +
+                    "no synthesised clicks — apps see real touch events"
+            } else {
+                "drag → cursor  •  tap → click  •  long press → right\n" +
                     "double-tap + hold → left button drag\n" +
                     "2-finger drag → wheel  •  2-finger tap → middle\n" +
-                    "stylus → pen events  •  Show keyboard → type to host",
+                    "pinch fingers → Ctrl+Wheel zoom\n" +
+                    "stylus → pen events  •  Show keyboard → type to host"
+            }
+            Text(
+                text = helpText,
                 color = Color.White,
                 modifier = Modifier.align(Alignment.TopStart).padding(16.dp),
                 style = MaterialTheme.typography.bodyMedium,
@@ -472,6 +497,65 @@ private fun releaseCtrlIfHeld() {
         sendKey(EVDEV_LEFTCTRL, false)
         gesture.ctrlHeld = false
     }
+}
+
+// ── Raw touch (MT-B passthrough) ─────────────────────────────────────
+
+/**
+ * Forward every pointer in [event] straight to the host's uinput
+ * Touchscreen device as `TouchSlot` packets. Slot + tracking id come
+ * from Android's stable `pointerId` (Linux MT-B expects tracking id
+ * >= 0 while contact, -1 on release). Coords map the local Compose
+ * canvas to the host display's 0..32767 ABS range linearly.
+ *
+ * Mode is exclusive — when the toggle is on, none of the
+ * trackpad-style synthesis (mouse buttons, wheel, pinch→Ctrl+Wheel)
+ * fires. The host sees a true multi-touch stream and resolves
+ * gestures via the focused compositor / app, which is what apps
+ * with native touch handling (browsers, GIMP/Krita with touch,
+ * Wayland compositors with libinput gestures) actually want.
+ */
+private fun handleRawTouchEvent(event: MotionEvent, canvas: IntSize) {
+    if (canvas.width <= 0 || canvas.height <= 0) return
+    when (event.actionMasked) {
+        MotionEvent.ACTION_DOWN, MotionEvent.ACTION_POINTER_DOWN -> {
+            emitTouchSlot(event, event.actionIndex, canvas, lifted = false)
+        }
+        MotionEvent.ACTION_MOVE -> {
+            for (i in 0 until event.pointerCount) {
+                emitTouchSlot(event, i, canvas, lifted = false)
+            }
+        }
+        MotionEvent.ACTION_UP, MotionEvent.ACTION_POINTER_UP -> {
+            emitTouchSlot(event, event.actionIndex, canvas, lifted = true)
+        }
+        MotionEvent.ACTION_CANCEL -> {
+            for (i in 0 until event.pointerCount) {
+                emitTouchSlot(event, i, canvas, lifted = true)
+            }
+        }
+    }
+}
+
+private fun emitTouchSlot(event: MotionEvent, idx: Int, canvas: IntSize, lifted: Boolean) {
+    val pointerId = event.getPointerId(idx)
+    val slot = (pointerId and 0xFF).toByte()
+    val trackingId = if (lifted) -1 else pointerId
+    val absX = (event.getX(idx).coerceIn(0f, canvas.width.toFloat()) *
+        STYLUS_ABS_MAX / canvas.width).toInt().coerceIn(0, STYLUS_ABS_MAX)
+    val absY = (event.getY(idx).coerceIn(0f, canvas.height.toFloat()) *
+        STYLUS_ABS_MAX / canvas.height).toInt().coerceIn(0, STYLUS_ABS_MAX)
+    val pressure = (event.getPressure(idx).coerceIn(0f, 1f) * 255).toInt()
+        .coerceIn(0, 255)
+    NativeBridge.nativeSendInputMessage(
+        WireInputMessage.TouchSlot(
+            slot = slot,
+            x = absX,
+            y = absY,
+            pressure = pressure,
+            trackingId = trackingId,
+        ).encode()
+    )
 }
 
 private fun handleStylus(event: MotionEvent, canvas: IntSize): String {
