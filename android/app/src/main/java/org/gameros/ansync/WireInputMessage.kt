@@ -48,8 +48,13 @@ sealed class WireInputMessage {
             val b = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(v).array()
             b.forEach { buf.add(it) }
         }
+        fun u32(v: Int) = i32(v)
         fun u16(v: Int) {
             val b = ByteBuffer.allocate(2).order(ByteOrder.LITTLE_ENDIAN).putShort(v.toShort()).array()
+            b.forEach { buf.add(it) }
+        }
+        fun i16(v: Short) {
+            val b = ByteBuffer.allocate(2).order(ByteOrder.LITTLE_ENDIAN).putShort(v).array()
             b.forEach { buf.add(it) }
         }
         when (this) {
@@ -65,7 +70,25 @@ sealed class WireInputMessage {
                 u16(pressure)
                 i32(trackingId)
             }
-            is Stylus, is Gamepad -> throw IllegalStateException("device→host not supported for ${this::class.simpleName}")
+            is Stylus -> {
+                u8(5)
+                i32(x)
+                i32(y)
+                u16(pressure)
+                i16(tiltX)
+                i16(tiltY)
+                u8(btn.toInt() and 0xFF)
+            }
+            is Gamepad -> {
+                u8(6)
+                u32(buttons)
+                i16(lx)
+                i16(ly)
+                i16(rx)
+                i16(ry)
+                u8(lt.toInt() and 0xFF)
+                u8(rt.toInt() and 0xFF)
+            }
         }
         return buf.toByteArray()
     }

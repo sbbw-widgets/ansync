@@ -7,4 +7,11 @@
         running the ansync daemon. Required for the host to control this
         device while screen-mirrored.
     </string>
+
+    <!-- Quick Settings tile labels (U4b). -->
+    <string name="tile_mirror_label">Mirror to PC</string>
+    <string name="tile_touchpad_label">Touchpad → PC</string>
+    <string name="tile_mic_label">Share mic</string>
+    <string name="tile_audio_label">PC audio out</string>
+    <string name="tile_gamepad_label">Gamepad → PC</string>
 </resources>

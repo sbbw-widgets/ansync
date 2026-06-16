@@ -12,12 +12,17 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CAMERA" />
+    <!-- DATA_SYNC is the "no special operation" type. The service
+         starts under this label whenever no capture / camera / mic is
+         active so it can run as a plain QUIC client + input dispatch
+         worker without claiming any of the restricted types. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <!-- Virtual camera relay (Step 10): host streams sensor frames
          from the Android camera into a v4l2loopback device. The
-         user-facing permission grant is the standard runtime CAMERA
-         prompt the first time MainActivity routes a StartCamera. -->
+         runtime CAMERA prompt is requested when the user enables
+         the camera feature; the setup notif covers the others. -->
     <uses-permission android:name="android.permission.CAMERA" />
     <uses-feature android:name="android.hardware.camera.any" android:required="false" />
 
@@ -33,6 +38,16 @@
          in Step 11 (audio routing controls). -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
 
+    <!-- Auto-restart the companion service after device reboot (U4c). -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+
+    <!-- Android 14+ requires this for `setFullScreenIntent` to be
+         honoured. With it (plus user grant under Settings → Special
+         App Access → Full-screen intent) the pair notification
+         auto-opens PairingActivity without a tap. Without the grant
+         the notif still works as a tappable heads-up. -->
+    <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
+
     <application
         android:label="@string/app_name"
         android:icon="@android:drawable/sym_def_app_icon"
@@ -41,20 +56,72 @@
         android:theme="@android:style/Theme.Material.Light.NoActionBar"
         tools:targetApi="34">
 
+        <!--
+            Headless companion. No launcher icon — every Activity below
+            is either a transparent shim that pops a system dialog and
+            finishes, or a full-screen overlay launched from a QSTile.
+            The service is started by PairingReceiver / BootReceiver
+            without any user-visible app surface.
+        -->
+
+        <!--
+            Pure background companion: no launcher icon. Entry points
+            are the SetupNotif heads-up + PairingReceiver broadcast +
+            BootReceiver auto-restart. SetupStepActivity is the
+            translucent shim the user lands in after tapping the
+            setup notif — it MUST stay registered (PendingIntent
+            target) but no MAIN/LAUNCHER intent-filter.
+
+            NB: on aggressive OEMs (MIUI / EMUI / ColorOS) the lack
+            of a launcher icon can keep the app in a frozen state
+            until the user manually whitelists it under Battery /
+            Autostart. We surface that hint in `SetupStep.MiuiAutostart`.
+        -->
         <activity
-            android:name=".MainActivity"
-            android:exported="true"
-            android:configChanges="orientation|screenSize|keyboardHidden">
-            <intent-filter>
-                <action android:name="android.intent.action.MAIN" />
-                <category android:name="android.intent.category.LAUNCHER" />
-            </intent-filter>
-        </activity>
+            android:name=".SetupStepActivity"
+            android:exported="false"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar"
+            android:excludeFromRecents="true"
+            android:noHistory="true" />
+
+        <activity
+            android:name=".GrantScreenCaptureActivity"
+            android:exported="false"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar"
+            android:excludeFromRecents="true"
+            android:noHistory="true" />
+
+        <activity
+            android:name=".GrantStorageActivity"
+            android:exported="false"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar"
+            android:excludeFromRecents="true"
+            android:noHistory="true" />
+
+        <!--
+            Cable-pair driver. Launched by PairingReceiver after the
+            host's am broadcast lands; runs the native bootstrap on a
+            background thread so the receiver can return inside the
+            ANR window, then starts AnsyncCompanionService directly.
+            Pending grants are surfaced via the SetupNotif heads-up
+            once the service is alive.
+        -->
+        <activity
+            android:name=".PairingActivity"
+            android:exported="false"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar"
+            android:excludeFromRecents="true"
+            android:noHistory="true" />
 
         <activity
             android:name=".TouchpadActivity"
             android:exported="false"
             android:configChanges="orientation|screenSize|keyboardHidden" />
+
+        <activity
+            android:name=".GamepadActivity"
+            android:exported="false"
+            android:configChanges="orientation|screenSize|keyboardHidden|navigation" />
 
         <!-- Foreground service hosting the QUIC client, MediaProjection
              capture surface, and the audio route. Brought up by the
@@ -63,7 +130,7 @@
         <service
             android:name=".AnsyncCompanionService"
             android:exported="false"
-            android:foregroundServiceType="mediaProjection|camera|microphone" />
+            android:foregroundServiceType="dataSync|mediaProjection|camera|microphone" />
 
         <!-- Cable-pairing entry point. Invoked by the host via
              `adb shell am broadcast`. Exported so the ADB shell can
@@ -73,6 +140,17 @@
             android:exported="true">
             <intent-filter>
                 <action android:name="org.gameros.ansync.action.PAIR" />
+            </intent-filter>
+        </receiver>
+
+        <!-- Auto-restart after device boot or package upgrade (U4c). -->
+        <receiver
+            android:name=".BootReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.LOCKED_BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
             </intent-filter>
         </receiver>
 
@@ -90,6 +168,77 @@
             <meta-data
                 android:name="android.accessibilityservice"
                 android:resource="@xml/accessibility_service_config" />
+        </service>
+
+        <!-- Notification mirror: forwards every status-bar notification
+             the user has granted access to over the QUIC link. The
+             user enables it under Settings → Apps → Special access →
+             Notification access. -->
+        <service
+            android:name=".NotificationForwarder"
+            android:exported="true"
+            android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+            <intent-filter>
+                <action android:name="android.service.notification.NotificationListenerService" />
+            </intent-filter>
+        </service>
+
+        <!-- Quick Settings tiles (U4b). Users add them from Edit in
+             the QS shade; tap dispatches to AnsyncCompanionService via
+             a simple Intent so we don't need to bind. -->
+        <service
+            android:name=".tile.MirrorTile"
+            android:label="@string/tile_mirror_label"
+            android:icon="@android:drawable/stat_sys_data_bluetooth"
+            android:exported="true"
+            android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
+            <intent-filter>
+                <action android:name="android.service.quicksettings.action.QS_TILE" />
+            </intent-filter>
+        </service>
+
+        <service
+            android:name=".tile.TouchpadTile"
+            android:label="@string/tile_touchpad_label"
+            android:icon="@android:drawable/ic_menu_compass"
+            android:exported="true"
+            android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
+            <intent-filter>
+                <action android:name="android.service.quicksettings.action.QS_TILE" />
+            </intent-filter>
+        </service>
+
+        <service
+            android:name=".tile.MicShareTile"
+            android:label="@string/tile_mic_label"
+            android:icon="@android:drawable/ic_btn_speak_now"
+            android:exported="true"
+            android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
+            <intent-filter>
+                <action android:name="android.service.quicksettings.action.QS_TILE" />
+            </intent-filter>
+        </service>
+
+        <service
+            android:name=".tile.AudioSinkTile"
+            android:label="@string/tile_audio_label"
+            android:icon="@android:drawable/ic_lock_silent_mode_off"
+            android:exported="true"
+            android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
+            <intent-filter>
+                <action android:name="android.service.quicksettings.action.QS_TILE" />
+            </intent-filter>
+        </service>
+
+        <service
+            android:name=".tile.GamepadTile"
+            android:label="@string/tile_gamepad_label"
+            android:icon="@android:drawable/ic_menu_send"
+            android:exported="true"
+            android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
+            <intent-filter>
+                <action android:name="android.service.quicksettings.action.QS_TILE" />
+            </intent-filter>
         </service>
     </application>
 </manifest>

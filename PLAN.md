@@ -197,7 +197,7 @@ ansync/
 - [x] **Step 6** — `video` decode + `ansyncd` egui window — screen mirror end-to-end H.264 → wgpu texture
 - [x] **Step 7** — `input` uinput — Android como kbd/touch/stylus para PC + reverse para controlar Android vía AccessibilityService
   - [x] **7a** — Host `ansync_input::uinput` impls (Keyboard / Mouse / Touchscreen MT-B / Stylus / Gamepad XInput-like) detrás del feature `uinput`. Ships `bins/ansyncd/contrib/60-ansync-uinput.rules` + `nix/uinput.nix` partial module — Step 14 lo importa al módulo NixOS consolidado para que el install sea plug-and-play (kernel module + udev rule + nota de group `input`).
-  - [ ] **7b** — Mensajes input en `ansync_proto` + stream QUIC dedicado + dispatch en `daemon-core` (permission `input_from_device` check antes de cualquier `send`)
+  - [x] **7b** — Mensajes input en `ansync_proto` + stream QUIC dedicado + dispatch en `daemon-core` (permission `input_from_device` check antes de cualquier `send`)
     - [x] **7b-1** — `InputSession` orchestrator en `ansync_input` (lazy device construction, permission gate per-event, `InputDeviceFactory` trait + `UinputFactory` impl, `proto::InputMessage → InputEvent` mapping).
     - [x] **7b-2** — QUIC server bind en `daemon-core` + accept loop + peer auth contra `PeerStore` + stream demux para `StreamKind::Input` → `InputSession::dispatch`. Transport gana `Ed25519AnyPeerVerifier` (trait `TrustedPeers`) + `QuicTransport::bind_any`; identidad del peer se recupera post-handshake via `quinn::Connection::peer_identity()`. `DaemonConfig.listen_addr` configurable (default `0.0.0.0:0`); mDNS anuncia el puerto real. `Capabilities::INPUT_FROM_DEV` activa por default.
   - [x] **7c** — Companion Android scaffold: `android/` con Gradle KTS + version catalog (`gradle/libs.versions.toml`), AGP 8.5.2 / Kotlin 2.0.20 / compileSdk 35 / minSdk 26 / Java 17. `AndroidManifest.xml` declara INTERNET + ACCESS_NETWORK_STATE + CHANGE_WIFI_MULTICAST_STATE (mDNS) + FOREGROUND_SERVICE + FOREGROUND_SERVICE_MEDIA_PROJECTION + POST_NOTIFICATIONS. Tres componentes stub: `MainActivity` (Compose status screen), `AnsyncCompanionService` (foreground service, notification channel, FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION), `AnsyncAccessibilityService` (static handle pattern para que el companion service llame `dispatchGesture` en Step 7e). Wrapper jar excluido del repo — usuario corre `gradle wrapper` una vez antes del primer `./gradlew assembleDebug`.
@@ -232,6 +232,7 @@ ansync/
   - [x] **9.5c** — Companion `streams_accept_loop` ahora maneja `StreamKind::Input` inbound del daemon → spawn `input_recv_loop` que pushea encoded events al mismo mpsc que consume `nativePollInputMessage` → AccessibilityService.dispatchGesture (7e). Convención clarificada en comentario: opener escribe, accepter lee. `nativeOpenConnection` ya no pre-abre Input stream.
   - [x] **9.5d** — Daemon `action_loop::ShowScreen` ahora abre `StreamKind::Input` outbound antes de spawn-ear el window thread. Wirea `UnboundedSender<InputMessage>` al `MirrorApp`. `input_writer_loop` consume del channel y postcard + write_frame al stream. `MirrorApp` emite `InputMessage::TouchSlot` mapeando pointer egui → coordenadas remotas (`fw × fh` desde último frame). Press/release/move/hover-exit emiten tracking_id 1/-1 standard MT-B.
   - [x] **9.5e** — `TouchpadActivity` Compose full-screen captura `MotionEvent` con `pointerInteropFilter` → `WireInputMessage.encode()` tag-binary → `nativeSendInputMessage(blob)`. Native `decode_input_from_kotlin` mirror del decoder Kotlin → `postcard::to_allocvec(InputMessage)` → write_frame. Outbound Input stream lazy-opens en `ActiveSession.outbound_input` la primera vez. Touch-down → `MouseButton{1,true}`, move → `MouseMove{dx,dy}` deltas, up/cancel → `MouseButton{1,false}`. Botón en MainActivity "Open touchpad".
+  - [x] **9.5e+** — Device→host input completo: TouchpadActivity gana long-press → `MouseButton{2}` (right), 2-finger drag → `MouseWheel`, 2-finger tap → `MouseButton{3}` (middle), `TOOL_TYPE_STYLUS` → `Stylus` tag (x/y escaladas a 0..32767, pressure 0..8191, tiltX/tiltY desde `AXIS_TILT`+orient), `dispatchKeyEvent` hardware kbd → `KeyPress` evdev, IME `BasicTextField` con onValueChange sintetiza `KeyPress` por char (auto-shift para mayúsculas / punctuación ASCII). Nueva `GamepadActivity` overrides `dispatchKeyEvent` + `dispatchGenericMotionEvent` (SOURCE_JOYSTICK) → `Gamepad{buttons,lx,ly,rx,ry,lt,rt}`; QSTile `GamepadTile` lanzador. `KeycodeMap.kt` traduce `KeyEvent.KEYCODE_*` → evdev `KEY_*`. WireInputMessage Kotlin encode arms Stylus/Gamepad ya no tiran, mirror exacto del layout `encode_for_kotlin`. Rust `decode_input_from_kotlin` cubre tags 5 + 6 con nuevos helpers `take_u16` / `take_i16`.
   - [x] **9.5f** — Cable pairing companion side:
     - `pair_host_via_adb` ahora dispara `adb shell am broadcast -a org.gameros.ansync.action.PAIR -n org.gameros.ansync/.PairingReceiver --ei port $PORT --es name $HOST` después del `adb reverse`. Auto-wake del companion — no requiere abrir app primero.
     - `PairingReceiver` (manifest `<receiver exported=true>`) extrae port, llama `nativeInit + nativePairOverCable(port, deviceName)`.
@@ -286,7 +287,7 @@ Gaps identificados al cerrar el roadmap. Ordenados por severidad. Cada uno es bo
 
 ### Bloqueantes para v1 stable
 
-- [ ] **R1 — APK outdated upgrade flow (cerrar Step 17 spec)**
+- [x] **R1 — APK outdated upgrade flow (cerrar Step 17 spec)**
   - `query_installed_version` existe pero no se usa. Comparar `versionName` del device con `tag_name` del release fetched.
   - Si companion presente + outdated:
     - Default: prompt CLI `"upgrade companion {old} → {new}? (y/N)"` en `ansyncctl pair`.
@@ -295,19 +296,19 @@ Gaps identificados al cerrar el roadmap. Ordenados por severidad. Cada uno es bo
   - Actualmente solo install-when-missing está wirado.
   - Files: `bins/ansyncctl/src/main.rs::pair`.
 
-- [ ] **R2 — Audio mid-session permission revoke**
+- [x] **R2 — Audio mid-session permission revoke**
   - `daemon-core::audio_inbound_loop` lleva `_permissions` (unused). Toggle `audio_in` off mid-stream no corta el flujo.
   - Mirror el patrón de `input_stream_loop`: re-check perm per-chunk, surface clean cuando flip to off (drop frame + return).
   - Mismo para `audio_pump_loop` re `audio_out`.
   - Files: `crates/daemon-core/src/lib.rs`.
 
-- [ ] **R4 — Notifications wire (Step 4 leftover surfaced)**
+- [x] **R4 — Notifications wire (Step 4 leftover surfaced)**
   - `proto::NotificationMessage` + `Capabilities::NOTIFICATIONS` existen pero sin `StreamKind::Notifications` ni handlers.
   - Add tag 0x09. Daemon-core accept loop demux + gate `Permission::Notifications`. Surface via D-Bus signal `Device.NotificationPosted(app, title, body)`.
   - Companion side: `NotificationListenerService` (Android) + JNI bridge similar al clipboard pattern.
   - Files: `crates/transport/src/{lib,quic}.rs`, `crates/daemon-core/src/lib.rs`, `android/src/lib.rs`, nueva `android/app/src/main/java/.../NotificationForwarder.kt`.
 
-- [ ] **R9 — Validar `nix build .#default`**
+- [x] **R9 — Validar `nix build .#default`**
   - `nix/package.nix` escrito pero nunca ejecutado. Posibles issues: `lib.cleanSourceWith` filter incompleto, missing buildInput (ferricast path deps), `LIBCLANG_PATH` no propagado al `buildPackage` (solo está en commonArgs).
   - Correr `nix build .#default` desde `/home/s4rch/Public/rust/GamerOS/ansync`. Fix lo que rompa.
   - Validar también `nix build .#ansyncd .#ansyncctl` (apps).
@@ -319,11 +320,11 @@ Gaps identificados al cerrar el roadmap. Ordenados por severidad. Cada uno es bo
   - `ClipboardBridge.pushToHost()` callable pero sin caller. Add botón en `MainActivity` Compose que invoque + muestre Toast con resultado.
   - Files: `android/app/src/main/java/.../MainActivity.kt`.
 
-- [ ] **R5 — SAF FS mutaciones (cerrar Step 9e)**
+- [x] **R5 — SAF FS mutaciones (cerrar Step 9e)**
   - `AnsyncFsServer` retorna ENOSYS para `write/create/unlink/rename/truncate/chmod`. Implementar usando `DocumentsContract.createDocument` / `deleteDocument` / `renameDocument` / `OutputStream` via `openOutputStream(uri, "w" | "wa" | "rwt")`. `chmod` deja `ENOSYS` (SAF no expone modes — limitación intencional).
   - Files: `android/app/src/main/java/.../AnsyncFsServer.kt`.
 
-- [ ] **R6 — BT-HID full profile registration (cerrar Step 13)**
+- [x] **R6 — BT-HID full profile registration (cerrar Step 13)**
   - `BtHidDevice::send` loguea sin transmitir. Wirea:
     - SDP record con HID descriptor (keyboard / mouse / gamepad reports).
     - L2CAP PSM 0x11 (control) + 0x13 (interrupt) sockets via `bluer::l2cap::Socket`.
@@ -343,11 +344,11 @@ Gaps identificados al cerrar el roadmap. Ordenados por severidad. Cada uno es bo
   - `Capabilities::SENSORS` + `Permission::Sensors` existen sin proto/handlers. Bajo prioridad (no es feature core scrcpy-equivalent).
   - Posible: stream kind 0x0a, proto `SensorMessage::{Accelerometer{x,y,z}, Gyro{...}, etc.}`. Companion `SensorManager.registerListener`. Útil para casos como game controllers (gyro aim).
 
-- [ ] **R11 — Clipboard blob bidi**
+- [x] **R11 — Clipboard blob bidi**
   - Companion descarta `ClipboardMessage::Blob` silenciosamente. Wirea image MIMEs (`image/png`, `image/jpeg`) via `ClipData.newUri` + `MediaStore`. Text-only en Step 12 ship.
   - Files: `android/src/lib.rs::clipboard_in_loop`, `android/app/src/main/java/.../ClipboardBridge.kt`.
 
-- [ ] **R12 — Cleanup `audio_inbound_loop` permissions param**
+- [x] **R12 — Cleanup `audio_inbound_loop` permissions param**
   - `_permissions: Arc<dyn PermissionsStore>` es noise. O lo usa (R2) o sale del signature.
   - Resuelto automáticamente cuando R2 cierra.
 
@@ -358,6 +359,93 @@ Gaps identificados al cerrar el roadmap. Ordenados por severidad. Cada uno es bo
 - R7, R11 son cosmética: dejan para post-v1.
 - R8 documentar como upstream limitation en README + cerrar como WONTFIX.
 - R10 evaluar demanda: si nadie lo pide, dropear del scope.
+
+## Triaje UX post-v1 (sesión 2026-06-15)
+
+Surfaceado tras primera ronda de smoke test real con DMS widget + companion. PLAN.md es el roadmap canónico — esta sección persiste el triaje para continuar en sesión nueva.
+
+### Síntomas reportados
+
+1. **Plugin DMS roto** — syntax errors QML, multi-screen no muestra data en pantallas secundarias, `Theme.errorText` undefined, `parent.flag` undefined dentro de `Connections{}`, deprecated `checked` injection, `anchors.fill` dentro de Column.
+2. **Pair no completa** — ni USB ni WiFi. Sin logs aún para diagnosticar.
+3. **Sin estado de conexión visible** — D-Bus expone `State: string` pero no hay señal de cambio ni state machine explícita (Online / Idle / Disconnected / Pairing).
+4. **Hostname / device name no se intercambia** — daemon usa `device_id` (uuid). Falta `gethostname()` host-side + `Build.MODEL + " " + Build.MANUFACTURER` companion-side.
+5. **Companion UI tosca** — Activity con botones (Start screen capture, Open touchpad, picker SAF, paired host display) rompe la analogía scrcpy: control debe vivir en host.
+
+### Fixes ya aplicados (esta sesión)
+
+- [x] Plugin DMS QML balance + multi-screen: `pragma Singleton` en `AnsyncService.qml`, `qmldir` con `singleton AnsyncService 1.0 AnsyncService.qml`, widget consume `import "."` + `readonly property var svc: AnsyncService`. `pluginData` propagado vía `Component.onCompleted` + `Connections{ target: root }`.
+- [x] `Theme.errorText` → `"white"` (no existe en DMS Theme).
+- [x] Permission row: `id: permRow` + helper `refresh()` + `(value) => ...` formal param, drop `parent.flag` desde dentro de `Connections{}`.
+- [x] `anchors.fill: parent` dentro de Column → `width: parent.width` (pair Column + forget Column).
+- [x] Pill wrappers `Item { implicitHeight: parent.widgetThickness }` → bare `Row{ spacing }` / `Column{ spacing }` (matcha DankFerricast).
+
+### Pendientes post-v1 (orden propuesto)
+
+- [x] **U1 — Hostname / Hello frame** (cierra síntoma 4)
+  - `StreamKind::Hello` (tag 0x0a) one-shot bidi. Primer y único frame post-handshake en ambas direcciones es `Envelope{Message::Hello{device_id, name, capabilities}}`.
+  - Host: `libc::gethostname` con fallback `$HOSTNAME`.
+  - Companion: `Build.MANUFACTURER + " " + Build.MODEL` cacheado vía `nativeSetDeviceName` (llamado en Service.onCreate + MainActivity + PairingReceiver).
+  - Daemon `hello_inbound_loop` actualiza `StoredPeer.name` cuando cambia. Companion `hello_in_loop` stashea host name en `last_host_name`; `nativePollHostName` + MainActivity LaunchedEffect persisten en `PREF_HOST_NAME`.
+  - D-Bus `Device.Name` ya devolvía `peer.name`; ahora refleja hostname real automáticamente.
+
+- [x] **U2 — Connectivity state machine + D-Bus signal** (cierra síntoma 3)
+  - `ConnState{Disconnected, Pairing, Authenticated, Active}` en `ansync_dbus::state`. Registry `Arc<StdMutex<HashMap<DeviceId, ConnState>>>` en `DaemonState`.
+  - `Device.State` ahora lee del registry. `Device::emit_state_changed` helper emite el auto-generated `PropertiesChanged` (state) + custom signal `Manager.DeviceConnectivityChanged(id, state)`.
+  - Transiciones en `handle_connection`: Authenticated cuando arranca (post-TLS), Active cuando `send_hello` ok, Disconnected en cleanup. `Pairing` reservado para ansyncctl pair flow (no wire en daemon-core).
+  - DMS widget pinta verde/amarillo/gris suscribiéndose a `Manager.DeviceConnectivityChanged` (single fan-out path) o `PropertiesChanged` per device.
+
+- [x] **U3 — Diagnóstico pair fail** (cierra síntoma 2)
+  - Diagnóstico end-to-end con `journalctl --user _COMM=ansyncd` + `adb logcat -s ansync.*`. Tres bugs cazados:
+    1. **`adb_client::ADBServerDevice::reverse` no instala el listener en adbd del device.** `adb reverse --list` lo muestra host-side pero `/proc/net/tcp` del device nunca abre el puerto → companion `connect("127.0.0.1", port)` ETIMEDOUT. Fix: `pair_host_via_adb` shell-out al binario `adb` para `reverse` + `reverse --remove-all`. (Step 16 removió *parsing* de stdout, no usage del binario; reverse no parsea nada).
+    2. **`bootstrap_host` no flushea/cerraba el TCP antes de dropear.** Tokio `TcpStream::drop` race con kernel adb-USB forwarder → companion lee "early eof" antes que el Ack atraviese el cable. Fix: `stream.flush().await + stream.shutdown().await` después de `write_envelope(Ack)`.
+    3. **`adb_client::shell_command` con shell_v2 entrega framing bytes mezclados con stdout.** `companion_installed` strict-line match fallaba pese a APK presente; `query_installed_version` igual con `strip_prefix("versionName=")`. Fix: substring match (`stdout.contains("package:...")` + `find("versionName=")` con extracción hasta whitespace).
+    4. **`PairingReceiver` usaba el extra `name` del broadcast como propio.** El extra trae el HOST_NAME (para display), no Build.MODEL. Resultado: peer.name en host quedaba `ansync-host` (auto-corregido en siguiente connect vía U1 Hello frame, pero feo). Fix Kotlin: `companionName = "${Build.MANUFACTURER} ${Build.MODEL}"`.
+  - Verificado: pair end-to-end OK, `PeerStore` persiste, `Manager.RefreshPeers` registra path D-Bus, companion log `cable pairing complete with host ansync-host`.
+
+- [x] **U4 — Headless companion + popups + QSTiles** (cierra síntoma 5)
+  - Companion = service de fondo puro. Sin launcher icon.
+  - **U4a [x]** — Transform headless:
+    - Drop `MainActivity` + Compose Material3 status surface.
+    - New translucent shims: `PermissionsBootstrapActivity` (walks POST_NOTIFICATIONS / RECORD_AUDIO / SAF tree picker / Accessibility settings / Notification Listener settings con toasts), `GrantScreenCaptureActivity` (MediaProjection picker), `GrantStorageActivity` (re-pick SAF tree on demand).
+    - `AnsyncCompanionService.onCreate` lanza `PermissionsBootstrapActivity` si `PREF_GRANTS_BOOTSTRAPPED` off (idempotente).
+    - `PairingReceiver` arranca el service post-bootstrap atomic (sin requerir abrir app).
+    - Service `requestCaptureFromUser()` postea high-priority notif que abre `GrantScreenCaptureActivity` cuando host pide ShowScreen sin token activo.
+    - `foregroundServiceType=dataSync|mediaProjection|camera|microphone`; service inicia en `dataSync`, promueve a tipo específico cuando capture/audio/camera arrancan (Android 14+ rechaza media-tipos sin privileged token activo).
+    - Manifest: drop MAIN/LAUNCHER intent-filter; translucent activities `noHistory + excludeFromRecents`.
+    - `Prefs.kt` central para `PREFS / PREF_TREE_URI / PREF_HOST_ADDR / PREF_GRANTS_BOOTSTRAPPED`.
+  - **U4b [x]** — QSTiles: `MirrorTile`, `TouchpadTile`, `MicShareTile`, `AudioSinkTile`. Cada uno = `TileService` que envía Intent a `AnsyncCompanionService`. State persistido en SharedPreferences (`PREF_MIRROR_ACTIVE` / `PREF_MIC_ACTIVE` / `PREF_AUDIO_OUT_ACTIVE`). Mirror y Touchpad usan `startActivityAndCollapse` con PendingIntent (API 34+ signature).
+  - **U4c [x]** — `BootReceiver` (BOOT_COMPLETED + LOCKED_BOOT_COMPLETED + MY_PACKAGE_REPLACED) + `HostDialer` con `ConnectivityManager.NetworkCallback` (Wi-Fi / Ethernet) + `HostDiscovery` mDNS reuse + exponential backoff (1s→60s). Auto-redial cuando wifi reconecta sin user action.
+  - **U4d [x]** — Notif persistente recompone state-driven: por cada stream activo (mirror / mic / PC audio / camera) muestra una action button "Stop X" con PendingIntent a la action correspondiente del service. `refreshNotification()` se llama desde cada start/stop helper. Absorbe R7 — sin MediaSession completo pero functional para corte directo desde shade.
+  - **U4e [ ] (DEFERRED)** — WiFi pair PIN scope: PIN gen + Activity + native TCP listener + new host CLI + Pin protocol — deferred post-v1. Cable pair (USB) sigue funcionando completo.
+  - USB pair: cable = trust window, auto-accept sin tap (ya está).
+
+- [x] **U5 — `RequestScreenCapture` wire + auto-connect** (cierra síntoma 5 + 4)
+  - `ControlMessage::{RequestScreenCapture, StopScreenCapture}` nuevos en proto.
+  - Daemon `action_loop::ShowScreen` ahora ALSO abre Control + manda `RequestScreenCapture` post-window-spawn. `HideScreen` simétrico (manda `StopScreenCapture`).
+  - Companion native: `control_recv_loop` decoda los dos tags, push a `capture_ctrl_rx` (Vec<u8> single-byte). JNI `nativePollCaptureControl()` blocking.
+  - Companion Kotlin: `AnsyncCompanionService.startCaptureControlPoller()` worker thread `ansync-cap-ctrl`. Tag 0 → `requestCaptureFromUser()` (high-priority notif "tap to grant" → `GrantScreenCaptureActivity` → MediaProjection picker → `ACTION_START_CAPTURE`). Tag 1 → `stopCapture()`.
+  - Auto-connect: `HostDialer` (U4c) cubre el escenario "device unlocks → wifi up → companion dials host automáticamente". Host-side mDNS host-discovers-companion deferred (companion already announces via daemon's mDNS announce; host browse mechanism = follow-up).
+
+- [ ] **U5 — Auto-connect mDNS host-side** (cierra síntoma 5)
+  - Host descubre companion via mDNS al boot del daemon → si pubkey matchea `PeerStore` → connect automático.
+  - Drop "Connect to X (IP)" botón del companion (ya implementado en post-9.5 gap closer pero ahora redundante).
+  - Re-connect on suspend/resume via netlink watch.
+
+### Tradeoffs
+
+- U4 mata UI Activity de Steps 7c-9.5 (CameraSession Intent flow, TouchpadActivity, paired host card). SAF picker NO se puede evitar (Android requiere user grant explícito) — minimizar a primer mount.
+- U3 sin logs es shot-in-the-dark. Bloqueado hasta que usuario pegue output.
+- U2 toca surface D-Bus pública; coordinar con bump de versión interfaz.
+- U1 trivial, base para todos los demás (DMS pinta nombre real, no `a1b2c3d4`).
+
+### Orden recomendado
+
+1. **U1** (hostname) — trivial, prereq cosmético para todo lo demás.
+2. **U2** (state machine + signal) — base para que DMS muestre algo útil.
+3. **U3** (pair fail diag) — bloqueado en logs del usuario.
+4. **U4** (strip Activity) — gran refactor companion, mejor con U1+U2 ya merged.
+5. **U5** (auto-connect mDNS) — última capa, depende de U2 para señalizar state.
 
 ## Dependencias Cargo (workspace)
 

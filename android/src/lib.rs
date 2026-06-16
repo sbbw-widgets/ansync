@@ -14,12 +14,15 @@
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
-use ansync_core::{DeviceId, DevicePermissions, Permission};
+use ansync_core::{Capabilities, DeviceId, DeviceName, DevicePermissions, Permission};
 use ansync_crypto::IdentityKeypair;
 use ansync_files::{AutoAcceptPolicy, receive_file};
 use ansync_pairing::cable::bootstrap_companion;
 use ansync_permissions::{PermissionsError, PermissionsStore};
-use ansync_proto::{ClipboardMessage, ControlMessage, Envelope, FsOpMessage, InputMessage, Message};
+use ansync_proto::{
+    ClipboardMessage, ControlMessage, Envelope, FsOpMessage, GamepadState, Hello, InputMessage,
+    Message, NotificationMessage, PROTOCOL_VERSION,
+};
 use ansync_transport::{
     Connection, QuicConnection, QuicStream, QuicTransport, Stream as _, StreamKind,
 };
@@ -58,6 +61,15 @@ struct CompanionState {
     /// into. Defaults to the app's `filesDir/incoming/` until the
     /// Kotlin side picks a SAF tree URI.
     download_dir: PathBuf,
+    /// Human-readable device name. Pushed to the host on every
+    /// connect via `StreamKind::Hello`. `None` until Kotlin calls
+    /// `nativeSetDeviceName` (typically once at service onCreate
+    /// with `Build.MODEL`).
+    device_name: Option<String>,
+    /// Latest host name learned from the inbound Hello frame. Kotlin
+    /// polls via `nativePollHostName` for the paired-host card. Stays
+    /// `None` until the first session post-handshake completes.
+    last_host_name: Arc<Mutex<Option<String>>>,
     session: Option<ActiveSession>,
 }
 
@@ -123,6 +135,15 @@ struct ActiveSession {
     /// Inbound `ControlMessage::StartAudioRoute` / `StopAudioRoute`.
     /// Same tag-binary fanout pattern as camera_ctrl_rx.
     audio_ctrl_rx: Arc<AsyncMutex<UnboundedReceiver<Vec<u8>>>>,
+    /// Inbound `ControlMessage::RequestScreenCapture` /
+    /// `StopScreenCapture`. Two single-byte tags so Kotlin can poll
+    /// without postcard.
+    capture_ctrl_rx: Arc<AsyncMutex<UnboundedReceiver<Vec<u8>>>>,
+    /// Inbound `ControlMessage::RequestFileAccess` /
+    /// `ReleaseFileAccess`. Tag 0 = request, tag 1 = release. Kotlin
+    /// polls and pops the SAF picker on tag 0 if no tree URI is
+    /// persisted yet, otherwise just brings up the FS server.
+    file_ctrl_rx: Arc<AsyncMutex<UnboundedReceiver<Vec<u8>>>>,
     /// Outbound device→host Audio stream for mic forwarding.
     /// Lazy-opened on the first `nativeSendAudioChunk` (device-side).
     outbound_audio: Arc<AsyncMutex<Option<QuicStream>>>,
@@ -131,6 +152,10 @@ struct ActiveSession {
     audio_in_rx: Arc<AsyncMutex<UnboundedReceiver<Vec<u8>>>>,
     /// Inbound clipboard text from the host. UTF-8 bytes.
     clipboard_in_rx: Arc<AsyncMutex<UnboundedReceiver<String>>>,
+    /// Inbound clipboard blob: `(mime, data)`. Kotlin polls via
+    /// `nativePollClipboardBlob` which returns a flat
+    /// `[mime_len u32 LE | mime utf8 | data]` encoding.
+    clipboard_in_blob_rx: Arc<AsyncMutex<UnboundedReceiver<(String, Vec<u8>)>>>,
 }
 
 #[unsafe(no_mangle)]
@@ -181,9 +206,62 @@ pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativeInit(
     *slot = Some(CompanionState {
         identity,
         download_dir,
+        device_name: None,
+        last_host_name: Arc::new(Mutex::new(None)),
         session: None,
     });
     jni::sys::JNI_TRUE
+}
+
+/// Stash the human-readable device name. Called by Kotlin once per
+/// service lifetime with `Build.MANUFACTURER + " " + Build.MODEL`. The
+/// stashed name is forwarded to the host inside every Hello frame so
+/// the daemon's `PeerStore.name` stays in sync with what the user
+/// renamed the device to in Settings.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativeSetDeviceName<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    name: JString<'local>,
+) -> jboolean {
+    let name: String = match env.get_string(&name) {
+        Ok(s) => s.into(),
+        Err(e) => {
+            error!("nativeSetDeviceName: invalid string: {e}");
+            return jni::sys::JNI_FALSE;
+        }
+    };
+    let mut slot = state_slot().lock().expect("state mutex poisoned");
+    if let Some(s) = slot.as_mut() {
+        info!("device name set to {name}");
+        s.device_name = Some(name);
+        jni::sys::JNI_TRUE
+    } else {
+        warn!("nativeSetDeviceName: state not initialised");
+        jni::sys::JNI_FALSE
+    }
+}
+
+/// Return the latest host name observed on a Hello frame, or `null`
+/// if no session has completed a handshake yet. Cheap; the value is
+/// just a `String` clone behind a mutex.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativePollHostName<'local>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+) -> jni::sys::jstring {
+    let name = {
+        let slot = state_slot().lock().expect("state mutex poisoned");
+        slot.as_ref()
+            .and_then(|s| s.last_host_name.lock().ok().and_then(|g| g.clone()))
+    };
+    match name {
+        Some(s) => match env.new_string(s) {
+            Ok(js) => js.into_raw(),
+            Err(_) => std::ptr::null_mut(),
+        },
+        None => std::ptr::null_mut(),
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -243,10 +321,14 @@ pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativeOpenConnection
         }
     };
 
-    let identity = {
+    let (identity, device_name, host_name_slot) = {
         let slot = state_slot().lock().expect("state mutex poisoned");
         match slot.as_ref() {
-            Some(s) => IdentityKeypair::from_seed(*s.identity.seed_bytes()),
+            Some(s) => (
+                IdentityKeypair::from_seed(*s.identity.seed_bytes()),
+                s.device_name.clone(),
+                s.last_host_name.clone(),
+            ),
             None => {
                 error!("nativeOpenConnection: state not initialised");
                 return jni::sys::JNI_FALSE;
@@ -275,6 +357,7 @@ pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativeOpenConnection
         }
     };
 
+    let identity_for_hello = IdentityKeypair::from_seed(*identity.seed_bytes());
     let transport = QuicTransport::new(identity);
     let conn = match runtime().block_on(transport.connect(addr, expected_server)) {
         Ok(c) => c,
@@ -284,6 +367,19 @@ pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativeOpenConnection
         }
     };
     info!("nativeOpenConnection: handshake ok with {addr}");
+
+    // Send our Hello before opening any media stream — gives the host
+    // the freshest name/caps the moment the connection is up. Failure
+    // here is logged but not fatal; the host falls back to the stored
+    // name from pairing.
+    {
+        let name = device_name
+            .clone()
+            .unwrap_or_else(|| "android".to_string());
+        if let Err(e) = runtime().block_on(send_hello(&conn, &identity_for_hello, &name)) {
+            warn!("nativeOpenConnection: send_hello failed: {e}");
+        }
+    }
 
     let video_stream = match runtime().block_on(conn.open(StreamKind::Video)) {
         Ok(s) => s,
@@ -312,11 +408,20 @@ pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativeOpenConnection
     let (audio_ctrl_tx, audio_ctrl_rx) = unbounded_channel::<Vec<u8>>();
     let audio_ctrl_tx = Arc::new(audio_ctrl_tx);
 
+    let (capture_ctrl_tx, capture_ctrl_rx) = unbounded_channel::<Vec<u8>>();
+    let capture_ctrl_tx = Arc::new(capture_ctrl_tx);
+
+    let (file_ctrl_tx, file_ctrl_rx) = unbounded_channel::<Vec<u8>>();
+    let file_ctrl_tx = Arc::new(file_ctrl_tx);
+
     let (audio_in_tx, audio_in_rx) = unbounded_channel::<Vec<u8>>();
     let audio_in_tx = Arc::new(audio_in_tx);
 
     let (clip_in_tx, clip_in_rx) = unbounded_channel::<String>();
     let clip_in_tx = Arc::new(clip_in_tx);
+
+    let (clip_blob_tx, clip_blob_rx) = unbounded_channel::<(String, Vec<u8>)>();
+    let clip_blob_tx = Arc::new(clip_blob_tx);
 
     let conn_arc = Arc::new(conn);
     let download_dir = {
@@ -344,6 +449,10 @@ pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativeOpenConnection
         audio_ctrl_tx.clone(),
         audio_in_tx.clone(),
         clip_in_tx.clone(),
+        clip_blob_tx.clone(),
+        host_name_slot,
+        capture_ctrl_tx.clone(),
+        file_ctrl_tx.clone(),
     ));
 
     let session = ActiveSession {
@@ -359,6 +468,9 @@ pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativeOpenConnection
         outbound_audio: Arc::new(AsyncMutex::new(None)),
         audio_in_rx: Arc::new(AsyncMutex::new(audio_in_rx)),
         clipboard_in_rx: Arc::new(AsyncMutex::new(clip_in_rx)),
+        clipboard_in_blob_rx: Arc::new(AsyncMutex::new(clip_blob_rx)),
+        capture_ctrl_rx: Arc::new(AsyncMutex::new(capture_ctrl_rx)),
+        file_ctrl_rx: Arc::new(AsyncMutex::new(file_ctrl_rx)),
     };
     let mut slot = state_slot().lock().expect("state mutex poisoned");
     if let Some(s) = slot.as_mut() {
@@ -378,6 +490,10 @@ async fn streams_accept_loop(
     audio_ctrl_tx: Arc<UnboundedSender<Vec<u8>>>,
     audio_in_tx: Arc<UnboundedSender<Vec<u8>>>,
     clip_in_tx: Arc<UnboundedSender<String>>,
+    clip_blob_tx: Arc<UnboundedSender<(String, Vec<u8>)>>,
+    host_name_slot: Arc<Mutex<Option<String>>>,
+    capture_ctrl_tx: Arc<UnboundedSender<Vec<u8>>>,
+    file_ctrl_tx: Arc<UnboundedSender<Vec<u8>>>,
 ) {
     let permissions: Arc<dyn PermissionsStore> = Arc::new(PermissivePermissions);
     loop {
@@ -424,7 +540,15 @@ async fn streams_accept_loop(
             StreamKind::Control => {
                 let cam_tx = camera_ctrl_tx.clone();
                 let aud_tx = audio_ctrl_tx.clone();
-                tokio::spawn(control_recv_loop(stream, (*cam_tx).clone(), (*aud_tx).clone()));
+                let cap_tx = capture_ctrl_tx.clone();
+                let file_tx = file_ctrl_tx.clone();
+                tokio::spawn(control_recv_loop(
+                    stream,
+                    (*cam_tx).clone(),
+                    (*aud_tx).clone(),
+                    (*cap_tx).clone(),
+                    (*file_tx).clone(),
+                ));
             }
             StreamKind::Audio => {
                 let tx = audio_in_tx.clone();
@@ -432,7 +556,12 @@ async fn streams_accept_loop(
             }
             StreamKind::Clipboard => {
                 let tx = clip_in_tx.clone();
-                tokio::spawn(clipboard_in_loop(stream, (*tx).clone()));
+                let btx = clip_blob_tx.clone();
+                tokio::spawn(clipboard_in_loop(stream, (*tx).clone(), (*btx).clone()));
+            }
+            StreamKind::Hello => {
+                let slot = host_name_slot.clone();
+                tokio::spawn(hello_in_loop(stream, slot));
             }
             other => {
                 warn!("streams_accept_loop: dropping unexpected stream {other:?}");
@@ -697,6 +826,13 @@ impl<'a> Cursor<'a> {
     fn take_i32(&mut self) -> Result<i32, String> {
         Ok(self.take_u32()? as i32)
     }
+    fn take_u16(&mut self) -> Result<u16, String> {
+        let s = self.take(2)?;
+        Ok(u16::from_le_bytes([s[0], s[1]]))
+    }
+    fn take_i16(&mut self) -> Result<i16, String> {
+        Ok(self.take_u16()? as i16)
+    }
     fn take_u64(&mut self) -> Result<u64, String> {
         let s = self.take(8)?;
         let mut a = [0u8; 8];
@@ -728,6 +864,8 @@ async fn control_recv_loop(
     mut stream: QuicStream,
     camera_tx: UnboundedSender<Vec<u8>>,
     audio_tx: UnboundedSender<Vec<u8>>,
+    capture_tx: UnboundedSender<Vec<u8>>,
+    file_tx: UnboundedSender<Vec<u8>>,
 ) {
     loop {
         let bytes = match stream.recv().await {
@@ -794,6 +932,28 @@ async fn control_recv_loop(
                     return;
                 }
             }
+            Message::Control(ControlMessage::RequestScreenCapture) => {
+                // Single-byte signal — Kotlin matches on tag 0 = start
+                // request, tag 1 = stop. No payload either way.
+                if capture_tx.send(vec![0u8]).is_err() {
+                    return;
+                }
+            }
+            Message::Control(ControlMessage::StopScreenCapture) => {
+                if capture_tx.send(vec![1u8]).is_err() {
+                    return;
+                }
+            }
+            Message::Control(ControlMessage::RequestFileAccess) => {
+                if file_tx.send(vec![0u8]).is_err() {
+                    return;
+                }
+            }
+            Message::Control(ControlMessage::ReleaseFileAccess) => {
+                if file_tx.send(vec![1u8]).is_err() {
+                    return;
+                }
+            }
             other => {
                 warn!("control_recv_loop: ignoring Control message {other:?}");
             }
@@ -832,7 +992,11 @@ async fn audio_in_loop(mut stream: QuicStream, tx: UnboundedSender<Vec<u8>>) {
     }
 }
 
-async fn clipboard_in_loop(mut stream: QuicStream, tx: UnboundedSender<String>) {
+async fn clipboard_in_loop(
+    mut stream: QuicStream,
+    tx: UnboundedSender<String>,
+    blob_tx: UnboundedSender<(String, Vec<u8>)>,
+) {
     loop {
         let bytes = match stream.recv().await {
             Ok(b) => b,
@@ -849,17 +1013,88 @@ async fn clipboard_in_loop(mut stream: QuicStream, tx: UnboundedSender<String>) 
                 continue;
             }
         };
-        let text = match msg {
-            ClipboardMessage::Text { content } => content,
-            ClipboardMessage::Blob { mime, .. } => {
-                warn!("clipboard_in_loop: ignoring blob (mime={mime})");
-                continue;
+        match msg {
+            ClipboardMessage::Text { content } => {
+                if tx.send(content).is_err() {
+                    info!("clipboard_in_loop: text receiver dropped; exiting");
+                    return;
+                }
             }
-        };
-        if tx.send(text).is_err() {
-            info!("clipboard_in_loop: receiver dropped; exiting");
+            ClipboardMessage::Blob { mime, data } => {
+                if blob_tx.send((mime, data)).is_err() {
+                    info!("clipboard_in_loop: blob receiver dropped; exiting");
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// Open `StreamKind::Hello` outbound and push a single `Hello` envelope
+/// carrying our device id + name + capability bits, then close. Lets
+/// the daemon refresh its `PeerStore.name` cache without waiting for
+/// the next pair.
+async fn send_hello(
+    conn: &QuicConnection,
+    identity: &IdentityKeypair,
+    device_name: &str,
+) -> Result<(), ansync_transport::TransportError> {
+    let pk = identity.public().as_bytes();
+    let mut id_bytes = [0u8; 16];
+    id_bytes.copy_from_slice(&pk[..16]);
+    let env = Envelope {
+        version: PROTOCOL_VERSION,
+        message: Message::Hello(Hello {
+            device_id: DeviceId(id_bytes),
+            name: DeviceName(device_name.to_string()),
+            // Companion-side caps reflect what the device can offer to
+            // the host. Keeping it as the union of everything we wire
+            // today; the host gates per-feature with its own perms.
+            capabilities: Capabilities::SCREEN_MIRROR
+                | Capabilities::CAMERA_VIDEO
+                | Capabilities::AUDIO_IN
+                | Capabilities::AUDIO_OUT
+                | Capabilities::MIC
+                | Capabilities::FILES
+                | Capabilities::CLIPBOARD
+                | Capabilities::NOTIFICATIONS,
+        }),
+    };
+    let bytes = postcard::to_allocvec(&env).map_err(|e| {
+        ansync_transport::TransportError::Handshake(format!("encode Hello: {e}"))
+    })?;
+    let mut stream = conn.open(StreamKind::Hello).await?;
+    stream.send(Bytes::from(bytes)).await?;
+    let _ = stream.finish().await;
+    Ok(())
+}
+
+/// Drain the host's Hello frame off a freshly accepted Hello stream
+/// and stash the name so Kotlin can surface it on the paired-host
+/// card.
+async fn hello_in_loop(mut stream: QuicStream, slot: Arc<Mutex<Option<String>>>) {
+    let bytes = match stream.recv().await {
+        Ok(b) => b,
+        Err(e) => {
+            warn!("hello_in_loop: recv failed: {e}");
             return;
         }
+    };
+    let env: Envelope = match postcard::from_bytes(&bytes) {
+        Ok(e) => e,
+        Err(e) => {
+            warn!("hello_in_loop: decode failed: {e}");
+            return;
+        }
+    };
+    match env.message {
+        Message::Hello(h) => {
+            info!("host Hello: name={} caps={:#x}", h.name, h.capabilities.bits());
+            if let Ok(mut g) = slot.lock() {
+                *g = Some(h.name.0);
+            }
+        }
+        other => warn!("hello_in_loop: non-Hello envelope: {other:?}"),
     }
 }
 
@@ -1060,21 +1295,32 @@ pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativePairOverCable<
     };
     let result = runtime().block_on(async move {
         let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port)).await?;
-        let peer = bootstrap_companion(&mut stream, &identity, &companion_name)
+        let result = bootstrap_companion(&mut stream, &identity, &companion_name)
             .await
             .map_err(|e| std::io::Error::other(format!("bootstrap: {e}")))?;
-        Ok::<_, std::io::Error>(peer)
+        Ok::<_, std::io::Error>(result)
     });
-    let peer = match result {
+    let pair_result = match result {
         Ok(p) => p,
         Err(e) => {
             error!("nativePairOverCable: pair failed: {e}");
             return std::ptr::null_mut();
         }
     };
-    info!("cable pairing complete with host {}", peer.name.0);
-    let hex = hex_encode(&peer.pubkey);
-    let response = format!("{hex}|{}", peer.name.0);
+    info!("cable pairing complete with host {}", pair_result.peer.name.0);
+    let hex = hex_encode(&pair_result.peer.pubkey);
+    // Wire to Kotlin: `<hex>|<name>|<ip:port>,<ip:port>,...` — the
+    // endpoints slot is empty when the host didn't advertise any
+    // (older daemon, no LAN). Kotlin parses + persists to
+    // `PREF_HOST_ADDR` so `HostDialer` can fall back to direct dial
+    // when mDNS multicast doesn't reach.
+    let endpoints = pair_result
+        .lan_endpoints
+        .iter()
+        .map(|(ip, port)| format!("{ip}:{port}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let response = format!("{hex}|{}|{endpoints}", pair_result.peer.name.0);
     match env.new_string(response) {
         Ok(s) => s.into_raw(),
         Err(e) => {
@@ -1110,17 +1356,27 @@ fn decode_input_from_kotlin(bytes: &[u8]) -> Result<InputMessage, String> {
             let slot = c.take(1)?[0];
             let x = c.take_i32()?;
             let y = c.take_i32()?;
-            let pressure_lo = c.take(1)?[0];
-            let pressure_hi = c.take(1)?[0];
+            let pressure = c.take_u16()?;
             let tracking_id = c.take_i32()?;
-            Ok(InputMessage::TouchSlot {
-                slot,
-                x,
-                y,
-                pressure: u16::from_le_bytes([pressure_lo, pressure_hi]),
-                tracking_id,
-            })
+            Ok(InputMessage::TouchSlot { slot, x, y, pressure, tracking_id })
         }
+        5 => Ok(InputMessage::Stylus {
+            x: c.take_i32()?,
+            y: c.take_i32()?,
+            pressure: c.take_u16()?,
+            tilt_x: c.take_i16()?,
+            tilt_y: c.take_i16()?,
+            btn: c.take(1)?[0],
+        }),
+        6 => Ok(InputMessage::Gamepad(GamepadState {
+            buttons: c.take_u32()?,
+            lx: c.take_i16()?,
+            ly: c.take_i16()?,
+            rx: c.take_i16()?,
+            ry: c.take_i16()?,
+            lt: c.take(1)?[0],
+            rt: c.take(1)?[0],
+        })),
         other => Err(format!("unknown InputMessage tag {other}")),
     }
 }
@@ -1332,6 +1588,68 @@ pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativeStopCameraStre
     jni::sys::JNI_TRUE
 }
 
+/// Block until the host sends a `ControlMessage::RequestFileAccess`
+/// / `ReleaseFileAccess`. Tag 0 = request, tag 1 = release.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativePollFileControl<'local>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+) -> jni::sys::jbyteArray {
+    let rx = {
+        let slot = state_slot().lock().expect("state mutex poisoned");
+        match slot.as_ref().and_then(|s| s.session.as_ref()) {
+            Some(sess) => sess.file_ctrl_rx.clone(),
+            None => return std::ptr::null_mut(),
+        }
+    };
+    let bytes = runtime().block_on(async move {
+        let mut guard = rx.lock().await;
+        guard.recv().await
+    });
+    match bytes {
+        Some(b) => match env.byte_array_from_slice(&b) {
+            Ok(arr) => arr.into_raw(),
+            Err(e) => {
+                error!("nativePollFileControl: byte_array_from_slice: {e}");
+                std::ptr::null_mut()
+            }
+        },
+        None => std::ptr::null_mut(),
+    }
+}
+
+/// Block (in native) until the host sends a
+/// `ControlMessage::RequestScreenCapture` / `StopScreenCapture` and
+/// return a single-byte tag (0 = start, 1 = stop). Returns `null`
+/// on session teardown.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativePollCaptureControl<'local>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+) -> jni::sys::jbyteArray {
+    let rx = {
+        let slot = state_slot().lock().expect("state mutex poisoned");
+        match slot.as_ref().and_then(|s| s.session.as_ref()) {
+            Some(sess) => sess.capture_ctrl_rx.clone(),
+            None => return std::ptr::null_mut(),
+        }
+    };
+    let bytes = runtime().block_on(async move {
+        let mut guard = rx.lock().await;
+        guard.recv().await
+    });
+    match bytes {
+        Some(b) => match env.byte_array_from_slice(&b) {
+            Ok(arr) => arr.into_raw(),
+            Err(e) => {
+                error!("nativePollCaptureControl: byte_array_from_slice: {e}");
+                std::ptr::null_mut()
+            }
+        },
+        None => std::ptr::null_mut(),
+    }
+}
+
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativePollAudioControl<'local>(
     env: JNIEnv<'local>,
@@ -1526,6 +1844,169 @@ pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativeSendClipboardT
         Ok(()) => jni::sys::JNI_TRUE,
         Err(e) => {
             warn!("nativeSendClipboardText: send failed: {e}");
+            jni::sys::JNI_FALSE
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativePollClipboardBlob<'local>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+) -> jni::sys::jbyteArray {
+    let rx = {
+        let slot = state_slot().lock().expect("state mutex poisoned");
+        match slot.as_ref().and_then(|s| s.session.as_ref()) {
+            Some(sess) => sess.clipboard_in_blob_rx.clone(),
+            None => return std::ptr::null_mut(),
+        }
+    };
+    let entry = runtime().block_on(async move {
+        let mut guard = rx.lock().await;
+        guard.recv().await
+    });
+    let Some((mime, data)) = entry else {
+        return std::ptr::null_mut();
+    };
+    let mime_bytes = mime.as_bytes();
+    let mut out = Vec::with_capacity(4 + mime_bytes.len() + data.len());
+    out.extend_from_slice(&(mime_bytes.len() as u32).to_le_bytes());
+    out.extend_from_slice(mime_bytes);
+    out.extend_from_slice(&data);
+    match env.byte_array_from_slice(&out) {
+        Ok(arr) => arr.into_raw(),
+        Err(e) => {
+            error!("nativePollClipboardBlob: byte_array_from_slice failed: {e}");
+            std::ptr::null_mut()
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativeSendClipboardBlob<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    mime: JString<'local>,
+    data: JByteArray<'local>,
+) -> jboolean {
+    let mime: String = match env.get_string(&mime) {
+        Ok(s) => s.into(),
+        Err(e) => {
+            error!("nativeSendClipboardBlob: mime get_string failed: {e}");
+            return jni::sys::JNI_FALSE;
+        }
+    };
+    let data: Vec<u8> = match env.convert_byte_array(&data) {
+        Ok(v) => v,
+        Err(e) => {
+            error!("nativeSendClipboardBlob: convert_byte_array failed: {e}");
+            return jni::sys::JNI_FALSE;
+        }
+    };
+    let conn = {
+        let slot = state_slot().lock().expect("state mutex poisoned");
+        match slot.as_ref().and_then(|s| s.session.as_ref()) {
+            Some(sess) => sess.conn.clone(),
+            None => {
+                warn!("nativeSendClipboardBlob: no active session");
+                return jni::sys::JNI_FALSE;
+            }
+        }
+    };
+    let msg = ClipboardMessage::Blob { mime, data };
+    let payload = match postcard::to_allocvec(&msg) {
+        Ok(b) => b,
+        Err(e) => {
+            warn!("nativeSendClipboardBlob: encode failed: {e}");
+            return jni::sys::JNI_FALSE;
+        }
+    };
+    let result = runtime().block_on(async move {
+        let mut stream = conn.open(StreamKind::Clipboard).await?;
+        stream.send(Bytes::from(payload)).await
+    });
+    match result {
+        Ok(()) => jni::sys::JNI_TRUE,
+        Err(e) => {
+            warn!("nativeSendClipboardBlob: send failed: {e}");
+            jni::sys::JNI_FALSE
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativeSendNotificationPosted<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    id: jlong,
+    app: JString<'local>,
+    title: JString<'local>,
+    body: JString<'local>,
+) -> jboolean {
+    let app: String = match env.get_string(&app) {
+        Ok(s) => s.into(),
+        Err(e) => {
+            error!("nativeSendNotificationPosted: app get_string failed: {e}");
+            return jni::sys::JNI_FALSE;
+        }
+    };
+    let title: String = match env.get_string(&title) {
+        Ok(s) => s.into(),
+        Err(e) => {
+            error!("nativeSendNotificationPosted: title get_string failed: {e}");
+            return jni::sys::JNI_FALSE;
+        }
+    };
+    let body: String = match env.get_string(&body) {
+        Ok(s) => s.into(),
+        Err(e) => {
+            error!("nativeSendNotificationPosted: body get_string failed: {e}");
+            return jni::sys::JNI_FALSE;
+        }
+    };
+    send_notification(NotificationMessage::Posted {
+        id: id as u64,
+        app,
+        title,
+        body,
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativeSendNotificationRemoved(
+    _env: JNIEnv,
+    _class: JClass,
+    id: jlong,
+) -> jboolean {
+    send_notification(NotificationMessage::Removed { id: id as u64 })
+}
+
+fn send_notification(msg: NotificationMessage) -> jboolean {
+    let conn = {
+        let slot = state_slot().lock().expect("state mutex poisoned");
+        match slot.as_ref().and_then(|s| s.session.as_ref()) {
+            Some(sess) => sess.conn.clone(),
+            None => {
+                warn!("send_notification: no active session");
+                return jni::sys::JNI_FALSE;
+            }
+        }
+    };
+    let payload = match postcard::to_allocvec(&msg) {
+        Ok(b) => b,
+        Err(e) => {
+            warn!("send_notification: encode failed: {e}");
+            return jni::sys::JNI_FALSE;
+        }
+    };
+    let result = runtime().block_on(async move {
+        let mut stream = conn.open(StreamKind::Notifications).await?;
+        stream.send(Bytes::from(payload)).await
+    });
+    match result {
+        Ok(()) => jni::sys::JNI_TRUE,
+        Err(e) => {
+            warn!("send_notification: send failed: {e}");
             jni::sys::JNI_FALSE
         }
     }
