@@ -4,7 +4,11 @@ import android.content.ContentResolver
 import android.content.Context
 import android.net.Uri
 import android.provider.DocumentsContract
+import android.system.Os
+import android.system.OsConstants
 import android.util.Log
+import java.io.FileOutputStream
+import java.nio.ByteBuffer
 import kotlin.concurrent.thread
 
 /**
@@ -20,11 +24,10 @@ import kotlin.concurrent.thread
  *      `FsOpCodec`, dispatches to a SAF op against the tree URI, and
  *      replies via `nativeFsReply`.
  *
- * SAF wiring is intentionally minimal in Step 9e: stat / readdir /
- * open / read have shipping handlers; create / write / unlink /
- * rename / truncate / chmod return `Error(ENOSYS)` until the
- * follow-up patch hooks them. Pipeline + Codec are validated
- * end-to-end already.
+ * SAF wiring covers stat / readdir / open / read / write / create /
+ * unlink / rename / truncate. `chmod` returns ENOSYS by design —
+ * SAF doesn't expose Unix modes. Rename is restricted to same-dir
+ * (SAF's `renameDocument` semantic); cross-dir moves return EXDEV.
  */
 class AnsyncFsServer(
     private val ctx: Context,
@@ -79,12 +82,14 @@ class AnsyncFsServer(
             is FsOpRequest.Open -> openAt(req.path, req.flags)
             is FsOpRequest.Read -> readAt(req.handle, req.offset, req.len)
             is FsOpRequest.Close -> closeAt(req.handle)
-            is FsOpRequest.Write,
-            is FsOpRequest.Create,
-            is FsOpRequest.Unlink,
-            is FsOpRequest.Rename,
-            is FsOpRequest.Truncate,
-            is FsOpRequest.Chmod -> FsOpReply.Error(code = ENOSYS, message = "not implemented yet")
+            is FsOpRequest.Write -> writeAt(req.handle, req.offset, req.data)
+            is FsOpRequest.Create -> createAt(req.path, req.mode)
+            is FsOpRequest.Unlink -> unlinkAt(req.path)
+            is FsOpRequest.Rename -> renameAt(req.from, req.to)
+            is FsOpRequest.Truncate -> truncateAt(req.path, req.size)
+            // SAF has no Unix mode bit surface — keep ENOSYS so the FUSE
+            // layer reports "operation not supported" instead of lying.
+            is FsOpRequest.Chmod -> FsOpReply.Error(code = ENOSYS, message = "chmod unsupported on SAF")
         }
     }
 
@@ -221,6 +226,135 @@ class AnsyncFsServer(
         return FsOpReply.Ok
     }
 
+    private fun writeAt(handle: Long, offset: Long, data: ByteArray): FsOpReply {
+        val docUri = synchronized(handles) { handles[handle] }
+            ?: return FsOpReply.Error(EBADF, "bad handle")
+        return try {
+            resolver.openFileDescriptor(docUri, "rw").use { pfd ->
+                if (pfd == null) return FsOpReply.Error(EIO, "openFileDescriptor null")
+                val fd = pfd.fileDescriptor
+                Os.lseek(fd, offset, OsConstants.SEEK_SET)
+                FileOutputStream(fd).channel.use { ch ->
+                    val buf = ByteBuffer.wrap(data)
+                    var written = 0
+                    while (buf.hasRemaining()) {
+                        val n = ch.write(buf)
+                        if (n <= 0) break
+                        written += n
+                    }
+                    FsOpReply.Write(written = written)
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "writeAt failed", e)
+            FsOpReply.Error(EIO, e.message ?: "write failed")
+        }
+    }
+
+    private fun createAt(path: String, @Suppress("UNUSED_PARAMETER") mode: Int): FsOpReply {
+        // Split into parent + child name. SAF requires a parent dir
+        // URI + display name; there's no atomic "create at absolute
+        // path" call.
+        val (parentPath, name) = splitParent(path)
+            ?: return FsOpReply.Error(EINVAL, "invalid path $path")
+        val parentUri = resolveChildDocUri(parentPath)
+            ?: return FsOpReply.Error(ENOENT, "parent not found: $parentPath")
+        val mime = guessMime(name)
+        return try {
+            val newUri = DocumentsContract.createDocument(resolver, parentUri, mime, name)
+                ?: return FsOpReply.Error(EIO, "createDocument returned null")
+            val handle = synchronized(handles) {
+                val h = nextHandle++
+                handles[h] = newUri
+                h
+            }
+            FsOpReply.Create(handle = handle)
+        } catch (e: Exception) {
+            Log.w(TAG, "createAt failed path=$path", e)
+            FsOpReply.Error(EIO, e.message ?: "create failed")
+        }
+    }
+
+    private fun unlinkAt(path: String): FsOpReply {
+        val docUri = resolveChildDocUri(path) ?: return FsOpReply.Error(ENOENT, "not found")
+        return try {
+            if (DocumentsContract.deleteDocument(resolver, docUri)) {
+                FsOpReply.Ok
+            } else {
+                FsOpReply.Error(EIO, "deleteDocument returned false")
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "unlinkAt failed path=$path", e)
+            FsOpReply.Error(EIO, e.message ?: "unlink failed")
+        }
+    }
+
+    private fun renameAt(from: String, to: String): FsOpReply {
+        val (fromParent, _) = splitParent(from) ?: return FsOpReply.Error(EINVAL, "bad from")
+        val (toParent, newName) = splitParent(to) ?: return FsOpReply.Error(EINVAL, "bad to")
+        if (fromParent != toParent) {
+            // SAF `renameDocument` is rename-in-place. Cross-dir
+            // requires `moveDocument` which needs both source + target
+            // parent URIs and is a stickier semantics match; surface
+            // EXDEV so userspace can fall back to copy + unlink.
+            return FsOpReply.Error(EXDEV, "cross-dir rename unsupported")
+        }
+        val docUri = resolveChildDocUri(from) ?: return FsOpReply.Error(ENOENT, "not found")
+        return try {
+            val newUri = DocumentsContract.renameDocument(resolver, docUri, newName)
+                ?: return FsOpReply.Error(EIO, "renameDocument returned null")
+            // Update any open handles pointing at the old URI so
+            // subsequent reads/writes don't break on rename.
+            synchronized(handles) {
+                handles.entries.filter { it.value == docUri }.forEach { handles[it.key] = newUri }
+            }
+            FsOpReply.Ok
+        } catch (e: Exception) {
+            Log.w(TAG, "renameAt failed from=$from to=$to", e)
+            FsOpReply.Error(EIO, e.message ?: "rename failed")
+        }
+    }
+
+    private fun truncateAt(path: String, size: Long): FsOpReply {
+        val docUri = resolveChildDocUri(path) ?: return FsOpReply.Error(ENOENT, "not found")
+        return try {
+            resolver.openFileDescriptor(docUri, "rw").use { pfd ->
+                if (pfd == null) return FsOpReply.Error(EIO, "openFileDescriptor null")
+                Os.ftruncate(pfd.fileDescriptor, size)
+                FsOpReply.Ok
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "truncateAt failed path=$path size=$size", e)
+            FsOpReply.Error(EIO, e.message ?: "truncate failed")
+        }
+    }
+
+    private fun splitParent(path: String): Pair<String, String>? {
+        val trimmed = path.trim('/')
+        if (trimmed.isEmpty()) return null
+        val idx = trimmed.lastIndexOf('/')
+        return if (idx < 0) {
+            "" to trimmed
+        } else {
+            trimmed.substring(0, idx) to trimmed.substring(idx + 1)
+        }
+    }
+
+    private fun guessMime(name: String): String {
+        val ext = name.substringAfterLast('.', "").lowercase()
+        return when (ext) {
+            "txt", "md", "log", "json", "yaml", "yml", "toml" -> "text/plain"
+            "png" -> "image/png"
+            "jpg", "jpeg" -> "image/jpeg"
+            "webp" -> "image/webp"
+            "gif" -> "image/gif"
+            "mp4" -> "video/mp4"
+            "mp3" -> "audio/mpeg"
+            "pdf" -> "application/pdf"
+            else -> "application/octet-stream"
+        }
+    }
+
     companion object {
         private const val TAG = "ansync.fs"
         private const val STOP_JOIN_MS = 1_000L
@@ -229,6 +363,8 @@ class AnsyncFsServer(
         private const val ENOENT = 2
         private const val EIO = 5
         private const val EBADF = 9
+        private const val EXDEV = 18
+        private const val EINVAL = 22
         private const val ENOSYS = 38
     }
 }
