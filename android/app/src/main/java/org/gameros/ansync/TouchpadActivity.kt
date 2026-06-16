@@ -112,6 +112,11 @@ private const val TAP_MAX_MS = 200L
 private const val DOUBLE_TAP_MS = 300L
 private const val STYLUS_ABS_MAX = 32767
 private const val STYLUS_PRESSURE_MAX = 8191
+/// Hi-res wheel ticks emitted per pixel of finger travel. 120 ticks
+/// equal one legacy notch, so this factor lands ~3-4 notches per 100
+/// px of swipe — close to how a physical trackpad behaves on the
+/// same hardware.
+private const val WHEEL_HI_RES_PER_PIXEL = 4f
 
 @OptIn(ExperimentalComposeUiApi::class)
 @Composable
@@ -200,8 +205,12 @@ private data class Gesture(
     var twoFingerActive: Boolean = false,
     var twoFingerLastY: Float = 0f,
     var twoFingerLastX: Float = 0f,
+    var twoFingerStartX: Float = 0f,
+    var twoFingerStartY: Float = 0f,
     var twoFingerMoved: Boolean = false,
     var lastUpAt: Long = 0L,
+    var wheelRemainderX: Float = 0f,
+    var wheelRemainderY: Float = 0f,
 )
 
 private val gesture = Gesture()
@@ -244,19 +253,53 @@ private fun handlePointerEvent(event: MotionEvent, canvas: IntSize): String? {
             gesture.twoFingerActive = true
             gesture.twoFingerLastX = event.x
             gesture.twoFingerLastY = event.y
+            gesture.twoFingerStartX = event.x
+            gesture.twoFingerStartY = event.y
             gesture.twoFingerMoved = false
+            gesture.wheelRemainderX = 0f
+            gesture.wheelRemainderY = 0f
             "two-finger active"
         }
         MotionEvent.ACTION_MOVE -> {
             if (gesture.twoFingerActive) {
-                val dx = (event.x - gesture.twoFingerLastX).toInt()
-                val dy = (event.y - gesture.twoFingerLastY).toInt()
-                if (dx != 0 || dy != 0) {
-                    // Y-up = wheel-up = positive dy in evdev REL_WHEEL.
-                    val wheelY = (-dy) / 8
-                    val wheelX = dx / 8
-                    if (wheelY != 0 || wheelX != 0) {
-                        gesture.twoFingerMoved = true
+                // Wire semantics: `MouseWheel.dx/dy` are
+                // high-resolution wheel ticks (120 = 1 legacy
+                // notch). The host's uinput Mouse emits both
+                // `REL_WHEEL_HI_RES` and accumulator-driven
+                // `REL_WHEEL` notches, so smooth-scrolling
+                // consumers (libinput / Wayland compositors,
+                // GNOME, KDE, modern browsers, Electron apps) see
+                // per-pixel deltas while legacy consumers still
+                // step in notches.
+                //
+                // Companion → host scale: ~4 hi-res ticks per
+                // pixel of finger travel. Empirically a 100 px
+                // swipe ≈ 3 notches scrolled — close to how a
+                // physical trackpad feels on the same hardware.
+                // Sub-pixel remainder is carried in
+                // `wheelRemainderX/Y` so slow drags don't quantise
+                // to zero.
+                val dx = event.x - gesture.twoFingerLastX
+                val dy = event.y - gesture.twoFingerLastY
+                if (dx != 0f || dy != 0f) {
+                    // Track whether the gesture has actually moved
+                    // (vs micro-jitter while two fingers rest) so
+                    // the UP handler can still classify a small
+                    // settle as a 2-finger tap → middle click.
+                    val travelled = kotlin.math.hypot(
+                        (event.x - gesture.twoFingerStartX).toDouble(),
+                        (event.y - gesture.twoFingerStartY).toDouble(),
+                    )
+                    if (travelled > TAP_SLOP_PX) gesture.twoFingerMoved = true
+
+                    gesture.wheelRemainderX += dx * WHEEL_HI_RES_PER_PIXEL
+                    // Y-up == wheel-up == positive `REL_WHEEL`.
+                    gesture.wheelRemainderY += -dy * WHEEL_HI_RES_PER_PIXEL
+                    val wheelX = gesture.wheelRemainderX.toInt()
+                    val wheelY = gesture.wheelRemainderY.toInt()
+                    if (wheelX != 0 || wheelY != 0) {
+                        gesture.wheelRemainderX -= wheelX.toFloat()
+                        gesture.wheelRemainderY -= wheelY.toFloat()
                         NativeBridge.nativeSendInputMessage(
                             WireInputMessage.MouseWheel(dx = wheelX, dy = wheelY).encode()
                         )

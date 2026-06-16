@@ -174,11 +174,22 @@ impl VirtualInputDevice for Keyboard {
 
 pub struct Mouse {
     handle: Option<UInputHandle<File>>,
+    /// Accumulated high-resolution wheel ticks (REL_WHEEL_HI_RES /
+    /// REL_HWHEEL_HI_RES units; 120 hi-res = 1 traditional notch).
+    /// We emit a traditional REL_WHEEL / REL_HWHEEL step every time
+    /// the accumulator crosses ±120 so legacy consumers that ignore
+    /// the hi-res axis still get notched scrolling.
+    wheel_accum_y: i32,
+    wheel_accum_x: i32,
 }
 
 impl Mouse {
     pub fn new() -> Self {
-        Self { handle: None }
+        Self {
+            handle: None,
+            wheel_accum_y: 0,
+            wheel_accum_x: 0,
+        }
     }
 }
 
@@ -215,6 +226,8 @@ impl VirtualInputDevice for Mouse {
             input_linux::RelativeAxis::Y,
             input_linux::RelativeAxis::Wheel,
             input_linux::RelativeAxis::HorizontalWheel,
+            input_linux::RelativeAxis::WheelHiRes,
+            input_linux::RelativeAxis::HorizontalWheelHiRes,
         ] {
             handle.set_relbit(axis)?;
         }
@@ -255,22 +268,48 @@ impl VirtualInputDevice for Mouse {
                     &[raw(EventKind::Key, key as u16, value), syn_report()],
                 )
             }
-            InputEvent::MouseWheel { dx, dy } => write_events(
-                h,
-                &[
-                    raw(
+            InputEvent::MouseWheel { dx, dy } => {
+                // Wire semantics: `dx` / `dy` are high-resolution
+                // wheel ticks where 120 hi-res = 1 legacy notch.
+                // Hi-res axes drive trackpad-style smooth pixel
+                // scrolling in libinput / GNOME / KDE; the legacy
+                // notch axes are still emitted for clients that
+                // ignore the hi-res ones (older X11 stacks, raw
+                // evdev consumers).
+                self.wheel_accum_x = self.wheel_accum_x.saturating_add(dx);
+                self.wheel_accum_y = self.wheel_accum_y.saturating_add(dy);
+                let notch_x = self.wheel_accum_x / 120;
+                let notch_y = self.wheel_accum_y / 120;
+                self.wheel_accum_x -= notch_x * 120;
+                self.wheel_accum_y -= notch_y * 120;
+                let mut events = Vec::with_capacity(5);
+                events.push(raw(
+                    EventKind::Relative,
+                    input_linux::RelativeAxis::HorizontalWheelHiRes as u16,
+                    dx,
+                ));
+                events.push(raw(
+                    EventKind::Relative,
+                    input_linux::RelativeAxis::WheelHiRes as u16,
+                    dy,
+                ));
+                if notch_x != 0 {
+                    events.push(raw(
                         EventKind::Relative,
                         input_linux::RelativeAxis::HorizontalWheel as u16,
-                        dx,
-                    ),
-                    raw(
+                        notch_x,
+                    ));
+                }
+                if notch_y != 0 {
+                    events.push(raw(
                         EventKind::Relative,
                         input_linux::RelativeAxis::Wheel as u16,
-                        dy,
-                    ),
-                    syn_report(),
-                ],
-            ),
+                        notch_y,
+                    ));
+                }
+                events.push(syn_report());
+                write_events(h, &events)
+            }
             InputEvent::Sync => write_events(h, &[syn_report()]),
             _ => Ok(()),
         }
