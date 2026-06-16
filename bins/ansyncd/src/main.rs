@@ -96,6 +96,21 @@ fn install_logging() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Best-effort host name. Tries `gethostname(2)` first; falls back to
+/// `$HOSTNAME` for hermetic test envs that disable the syscall.
 fn hostname() -> Option<String> {
+    let mut buf = [0i8; 256];
+    // SAFETY: passing a stack buffer + its size; gethostname null-terminates
+    // when the name fits, returns -1 + ENAMETOOLONG on overflow.
+    let rc = unsafe { libc::gethostname(buf.as_mut_ptr(), buf.len()) };
+    if rc == 0 {
+        let cstr = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) };
+        if let Ok(s) = cstr.to_str() {
+            let trimmed = s.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
     std::env::var("HOSTNAME").ok().filter(|s| !s.is_empty())
 }

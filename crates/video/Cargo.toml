@@ -27,6 +27,13 @@ ferricast-decoder.workspace = true
 # only re-exports it.
 eframe.workspace = true
 egui.workspace = true
+egui-wgpu.workspace = true
+wgpu.workspace = true
+# Direct winit dep so `sink_egui` can opt the event loop into the
+# any-thread mode (mirror window spawns from a worker thread, not
+# main). Version pinned to match what eframe 0.31 transitively
+# requires; cargo dedupes if either side moves.
+winit = { version = "0.30", default-features = false, features = ["x11", "wayland"] }
 
 [features]
 default = []
