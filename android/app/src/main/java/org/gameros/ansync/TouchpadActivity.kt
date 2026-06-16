@@ -1,9 +1,17 @@
 package org.gameros.ansync
 
+import android.content.Context
 import android.os.Bundle
 import android.os.SystemClock
+import android.text.InputType
 import android.view.KeyEvent
 import android.view.MotionEvent
+import android.view.View
+import android.view.inputmethod.EditorInfo
+import android.view.inputmethod.InputConnection
+import android.view.inputmethod.InputConnectionWrapper
+import android.view.inputmethod.InputMethodManager
+import android.widget.EditText
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.background
@@ -11,13 +19,10 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
@@ -30,16 +35,12 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.ExperimentalComposeUiApi
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.focus.FocusRequester
-import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInteropFilter
 import androidx.compose.ui.layout.onSizeChanged
-import androidx.compose.ui.platform.LocalSoftwareKeyboardController
-import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 
 /**
  * Full-screen device→host input surface. Routes every interaction
@@ -47,22 +48,24 @@ import androidx.compose.ui.unit.sp
  * peer:
  *
  *  ┌─ Touch / mouse pad ────────────────────────────────────────────┐
- *  │ • 1-finger drag  → `MouseMove { dx, dy }`                       │
- *  │ • 1-finger tap   → `MouseButton { 1, press / release }`         │
- *  │ • long press     → `MouseButton { 2, press / release }`         │
- *  │ • 2-finger drag  → `MouseWheel { dx, dy }`                      │
- *  │ • 2-finger tap   → `MouseButton { 3, press / release }`         │
- *  │ • stylus events  → `Stylus { x, y, pressure, tiltX, tiltY, btn }`│
- *  │   (TOOL_TYPE_STYLUS, x/y scaled to 0..32767 host ABS range)     │
+ *  │ • 1-finger drag         → `MouseMove { dx, dy }` (no button)    │
+ *  │ • 1-finger tap          → `MouseButton { 1, down/up }`          │
+ *  │ • long press            → `MouseButton { 2, down/up }`          │
+ *  │ • double-tap + hold     → `MouseButton { 1, down }` + drag      │
+ *  │ • 2-finger drag         → `MouseWheel { dx, dy }`               │
+ *  │ • 2-finger tap          → `MouseButton { 3, down/up }`          │
+ *  │ • stylus events         → `Stylus { x, y, pressure, tilt, btn }`│
  *  └────────────────────────────────────────────────────────────────┘
  *
  *  ┌─ Keyboard ──────────────────────────────────────────────────────┐
  *  │ • Hardware KeyEvent  → `KeyPress { keycode, pressed }` via the  │
- *  │   activity-level `dispatchKeyEvent` (covers attached USB / BT   │
- *  │   keyboards out of the box).                                    │
- *  │ • Soft IME          → invisible `BasicTextField`; each char     │
- *  │   the IME commits is synthesised to a press/release sequence    │
- *  │   (with auto-shift for capital ASCII letters).                  │
+ *  │   activity-level `dispatchKeyEvent` (USB / BT keyboards).       │
+ *  │ • Soft IME           → an offscreen `EditText` whose            │
+ *  │   `InputConnection` intercepts `commitText`,                    │
+ *  │   `deleteSurroundingText` and `sendKeyEvent` 1-to-1 — no shared │
+ *  │   text buffer, so IME composition / autocomplete cannot         │
+ *  │   manufacture phantom deletes the way `BasicTextField`+         │
+ *  │   `onValueChange` did.                                          │
  *  └────────────────────────────────────────────────────────────────┘
  */
 class TouchpadActivity : ComponentActivity() {
@@ -77,10 +80,11 @@ class TouchpadActivity : ComponentActivity() {
     }
 
     /**
-     * Catches hardware keyboard events (attached BT / USB keyboards).
-     * Gamepad-source key events are forwarded to the default handler
-     * so the dedicated [GamepadActivity] can claim them when launched
-     * instead — this activity is the *mouse + keyboard* surface.
+     * Hardware keyboard events arrive here before the focused
+     * [EditText] sees them — forward attached BT / USB key events
+     * straight to the host and consume.
+     * Gamepad-source events are forwarded to the default handler so
+     * [GamepadActivity] can claim them when launched instead.
      */
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
         if ((event.source and android.view.InputDevice.SOURCE_GAMEPAD) ==
@@ -88,10 +92,14 @@ class TouchpadActivity : ComponentActivity() {
         ) {
             return super.dispatchKeyEvent(event)
         }
+        // Skip events that already came from the soft IME — those
+        // arrive via the InputConnection path below, not here.
+        if (event.deviceId == KeyEvent.KEYCODE_UNKNOWN) {
+            return super.dispatchKeyEvent(event)
+        }
         val evdev = KeycodeMap.toEvdev(event.keyCode) ?: return super.dispatchKeyEvent(event)
-        val pressed = event.action == KeyEvent.ACTION_DOWN
-        if (event.action == KeyEvent.ACTION_UP || event.action == KeyEvent.ACTION_DOWN) {
-            sendKey(evdev, pressed)
+        if (event.action == KeyEvent.ACTION_DOWN || event.action == KeyEvent.ACTION_UP) {
+            sendKey(evdev, event.action == KeyEvent.ACTION_DOWN)
             return true
         }
         return super.dispatchKeyEvent(event)
@@ -101,6 +109,7 @@ class TouchpadActivity : ComponentActivity() {
 private const val LONG_PRESS_MS = 450L
 private const val TAP_SLOP_PX = 12f
 private const val TAP_MAX_MS = 200L
+private const val DOUBLE_TAP_MS = 300L
 private const val STYLUS_ABS_MAX = 32767
 private const val STYLUS_PRESSURE_MAX = 8191
 
@@ -109,17 +118,18 @@ private const val STYLUS_PRESSURE_MAX = 8191
 private fun TouchpadScreen() {
     var status by remember { mutableStateOf("touchpad ready") }
     var canvasSize by remember { mutableStateOf(IntSize.Zero) }
-    var imeText by remember { mutableStateOf("") }
     var imeOpen by remember { mutableStateOf(false) }
-    val focusRequester = remember { FocusRequester() }
-    val ime = LocalSoftwareKeyboardController.current
+    var editTextRef by remember { mutableStateOf<HostKeyboardEditText?>(null) }
 
-    LaunchedEffect(imeOpen) {
+    LaunchedEffect(imeOpen, editTextRef) {
+        val et = editTextRef ?: return@LaunchedEffect
+        val imm = et.context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
         if (imeOpen) {
-            focusRequester.requestFocus()
-            ime?.show()
+            et.requestFocus()
+            imm.showSoftInput(et, InputMethodManager.SHOW_IMPLICIT)
         } else {
-            ime?.hide()
+            imm.hideSoftInputFromWindow(et.windowToken, 0)
+            et.clearFocus()
         }
     }
 
@@ -139,24 +149,18 @@ private fun TouchpadScreen() {
             )
         }
 
-        // Invisible-size BasicTextField — owns the focus when the IME
-        // is open and is the only sink the soft keyboard's
-        // `commitText` calls actually feed into. The mouse/touch box
-        // below stays the visual surface.
-        BasicTextField(
-            value = imeText,
-            onValueChange = { new ->
-                onImeTextChanged(old = imeText, new = new)
-                // Reset the buffer to keep memory bounded; we only
-                // care about the *delta* in this tick, not the
-                // accumulated string.
-                imeText = if (new.length > 256) "" else new
+        // Offscreen IME sink. The InputConnection wrapper installed
+        // by [HostKeyboardEditText] forwards every commit / delete /
+        // raw-key event straight to the host and *never* writes the
+        // typed text back into the EditText buffer — so IME
+        // composition state (live word previews, autocorrect, etc.)
+        // cannot manufacture phantom deletes when it rewrites the
+        // text under us.
+        AndroidView(
+            factory = { ctx ->
+                HostKeyboardEditText(ctx).also { editTextRef = it }
             },
-            singleLine = false,
-            textStyle = TextStyle(color = Color.Transparent, fontSize = 1.sp),
-            modifier = Modifier
-                .size(1.dp)
-                .focusRequester(focusRequester),
+            modifier = Modifier.size(1.dp),
         )
 
         Box(
@@ -172,13 +176,13 @@ private fun TouchpadScreen() {
         ) {
             Text(
                 text = "drag → cursor  •  tap → click  •  long press → right\n" +
+                    "double-tap + hold → left button drag\n" +
                     "2-finger drag → wheel  •  2-finger tap → middle\n" +
                     "stylus → pen events  •  Show keyboard → type to host",
                 color = Color.White,
                 modifier = Modifier.align(Alignment.TopStart).padding(16.dp),
                 style = MaterialTheme.typography.bodyMedium,
             )
-            Spacer(modifier = Modifier.height(8.dp))
         }
     }
 }
@@ -197,6 +201,7 @@ private data class Gesture(
     var twoFingerLastY: Float = 0f,
     var twoFingerLastX: Float = 0f,
     var twoFingerMoved: Boolean = false,
+    var lastUpAt: Long = 0L,
 )
 
 private val gesture = Gesture()
@@ -210,22 +215,32 @@ private fun handlePointerEvent(event: MotionEvent, canvas: IntSize): String? {
 
     return when (event.actionMasked) {
         MotionEvent.ACTION_DOWN -> {
-            gesture.downAt = SystemClock.uptimeMillis()
+            val now = SystemClock.uptimeMillis()
+            gesture.downAt = now
             gesture.startX = event.x
             gesture.startY = event.y
             gesture.lastX = event.x
             gesture.lastY = event.y
             gesture.rightHeld = false
-            gesture.leftHeld = false
             gesture.twoFingerActive = false
             gesture.twoFingerMoved = false
-            "pointer-down"
+            // Double-tap-and-hold: if the previous tap released
+            // within the double-tap window, the new touch starts
+            // with the left button held — user can now drag the
+            // selection / window / scrollbar.
+            gesture.leftHeld = (now - gesture.lastUpAt) < DOUBLE_TAP_MS
+            if (gesture.leftHeld) sendButton(button = 1, pressed = true)
+            if (gesture.leftHeld) "drag-mode" else "pointer-down"
         }
         MotionEvent.ACTION_POINTER_DOWN -> {
             // Second finger landed — promote the gesture to a
-            // two-finger scroll/middle-click stream and revoke any
-            // single-finger left-click that may have already been
-            // dispatched (we never tap-click before MOVE/UP).
+            // two-finger scroll/middle-click stream. A drag-mode
+            // single-finger gesture in progress is cancelled (button
+            // release) before flipping to scroll.
+            if (gesture.leftHeld) {
+                sendButton(button = 1, pressed = false)
+                gesture.leftHeld = false
+            }
             gesture.twoFingerActive = true
             gesture.twoFingerLastX = event.x
             gesture.twoFingerLastY = event.y
@@ -259,17 +274,16 @@ private fun handlePointerEvent(event: MotionEvent, canvas: IntSize): String? {
                         (event.y - gesture.startY).toDouble(),
                     )
                     val elapsed = SystemClock.uptimeMillis() - gesture.downAt
-                    if (!gesture.leftHeld && !gesture.rightHeld) {
-                        if (elapsed > LONG_PRESS_MS && moved < TAP_SLOP_PX) {
-                            // Stationary press past the long-press
-                            // window upgrades to a right-click drag.
-                            sendButton(button = 2, pressed = true)
-                            gesture.rightHeld = true
-                        } else if (moved > TAP_SLOP_PX) {
-                            // Real drag → start holding left button.
-                            sendButton(button = 1, pressed = true)
-                            gesture.leftHeld = true
-                        }
+                    // Long-press right-click: stationary finger
+                    // past the threshold upgrades to button 2 held.
+                    // Drag mode already has button 1 held from
+                    // ACTION_DOWN; plain drag emits *just* MouseMove
+                    // with no implicit button press.
+                    if (!gesture.leftHeld && !gesture.rightHeld &&
+                        elapsed > LONG_PRESS_MS && moved < TAP_SLOP_PX
+                    ) {
+                        sendButton(button = 2, pressed = true)
+                        gesture.rightHeld = true
                     }
                     NativeBridge.nativeSendInputMessage(
                         WireInputMessage.MouseMove(dx = dx, dy = dy).encode()
@@ -277,33 +291,31 @@ private fun handlePointerEvent(event: MotionEvent, canvas: IntSize): String? {
                     gesture.lastX = event.x
                     gesture.lastY = event.y
                 }
-                "drag"
+                if (gesture.leftHeld) "drag" else if (gesture.rightHeld) "right-drag" else "move"
             }
         }
-        MotionEvent.ACTION_POINTER_UP -> {
-            // Trailing finger lifted while the leading one is still
-            // down. Keep the leading state alive but flag that any
-            // pending single-finger tap should be skipped on UP.
-            "two-finger ending"
-        }
+        MotionEvent.ACTION_POINTER_UP -> "two-finger ending"
         MotionEvent.ACTION_UP -> {
-            val elapsed = SystemClock.uptimeMillis() - gesture.downAt
+            val now = SystemClock.uptimeMillis()
+            val elapsed = now - gesture.downAt
             val moved = kotlin.math.hypot(
                 (event.x - gesture.startX).toDouble(),
                 (event.y - gesture.startY).toDouble(),
             )
-            if (gesture.twoFingerActive) {
-                if (!gesture.twoFingerMoved && elapsed < TAP_MAX_MS) {
-                    sendButton(button = 3, pressed = true)
-                    sendButton(button = 3, pressed = false)
+            when {
+                gesture.twoFingerActive -> {
+                    if (!gesture.twoFingerMoved && elapsed < TAP_MAX_MS) {
+                        sendButton(button = 3, pressed = true)
+                        sendButton(button = 3, pressed = false)
+                    }
                 }
-            } else if (gesture.rightHeld) {
-                sendButton(button = 2, pressed = false)
-            } else if (gesture.leftHeld) {
-                sendButton(button = 1, pressed = false)
-            } else if (elapsed < TAP_MAX_MS && moved < TAP_SLOP_PX) {
-                sendButton(button = 1, pressed = true)
-                sendButton(button = 1, pressed = false)
+                gesture.rightHeld -> sendButton(button = 2, pressed = false)
+                gesture.leftHeld -> sendButton(button = 1, pressed = false)
+                elapsed < TAP_MAX_MS && moved < TAP_SLOP_PX -> {
+                    sendButton(button = 1, pressed = true)
+                    sendButton(button = 1, pressed = false)
+                    gesture.lastUpAt = now
+                }
             }
             gesture.leftHeld = false
             gesture.rightHeld = false
@@ -334,8 +346,6 @@ private fun handleStylus(event: MotionEvent, canvas: IntSize): String {
         else -> (event.pressure.coerceIn(0f, 1f) * STYLUS_PRESSURE_MAX).toInt()
             .coerceIn(0, STYLUS_PRESSURE_MAX)
     }
-    // Android exposes a single tilt magnitude (0..π/2) and an
-    // orientation azimuth; project to tiltX / tiltY in degrees.
     val tilt = event.getAxisValue(MotionEvent.AXIS_TILT)
     val orient = event.orientation
     val degs = (tilt * 180.0 / Math.PI).toFloat()
@@ -372,47 +382,113 @@ internal fun sendKey(evdev: Int, pressed: Boolean) {
     )
 }
 
-// ── Soft IME → KeyPress synthesis ────────────────────────────────────
+// ── Soft IME sink ────────────────────────────────────────────────────
 
-private fun onImeTextChanged(old: String, new: String) {
-    val oldLen = old.length
-    val newLen = new.length
-    when {
-        newLen > oldLen -> {
-            // Characters appended (covers both single-char commits
-            // and IME "paste" / autocomplete bursts).
-            val added = new.substring(oldLen)
-            for (c in added) {
-                sendCharAsKey(c)
+/**
+ * Offscreen [EditText] whose [InputConnection] is hijacked so that
+ * every IME event — committed text, surrounding-text deletes, raw
+ * key events — is forwarded straight to the host as a sequence of
+ * `KeyPress` events without ever mutating the local text buffer.
+ *
+ * The buffer-less design is deliberate: a shared `value` between
+ * Compose state and the IME (the original `BasicTextField` approach)
+ * gives the IME freedom to rewrite the composition (autocorrect /
+ * predictive replacement) and surfaces those rewrites as misleading
+ * length deltas, which the previous diff-based emitter translated
+ * into spurious backspaces — at worst wiping the host's text field
+ * end-to-end.
+ */
+internal class HostKeyboardEditText(ctx: Context) : EditText(ctx) {
+    init {
+        inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+        setBackgroundResource(0)
+        setTextColor(0)
+        isFocusable = true
+        isFocusableInTouchMode = true
+        importantForAutofill = View.IMPORTANT_FOR_AUTOFILL_NO
+    }
+
+    override fun onCreateInputConnection(outAttrs: EditorInfo): InputConnection {
+        outAttrs.imeOptions = EditorInfo.IME_FLAG_NO_EXTRACT_UI or
+            EditorInfo.IME_FLAG_NO_FULLSCREEN or
+            EditorInfo.IME_FLAG_NO_PERSONALIZED_LEARNING
+        outAttrs.inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+        val base = super.onCreateInputConnection(outAttrs)
+        return HostKeyboardInputConnection(base, true)
+    }
+}
+
+private class HostKeyboardInputConnection(
+    base: InputConnection,
+    mutable: Boolean,
+) : InputConnectionWrapper(base, mutable) {
+
+    override fun commitText(text: CharSequence?, newCursorPosition: Int): Boolean {
+        text?.forEach { sendCharAsKey(it) }
+        return true
+    }
+
+    /**
+     * IMEs use `setComposingText` for the in-progress word preview
+     * (the underlined word above the keyboard while you're typing).
+     * We do not surface that to the host — only the eventual
+     * `finishComposingText` / `commitText` does. Returning `true`
+     * with no buffer mutation makes the IME think the call landed
+     * so it stops retrying.
+     */
+    override fun setComposingText(text: CharSequence?, newCursorPosition: Int): Boolean = true
+    override fun finishComposingText(): Boolean = true
+    override fun setComposingRegion(start: Int, end: Int): Boolean = true
+
+    override fun deleteSurroundingText(beforeLength: Int, afterLength: Int): Boolean {
+        repeat(beforeLength) {
+            sendKey(14, true)
+            sendKey(14, false)
+        }
+        repeat(afterLength) {
+            sendKey(111, true)
+            sendKey(111, false)
+        }
+        return true
+    }
+
+    override fun deleteSurroundingTextInCodePoints(beforeLength: Int, afterLength: Int): Boolean =
+        deleteSurroundingText(beforeLength, afterLength)
+
+    override fun sendKeyEvent(event: KeyEvent): Boolean {
+        if (event.action == KeyEvent.ACTION_DOWN || event.action == KeyEvent.ACTION_UP) {
+            KeycodeMap.toEvdev(event.keyCode)?.let { evdev ->
+                sendKey(evdev, event.action == KeyEvent.ACTION_DOWN)
+                return true
             }
         }
-        newLen < oldLen -> {
-            // Characters deleted — emit BACKSPACE per removed char.
-            val removed = oldLen - newLen
-            repeat(removed) {
-                sendKey(14, true)
-                sendKey(14, false)
-            }
-        }
+        return super.sendKeyEvent(event)
+    }
+
+    override fun performEditorAction(editorAction: Int): Boolean {
+        // IME "send" / "done" / "go" actions: synthesise an Enter.
+        sendKey(28, true)
+        sendKey(28, false)
+        return true
     }
 }
 
 /**
  * Translate a Unicode `Char` into one or more evdev key presses.
- * Capital ASCII letters and the standard shifted punctuation glyphs
- * synthesise a left-shift held around the base key. Other Unicode
- * points are silently dropped — the wire only carries evdev keycodes
- * and the host uinput keyboard cannot type composed text directly;
- * use the clipboard path for non-ASCII strings.
+ * Capital ASCII letters and standard shifted punctuation synthesise
+ * a left-shift held around the base key. Non-ASCII glyphs are
+ * dropped — the wire only carries evdev keycodes and the host uinput
+ * keyboard cannot type composed text directly; use the clipboard
+ * path for non-ASCII strings.
  */
 private fun sendCharAsKey(c: Char) {
     val (evdev, shifted) = when (c) {
         '\n' -> 28 to false
         '\t' -> 15 to false
         ' ' -> 57 to false
-        in 'a'..'z' -> KeycodeMap.toEvdev(android.view.KeyEvent.KEYCODE_A + (c - 'a'))!! to false
-        in 'A'..'Z' -> KeycodeMap.toEvdev(android.view.KeyEvent.KEYCODE_A + (c - 'A'))!! to true
-        in '0'..'9' -> KeycodeMap.toEvdev(android.view.KeyEvent.KEYCODE_0 + (c - '0'))!! to false
+        in 'a'..'z' -> KeycodeMap.toEvdev(KeyEvent.KEYCODE_A + (c - 'a'))!! to false
+        in 'A'..'Z' -> KeycodeMap.toEvdev(KeyEvent.KEYCODE_A + (c - 'A'))!! to true
+        in '0'..'9' -> KeycodeMap.toEvdev(KeyEvent.KEYCODE_0 + (c - '0'))!! to false
         '-' -> 12 to false
         '_' -> 12 to true
         '=' -> 13 to false
