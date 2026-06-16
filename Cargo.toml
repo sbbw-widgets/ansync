@@ -95,6 +95,7 @@ zbus = { version = "5", default-features = false, features = ["tokio"] }
 # GUI (consumed in Step 6)
 eframe = { version = "0.31", default-features = false, features = ["wgpu", "wayland", "x11"] }
 egui = "0.31"
+egui-wgpu = "0.31"
 wgpu = "24"
 
 # Audio (consumed in Step 11). `cpal` speaks PipeWire on Linux
@@ -110,7 +111,7 @@ libc = "0.2"
 
 # Input (consumed in Steps 7 / 13)
 input-linux = "0.7"
-bluer = { version = "0.17", default-features = false, features = ["bluetoothd"] }
+bluer = { version = "0.17", default-features = false, features = ["bluetoothd", "l2cap"] }
 
 # Pure-Rust ADB client (Step 16). Replaces the `Command::new("adb")`
 # shell-outs from `pair_host_via_adb` etc. with structured calls
@@ -135,14 +136,17 @@ wl-clipboard-rs = "0.9"
 # CLI
 clap = { version = "4", features = ["derive"] }
 
-# Ferricast — sibling project at ../../ferricast. Wired here (Step 5):
-# the encoder facade carries H.264 + HEVC (`nvenc-hevc` / `vaapi-hevc`),
-# the decoder carries H.264 + HEVC NVDEC and a VA-API HEVC scaffold.
+# Ferricast — sibling project. Wired here (Step 5): the encoder
+# facade carries H.264 + HEVC (`nvenc-hevc` / `vaapi-hevc`), the
+# decoder carries H.264 + HEVC NVDEC and a VA-API HEVC scaffold.
 # `default-features = false` keeps fdk-aac / wayland-direct / etc out
-# of the link until Step 11 explicitly turns them on.
-ferricast-core = { path = "../../ferricast/crates/core" }
-ferricast-encoder = { path = "../../ferricast/crates/encoder", default-features = false, features = ["openh264", "vaapi", "nvenc", "nvenc-hevc", "vaapi-hevc"] }
-ferricast-decoder = { path = "../../ferricast/crates/decoder", default-features = false, features = ["openh264-decode", "nvdec-decode", "nvdec-hevc-decode", "vaapi-hevc-decode"] }
+# of the link until Step 11 explicitly turns them on. Pinned to a
+# git rev so the nix sandbox build resolves the same source as the
+# dev shell — local `path = "../../ferricast/..."` overrides are
+# possible via `[patch.crates-io]` if needed.
+ferricast-core = { git = "https://github.com/SergioRibera/ferricast", rev = "db0f7531618242f9aa6f3deaa359694e949b27d3" }
+ferricast-encoder = { git = "https://github.com/SergioRibera/ferricast", rev = "db0f7531618242f9aa6f3deaa359694e949b27d3", default-features = false, features = ["openh264", "vaapi", "nvenc", "nvenc-hevc", "vaapi-hevc"] }
+ferricast-decoder = { git = "https://github.com/SergioRibera/ferricast", rev = "db0f7531618242f9aa6f3deaa359694e949b27d3", default-features = false, features = ["openh264-decode", "nvdec-decode", "nvdec-hevc-decode", "vaapi-hevc-decode"] }
 
 [profile.release]
 lto = "thin"

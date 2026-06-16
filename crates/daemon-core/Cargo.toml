@@ -29,3 +29,10 @@ tracing.workspace = true
 thiserror.workspace = true
 directories.workspace = true
 zbus.workspace = true
+libc.workspace = true
+
+[features]
+default = []
+# Pass-through to the input crate; daemon-core picks the factory at
+# runtime based on `DaemonConfig.input_backend`.
+bt-hid = ["ansync-input/bt-hid"]

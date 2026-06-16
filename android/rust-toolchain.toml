@@ -1,0 +1,13 @@
+[toolchain]
+# Matches the `sergioribera/rust-android:1.96-sdk-37.0` docker image,
+# which only ships the `1.96` toolchain with the android targets
+# pre-installed. Overrides the host workspace's `stable` pin (which
+# is fine for the desktop daemon but does not have the android
+# targets baked into the image).
+channel = "1.96"
+targets = [
+    "aarch64-linux-android",
+    "armv7-linux-androideabi",
+    "i686-linux-android",
+    "x86_64-linux-android",
+]

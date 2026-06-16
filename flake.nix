@@ -30,6 +30,7 @@
         let
           pkgs = import inputs.nixpkgs {
             inherit system;
+            config.allowUnfree = true;
             overlays = [ inputs.rust-overlay.overlays.default ];
           };
 
@@ -54,32 +55,31 @@
             # IPC
             dbus
 
-            # Audio (Step 11). `cpal` speaks PipeWire via the
-            # PipeWire-ALSA shim, so we need both `alsa-lib` (for
-            # `alsa-sys`'s pkg-config probe) and pipewire (for the
-            # native lib that the shim forwards to).
+            # Audio
             pipewire
             alsa-lib
 
             # Video (Steps 5 / 6)
             libva
             libva-utils
+            cudaPackages.cuda_cudart
 
-            # Camera (Step 10)
+            # Camera
             v4l-utils
 
-            # Filesystem (Step 9)
+            # Filesystem
             fuse3
 
-            # Bluetooth (Step 13)
+            # Bluetooth
             bluez
 
-            # GUI (Step 6) — wgpu + eframe runtime
+            # GUI — wgpu + eframe runtime
             wayland
+            libGL
             libxkbcommon
             vulkan-loader
 
-            # Clipboard (Step 12)
+            # Clipboard
             wl-clipboard
           ];
         in
@@ -88,18 +88,18 @@
             nativeBuildInputs = nativeBuildDeps;
             buildInputs = runtimeDeps;
 
-            shellHook = ''
-              echo "ansync dev shell — rust $(rustc --version 2>/dev/null | awk '{print $2}')"
-              echo "Run: cargo check --workspace"
-            '';
-
-            LD_LIBRARY_PATH = lib.makeLibraryPath runtimeDeps;
-
-            # bindgen (used transitively by ferricast's VA-API and NVDEC
-            # build scripts) needs libclang to parse system headers.
-            # Without LIBCLANG_PATH it falls back to scanning /usr/lib
-            # and panics inside a pure nix shell.
+            # `/run/opengl-driver/lib` ships the proprietary NVIDIA
+            # runtime libs on NixOS hosts with `hardware.nvidia.*`
+            # enabled — `libcuda.so.1` (required by NVDEC / NVENC) and
+            # `libnvidia-encode.so.1` among them. It MUST come first
+            # so the real driver shadows our nixpkgs `cuda_cudart`
+            # stub, otherwise ferricast's NVDEC backend falls back to
+            # openh264 (software) at runtime.
+            LD_LIBRARY_PATH = "/run/opengl-driver/lib:${lib.makeLibraryPath runtimeDeps}";
             LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+
+            BINDGEN_EXTRA_CLANG_ARGS =
+              "-isystem ${pkgs.glibc.dev}/include -I${pkgs.libclang.lib}/lib/clang/${pkgs.clang.version}/include";
           };
 
           packages = {

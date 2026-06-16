@@ -17,8 +17,9 @@ tracing.workspace = true
 
 input-linux = { workspace = true, optional = true }
 bluer = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true, features = ["rt", "sync", "time", "macros"] }
 
 [features]
 default = []
 uinput = ["dep:input-linux"]
-bt-hid = ["dep:bluer"]
+bt-hid = ["dep:bluer", "dep:tokio"]

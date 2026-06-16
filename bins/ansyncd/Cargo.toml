@@ -28,6 +28,7 @@ tracing-journald.workspace = true
 clap.workspace = true
 eframe.workspace = true
 egui.workspace = true
+libc.workspace = true
 
 [features]
 default = []

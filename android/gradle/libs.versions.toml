@@ -6,11 +6,15 @@
 [versions]
 agp = "8.13.0"
 kotlin = "1.9.22"
+# compileSdk + buildTools auto-installed by sdkmanager at build time
+# (see docker invocation in README). The image ships only NDK 30 +
+# SDK Platform 37.0 (preview minor); AGP 8.13.0 is only tested up to
+# compile SDK 36, so we install android-36 + build-tools 35 on top.
 compileSdk = "36"
 targetSdk = "34"
 minSdk = "26"
 buildTools = "35.0.0"
-ndk = "29.0.14033849"
+ndk = "30.0.14904198"
 java = "17"
 rustAndroid = "0.9.6"
 

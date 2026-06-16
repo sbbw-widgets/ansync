@@ -36,6 +36,7 @@ let
       pkg-config
       cmake
       clang
+      makeWrapper
     ];
 
     buildInputs = with pkgs; [
@@ -44,10 +45,12 @@ let
       alsa-lib
       libva
       libva-utils
+      cudaPackages.cuda_cudart
       v4l-utils
       fuse3
       bluez
       wayland
+      libGL
       libxkbcommon
       vulkan-loader
       wl-clipboard
@@ -57,6 +60,18 @@ let
   };
 
   cargoArtifacts = craneLib.buildDepsOnly commonArgs;
+
+  # Runtime libs the wrapped binary must dlopen — CUDA + NVENC come
+  # from `/run/opengl-driver/lib` on NixOS hosts with the proprietary
+  # NVIDIA driver, which MUST shadow our `cuda_cudart` stub.
+  runtimeLibs = with pkgs; [
+    libva
+    libGL
+    vulkan-loader
+    wayland
+    libxkbcommon
+    cudaPackages.cuda_cudart
+  ];
 in
 craneLib.buildPackage (commonArgs // {
   inherit cargoArtifacts;
@@ -65,11 +80,16 @@ craneLib.buildPackage (commonArgs // {
 
   # Embedded udev rule + systemd unit ship next to the binaries so
   # the NixOS module can install them with `pkg.passthru.contrib`.
+  # Wrap `ansyncd` so NVDEC / NVENC find the host's NVIDIA runtime;
+  # without this the daemon silently falls back to openh264 (software).
   postInstall = ''
     install -Dm0644 bins/ansyncd/contrib/60-ansync-uinput.rules \
       "$out/lib/udev/rules.d/60-ansync-uinput.rules"
     install -Dm0644 bins/ansyncd/contrib/ansyncd.service \
       "$out/lib/systemd/user/ansyncd.service"
+
+    wrapProgram "$out/bin/ansyncd" \
+      --prefix LD_LIBRARY_PATH : "/run/opengl-driver/lib:${lib.makeLibraryPath runtimeLibs}"
   '';
 
   meta = with lib; {

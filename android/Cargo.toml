@@ -41,7 +41,7 @@ ansync-core = { path = "../crates/core" }
 ansync-proto = { path = "../crates/proto" }
 ansync-crypto = { path = "../crates/crypto" }
 ansync-files = { path = "../crates/files" }
-ansync-pairing = { path = "../crates/pairing" }
+ansync-pairing = { path = "../crates/pairing", default-features = false }
 ansync-permissions = { path = "../crates/permissions" }
 ansync-transport = { path = "../crates/transport" }
 

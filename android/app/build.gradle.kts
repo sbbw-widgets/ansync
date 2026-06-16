@@ -51,6 +51,12 @@ android {
     composeOptions {
         kotlinCompilerExtensionVersion = libs.versions.composeCompiler.get()
     }
+
+    packaging {
+        jniLibs {
+            pickFirsts += setOf("**/libansync_companion_native.so")
+        }
+    }
 }
 
 // rust-android-gradle plugin: compiles `../Cargo.toml` to `.so` and
