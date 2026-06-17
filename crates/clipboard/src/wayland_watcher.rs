@@ -26,6 +26,7 @@ use std::thread::JoinHandle;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use wayland_client::{
     Connection, Dispatch, EventQueue, QueueHandle,
+    event_created_child,
     globals::{GlobalListContents, registry_queue_init},
     protocol::{wl_registry, wl_seat},
 };
@@ -190,6 +191,16 @@ impl Dispatch<ZwlrDataControlManagerV1, ()> for WatcherState {
 }
 
 impl Dispatch<ZwlrDataControlDeviceV1, ()> for WatcherState {
+    // `data_offer` (opcode 0) is a "constructor" event — the compositor
+    // is introducing a new `ZwlrDataControlOfferV1` object. The
+    // wayland-client runtime needs to know which Dispatch impl handles
+    // the child, otherwise it aborts the worker thread. The
+    // `event_created_child!` macro generates the trait method that
+    // routes the opcode → child object's dispatch data.
+    event_created_child!(WatcherState, ZwlrDataControlDeviceV1, [
+        0 => (ZwlrDataControlOfferV1, ()),
+    ]);
+
     fn event(
         state: &mut Self,
         _proxy: &ZwlrDataControlDeviceV1,
