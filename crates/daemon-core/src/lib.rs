@@ -214,6 +214,7 @@ impl Daemon {
         let mirrors = Arc::new(MirrorRegistry::default());
         let cameras = Arc::new(CameraRegistry::default());
         let audios = Arc::new(AudioRegistry::default());
+        let clipboard_sync = ClipboardSync::default();
         let action_handle = tokio::spawn(action_loop(
             action_rx,
             action_tx.clone(),
@@ -221,6 +222,7 @@ impl Daemon {
             cameras.clone(),
             audios.clone(),
             permissions.clone(),
+            clipboard_sync.clone(),
         ));
 
         let device_name = DeviceName(self.config.device_name.clone());
@@ -259,6 +261,7 @@ impl Daemon {
         let clip_watcher_handle = tokio::spawn(host_clipboard_watcher(
             mirrors.clone(),
             permissions.clone(),
+            clipboard_sync.clone(),
         ));
         let accept_handle = tokio::spawn(accept_loop(AcceptCtx {
             server,
@@ -274,6 +277,7 @@ impl Daemon {
             capabilities: self.config.capabilities,
             identity: identity.clone(),
             dbus_state: state.clone(),
+            clipboard_sync: clipboard_sync.clone(),
         }));
 
         wait_for_shutdown().await?;
@@ -339,6 +343,9 @@ struct AcceptCtx {
     /// Shared with the D-Bus surface so transitions emit
     /// `Device.State` PropertiesChanged + `Manager.DeviceConnectivityChanged`.
     dbus_state: Arc<DaemonState>,
+    /// Echo-loop guard shared with the host clipboard watcher (see
+    /// [`ClipboardSync`]).
+    clipboard_sync: ClipboardSync,
 }
 
 /// Per-peer mirror state: frame slot the decoder populates and the
@@ -454,6 +461,67 @@ impl CameraRegistry {
     }
 }
 
+/// Shared SHA-256 fingerprint of the most recent clipboard payload
+/// either side has handled. Used to short-circuit the host
+/// `wlr_data_control` watcher ↔ companion `OnPrimaryClipChangedListener`
+/// echo loop:
+///
+///   1. User copies in app X → host watcher fires → daemon reads
+///      content + fingerprint(F) → store F in [`ClipboardSync`] →
+///      push to companion.
+///   2. Companion `setPrimaryClip` → Android listener fires → pushes
+///      back to host.
+///   3. Host `clipboard_inbound_loop` receives → fingerprint(F') → if
+///      `F' == F` (which is normal in the round-trip case) skip the
+///      `wl-clipboard-rs::copy` write. That write would otherwise
+///      spawn a fresh selection holder process which *steals*
+///      ownership from app X, breaking the user's ability to paste
+///      rich MIMEs back into anything else.
+///
+/// Cleared implicitly by the next legitimate change in either
+/// direction. Read+update are non-atomic on purpose — racing between
+/// rapid clipboard changes is fine because the worst case is a single
+/// extra push, not a divergent state.
+#[derive(Default, Clone)]
+pub struct ClipboardSync {
+    last: Arc<StdMutex<Option<String>>>,
+}
+
+impl ClipboardSync {
+    pub fn matches(&self, fp: &str) -> bool {
+        self.last
+            .lock()
+            .ok()
+            .and_then(|g| g.clone())
+            .as_deref()
+            == Some(fp)
+    }
+
+    pub fn set(&self, fp: String) {
+        if let Ok(mut g) = self.last.lock() {
+            *g = Some(fp);
+        }
+    }
+}
+
+pub fn clipboard_fingerprint(content: &ClipboardContent) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    match content {
+        ClipboardContent::Text(s) => {
+            h.update(b"t:");
+            h.update(s.as_bytes());
+        }
+        ClipboardContent::Blob { mime, data } => {
+            h.update(b"b:");
+            h.update(mime.as_bytes());
+            h.update(b"\0");
+            h.update(data);
+        }
+    }
+    format!("{:x}", h.finalize())
+}
+
 impl MirrorRegistry {
     /// Get-or-create the entry. Slot survives multiple peer reconnects
     /// so the window can stay open while video pauses + resumes.
@@ -498,6 +566,7 @@ async fn action_loop(
     cameras: Arc<CameraRegistry>,
     audios: Arc<AudioRegistry>,
     permissions: Arc<dyn ansync_permissions::PermissionsStore>,
+    clipboard_sync: ClipboardSync,
 ) {
     while let Some(action) = rx.recv().await {
         match action {
@@ -528,7 +597,9 @@ async fn action_loop(
                 handle_stop_audio(&audios, &device).await;
             }
             DaemonAction::SyncClipboard { device } => {
-                if let Err(e) = push_clipboard_to_peer(&mirrors, &permissions, &device).await {
+                if let Err(e) =
+                    push_clipboard_to_peer(&mirrors, &permissions, &device, &clipboard_sync).await
+                {
                     warn!(%device, error = %e, "SyncClipboard failed");
                 }
             }
@@ -678,6 +749,7 @@ async fn accept_loop(ctx: AcceptCtx) {
                 let capabilities = ctx.capabilities;
                 let identity = ctx.identity.clone();
                 let dbus_state = ctx.dbus_state.clone();
+                let clipboard_sync = ctx.clipboard_sync.clone();
                 tokio::spawn(async move {
                     if let Err(e) = handle_connection(
                         conn,
@@ -693,6 +765,7 @@ async fn accept_loop(ctx: AcceptCtx) {
                         capabilities,
                         identity,
                         dbus_state,
+                        clipboard_sync,
                     )
                     .await
                     {
@@ -722,6 +795,7 @@ async fn handle_connection(
     capabilities: Capabilities,
     identity: IdentityKeypair,
     dbus_state: Arc<DaemonState>,
+    clipboard_sync: ClipboardSync,
 ) -> Result<(), DaemonError> {
     let pubkey = conn.peer_identity().as_bytes();
     let mut id_bytes = [0u8; 16];
@@ -826,7 +900,8 @@ async fn handle_connection(
             StreamKind::Clipboard => {
                 let pid = peer_id.clone();
                 let perms = permissions.clone();
-                tokio::spawn(clipboard_inbound_loop(stream, pid, perms));
+                let sync = clipboard_sync.clone();
+                tokio::spawn(clipboard_inbound_loop(stream, pid, perms, sync));
             }
             StreamKind::Notifications => {
                 let pid = peer_id.clone();
@@ -1118,6 +1193,7 @@ async fn clipboard_inbound_loop(
     mut stream: QuicStream,
     peer_id: DeviceId,
     permissions: Arc<dyn ansync_permissions::PermissionsStore>,
+    sync: ClipboardSync,
 ) {
     let backend = WaylandClipboard::new();
     loop {
@@ -1148,6 +1224,18 @@ async fn clipboard_inbound_loop(
             ClipboardMessage::Text { content } => ClipboardContent::Text(content),
             ClipboardMessage::Blob { mime, data } => ClipboardContent::Blob { mime, data },
         };
+        // Echo guard: if the inbound payload is exactly what we just
+        // pushed outbound, skip the write. `wl-clipboard-rs::copy`
+        // spawns a fresh selection-owner process — re-writing would
+        // steal ownership from whichever app was offering the
+        // original (typically the same app the user just copied
+        // from), so they could no longer paste rich MIMEs anywhere.
+        let fp = clipboard_fingerprint(&content);
+        if sync.matches(&fp) {
+            debug!(%peer_id, "skipping inbound clipboard write — matches outbound fingerprint");
+            continue;
+        }
+        sync.set(fp);
         if let Err(e) = backend.write(content).await {
             warn!(%peer_id, error = %e, "WaylandClipboard write failed");
         }
@@ -1227,6 +1315,7 @@ async fn push_clipboard_to_peer(
     mirrors: &MirrorRegistry,
     permissions: &Arc<dyn ansync_permissions::PermissionsStore>,
     device: &DeviceId,
+    sync: &ClipboardSync,
 ) -> Result<(), DaemonError> {
     if !permissions
         .check(device, Permission::ClipboardOut)
@@ -1253,6 +1342,10 @@ async fn push_clipboard_to_peer(
             return Ok(());
         }
     };
+    // Stash the fingerprint so the companion's auto-push back doesn't
+    // re-write our own clipboard (which would steal selection
+    // ownership from whatever app was offering — see ClipboardSync).
+    sync.set(clipboard_fingerprint(&content));
     let msg = match content {
         ClipboardContent::Text(s) => ClipboardMessage::Text { content: s },
         ClipboardContent::Blob { mime, data } => ClipboardMessage::Blob { mime, data },
@@ -2018,6 +2111,7 @@ async fn companion_watcher(state: Arc<DaemonState>, conn: Arc<zbus::Connection>)
 async fn host_clipboard_watcher(
     mirrors: Arc<MirrorRegistry>,
     permissions: Arc<dyn ansync_permissions::PermissionsStore>,
+    sync: ClipboardSync,
 ) {
     let mut watcher = match ansync_clipboard::WaylandClipboardWatcher::start() {
         Ok(w) => w,
@@ -2053,7 +2147,23 @@ async fn host_clipboard_watcher(
                 Err(_) => break,
             }
         }
-        // Fan out to every connected peer with ClipboardOut on.
+        // Read once, fingerprint once, fan out: avoids re-reading the
+        // Wayland clipboard per peer and lets the echo guard short-
+        // circuit when the change originated from an inbound paste.
+        let backend = WaylandClipboard::new();
+        let content = match backend.read().await {
+            Ok(c) => c,
+            Err(e) => {
+                debug!(error = %e, "host clipboard read failed; skipping fan-out");
+                continue;
+            }
+        };
+        let fp = clipboard_fingerprint(&content);
+        if sync.matches(&fp) {
+            debug!("clipboard watcher fired but content matches last inbound; not pushing");
+            continue;
+        }
+        sync.set(fp);
         for (id, _entry) in mirrors.entries() {
             match permissions.check(&id, Permission::ClipboardOut).await {
                 Ok(true) => {}
@@ -2063,9 +2173,41 @@ async fn host_clipboard_watcher(
                     continue;
                 }
             }
-            if let Err(e) = push_clipboard_to_peer(&mirrors, &permissions, &id).await {
+            if let Err(e) =
+                send_clipboard_content_to_peer(&mirrors, &id, content.clone()).await
+            {
                 warn!(%id, error = %e, "auto-push clipboard failed");
             }
         }
     }
+}
+
+/// Push pre-read clipboard content to a peer without re-reading the
+/// host's clipboard. Used by the watcher fan-out so all peers see the
+/// same snapshot and the watcher's echo guard fingerprint stays
+/// coherent.
+async fn send_clipboard_content_to_peer(
+    mirrors: &MirrorRegistry,
+    device: &DeviceId,
+    content: ClipboardContent,
+) -> Result<(), DaemonError> {
+    let mirror = mirrors
+        .get(device)
+        .ok_or_else(|| DaemonError::Startup(format!("no mirror entry for {device}")))?;
+    let conn = mirror
+        .conn
+        .lock()
+        .expect("conn slot poisoned")
+        .clone()
+        .ok_or_else(|| DaemonError::Startup(format!("peer {device} not connected")))?;
+    let msg = match content {
+        ClipboardContent::Text(s) => ClipboardMessage::Text { content: s },
+        ClipboardContent::Blob { mime, data } => ClipboardMessage::Blob { mime, data },
+    };
+    let mut stream = conn.open(StreamKind::Clipboard).await?;
+    let bytes = postcard::to_allocvec(&msg)
+        .map_err(|e| DaemonError::Startup(format!("encode ClipboardMessage: {e}")))?;
+    stream.send(bytes::Bytes::from(bytes)).await?;
+    info!(%device, "host clipboard pushed (auto)");
+    Ok(())
 }
