@@ -316,11 +316,10 @@ Gaps identificados al cerrar el roadmap. Ordenados por severidad. Cada uno es bo
 
 ### v1 known-limitations aceptables (UX polish)
 
-- [ ] **R3 — Clipboard bidi listener-driven (sin UI)**
-  - U4a dropeó `MainActivity` → botón manual ya no aplica. Reframe: clipboard fluye en ambas direcciones automático, perms los maneja la PC.
-  - Companion → host: `ClipboardManager.OnPrimaryClipChangedListener` registrado en `ClipboardBridge.start()` dispara `pushToHost()` en cada cambio. Android otorga todo lo que pide → companion side sin gate, host lo descarta vía `ClipboardIn` si está off.
-  - Host → companion: ya wired (`SyncClipboard` D-Bus + `clipboard_in_loop` con gate `ClipboardOut` host-side).
-  - Files: `android/app/src/main/java/.../ClipboardBridge.kt` (~10 líneas: addPrimaryClipChangedListener + removePrimaryClipChangedListener en stop()).
+- [x] **R3 — Clipboard bidi listener-driven (sin UI)**
+  - `ClipboardBridge.start()` ahora registra `ClipboardManager.OnPrimaryClipChangedListener` que llama `pushToHost()` en cada cambio. `stop()` desregistra. Companion side sin gate (Android otorga todo); host decide via `ClipboardIn`/`ClipboardOut`.
+  - Echo guard: `lastFingerprint` (`"t:<text>"` para plain, `"u:<uri>"` para image MediaStore URI) seteado antes de cada `setPrimaryClip` inbound. Listener compara antes de pushear → cero ping-pong.
+  - Host → companion ya wired desde Step 12 (`SyncClipboard` D-Bus + `clipboard_in_loop`).
 
 - [x] **R5 — SAF FS mutaciones (cerrar Step 9e)**
   - `AnsyncFsServer` retorna ENOSYS para `write/create/unlink/rename/truncate/chmod`. Implementar usando `DocumentsContract.createDocument` / `deleteDocument` / `renameDocument` / `OutputStream` via `openOutputStream(uri, "w" | "wa" | "rwt")`. `chmod` deja `ENOSYS` (SAF no expone modes — limitación intencional).

@@ -11,25 +11,41 @@ import java.nio.ByteOrder
 import kotlin.concurrent.thread
 
 /**
- * Drains the host→device clipboard channel into the Android
- * `ClipboardManager`. Started by `AnsyncCompanionService`; stops
- * when the JNI poll returns `null` (session torn down).
+ * Bidirectional clipboard sync.
  *
- * Privacy: every paste lands in the Android global clipboard, so
- * the user's other apps will see it. The host side already gates
- * outbound clipboard on `Permission::ClipboardOut`, so a peer can't
- * push without an explicit "Allow" earlier.
+ * **Host → device** (inbound): two worker threads drain
+ * [NativeBridge.nativePollClipboardText] / `nativePollClipboardBlob`
+ * and call [ClipboardManager.setPrimaryClip].
+ *
+ * **Device → host** (outbound): an [ClipboardManager.OnPrimaryClipChangedListener]
+ * registered at [start] auto-pushes every clipboard change. Permission
+ * gating lives entirely on the host — the daemon's
+ * `clipboard_inbound_loop` checks `Permission::ClipboardIn` per chunk,
+ * so the companion can blindly push everything it sees without
+ * leaking anything the user didn't explicitly allow on the host.
+ *
+ * **Echo avoidance**: setting the primary clip (from either an
+ * inbound paste or pushToHost being re-called) fires the listener
+ * synchronously. A single-string fingerprint (`"t:<text>"` for plain
+ * text or `"u:<uri>"` for images) lets us skip the redundant push.
  */
 class ClipboardBridge(private val context: Context) {
     @Volatile private var running = false
     private var textThread: Thread? = null
     private var blobThread: Thread? = null
+    private var listener: ClipboardManager.OnPrimaryClipChangedListener? = null
+    @Volatile private var lastFingerprint: String? = null
 
     fun start() {
         if (running) return
         running = true
+        val mgr = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        val cb = ClipboardManager.OnPrimaryClipChangedListener {
+            onPrimaryClipChanged()
+        }
+        mgr.addPrimaryClipChangedListener(cb)
+        listener = cb
         textThread = thread(name = "ansync-clipboard-text") {
-            val mgr = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
             while (running) {
                 val text = NativeBridge.nativePollClipboardText()
                 if (text == null) {
@@ -38,6 +54,7 @@ class ClipboardBridge(private val context: Context) {
                     try { Thread.sleep(500) } catch (_: InterruptedException) {}
                     continue
                 }
+                lastFingerprint = textFingerprint(text)
                 val clip = ClipData.newPlainText("ansync", text)
                 try {
                     mgr.setPrimaryClip(clip)
@@ -47,7 +64,6 @@ class ClipboardBridge(private val context: Context) {
             }
         }
         blobThread = thread(name = "ansync-clipboard-blob") {
-            val mgr = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
             while (running) {
                 val blob = NativeBridge.nativePollClipboardBlob()
                 if (blob == null) {
@@ -70,16 +86,39 @@ class ClipboardBridge(private val context: Context) {
 
     fun stop() {
         running = false
+        listener?.let {
+            try {
+                (context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager)
+                    .removePrimaryClipChangedListener(it)
+            } catch (e: Exception) {
+                Log.w(TAG, "removePrimaryClipChangedListener threw", e)
+            }
+        }
+        listener = null
         textThread?.join(TIMEOUT_JOIN_MS)
         blobThread?.join(TIMEOUT_JOIN_MS)
         textThread = null
         blobThread = null
     }
 
+    private fun onPrimaryClipChanged() {
+        if (!running) return
+        val fingerprint = currentFingerprint() ?: return
+        if (fingerprint == lastFingerprint) return
+        lastFingerprint = fingerprint
+        try {
+            pushToHost()
+        } catch (e: Exception) {
+            Log.w(TAG, "pushToHost threw", e)
+        }
+    }
+
     /**
-     * Push the device's current clipboard text to the host. Returns
-     * `false` if the clipboard is empty or non-text — callers should
-     * surface that to the UI rather than retry.
+     * Push the device's current clipboard to the host. Auto-invoked
+     * by the [ClipboardManager.OnPrimaryClipChangedListener] on every
+     * change; safe to call manually too. Returns `false` if the
+     * clipboard is empty or has an unsupported MIME — callers should
+     * not retry.
      */
     fun pushToHost(): Boolean {
         val mgr = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
@@ -100,6 +139,20 @@ class ClipboardBridge(private val context: Context) {
         val text = item.coerceToText(context)?.toString() ?: return false
         return NativeBridge.nativeSendClipboardText(text)
     }
+
+    private fun currentFingerprint(): String? {
+        val mgr = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        val clip = mgr.primaryClip ?: return null
+        if (clip.itemCount == 0) return null
+        val item = clip.getItemAt(0)
+        val uri = item.uri
+        if (uri != null) return uriFingerprint(uri.toString())
+        val text = item.coerceToText(context)?.toString() ?: return null
+        return textFingerprint(text)
+    }
+
+    private fun textFingerprint(text: String): String = "t:$text"
+    private fun uriFingerprint(uri: String): String = "u:$uri"
 
     private fun decodeBlob(buf: ByteArray): Pair<String, ByteArray>? {
         if (buf.size < 4) return null
@@ -129,6 +182,7 @@ class ClipboardBridge(private val context: Context) {
                 return
             }
         resolver.openOutputStream(uri)?.use { it.write(data) }
+        lastFingerprint = uriFingerprint(uri.toString())
         val clip = ClipData.newUri(resolver, "ansync", uri)
         mgr.setPrimaryClip(clip)
     }
