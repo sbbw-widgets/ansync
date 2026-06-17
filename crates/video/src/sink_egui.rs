@@ -61,6 +61,25 @@ pub struct MirrorSlot {
     /// later — overwriting the handle is fine, both contexts share
     /// the same wgpu device.
     ctx: Mutex<Option<egui::Context>>,
+    /// Flipped by `request_show()` when the daemon wants the window
+    /// back on screen after a previous hide. Consumed in `update` by
+    /// firing `Visible(true)` + `Focus`. We don't reuse winit event
+    /// loops across `run` calls — winit/Wayland panics on a second
+    /// `EventLoop::build` per process — so the window thread stays
+    /// alive across hide/show and this atomic toggles the viewport
+    /// visibility instead.
+    show_request: AtomicBool,
+    /// Outbound input pipe. Daemon-core replaces this each ShowScreen
+    /// because the underlying QUIC stream is bound to the current
+    /// peer connection. `MirrorApp::update` pulls a fresh clone every
+    /// frame so input keeps flowing after a hide/show toggle.
+    input_tx: Mutex<Option<UnboundedSender<InputMessage>>>,
+    /// Daemon-core installs the sender each ShowScreen so the app can
+    /// notify it when the user clicks the window's X. The app does NOT
+    /// exit `eframe::run_native` — it cancels the close and hides the
+    /// viewport — so this is the only path for HideScreen to fire
+    /// without a D-Bus call.
+    close_tx: Mutex<Option<UnboundedSender<()>>>,
 }
 
 impl MirrorSlot {
@@ -68,6 +87,52 @@ impl MirrorSlot {
         Self {
             inner: Mutex::new(None),
             ctx: Mutex::new(None),
+            show_request: AtomicBool::new(false),
+            input_tx: Mutex::new(None),
+            close_tx: Mutex::new(None),
+        }
+    }
+
+    /// Ask the running window to reveal + focus on its next paint.
+    /// Wakes egui via the cached context so the request lands without
+    /// waiting for a frame from the producer.
+    pub fn request_show(&self) {
+        self.show_request.store(true, Ordering::Relaxed);
+        if let Ok(ctx) = self.ctx.lock() {
+            if let Some(ctx) = ctx.as_ref() {
+                ctx.request_repaint();
+            }
+        }
+    }
+
+    pub fn set_input_tx(&self, tx: Option<UnboundedSender<InputMessage>>) {
+        if let Ok(mut g) = self.input_tx.lock() {
+            *g = tx;
+        }
+    }
+
+    pub fn set_close_tx(&self, tx: Option<UnboundedSender<()>>) {
+        if let Ok(mut g) = self.close_tx.lock() {
+            *g = tx;
+        }
+    }
+
+    fn take_show_request(&self) -> bool {
+        self.show_request.swap(false, Ordering::Relaxed)
+    }
+
+    fn input_tx_clone(&self) -> Option<UnboundedSender<InputMessage>> {
+        self.input_tx
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().cloned())
+    }
+
+    fn notify_close(&self) {
+        if let Ok(g) = self.close_tx.lock() {
+            if let Some(tx) = g.as_ref() {
+                let _ = tx.send(());
+            }
         }
     }
 
@@ -109,11 +174,7 @@ pub fn new_slot() -> FrameSlot {
 /// Block the calling thread on `eframe::run_native`. Spawn this on a
 /// dedicated thread when the caller wants the daemon to keep running
 /// alongside the window — winit on Linux is happy on any thread.
-pub fn run(
-    title: String,
-    slot: FrameSlot,
-    input_tx: Option<UnboundedSender<InputMessage>>,
-) -> Result<(), Box<dyn std::error::Error>> {
+pub fn run(title: String, slot: FrameSlot) -> Result<(), Box<dyn std::error::Error>> {
     // The mirror window is spawned from `daemon-core::action_loop` on
     // a dedicated thread, which winit/eframe normally refuses on
     // Linux (X11 + Wayland event loops insist on the main thread).
@@ -202,7 +263,7 @@ pub fn run(
             // returning so the very first frame doesn't get stranded
             // waiting for an event-driven repaint.
             slot.attach_ctx(cc.egui_ctx.clone());
-            Ok(Box::new(MirrorApp::new(slot, input_tx)))
+            Ok(Box::new(MirrorApp::new(slot)))
         }),
     )
     .map_err(|e| format!("eframe: {e}").into())
@@ -212,7 +273,6 @@ pub struct MirrorApp {
     slot: FrameSlot,
     last_size: Option<(u32, u32)>,
     last_format: Option<PixelFormat>,
-    input_tx: Option<UnboundedSender<InputMessage>>,
     last_pointer: Option<egui::Pos2>,
     /// `Gilrs` reads /dev/input/event* under the hood, so we keep one
     /// instance for the lifetime of the window and poll it each
@@ -245,7 +305,7 @@ const GP_BIT_THUMBL: u32 = 1 << 9;
 const GP_BIT_THUMBR: u32 = 1 << 10;
 
 impl MirrorApp {
-    pub fn new(slot: FrameSlot, input_tx: Option<UnboundedSender<InputMessage>>) -> Self {
+    pub fn new(slot: FrameSlot) -> Self {
         let gilrs = match gilrs::Gilrs::new() {
             Ok(g) => Some(g),
             Err(e) => {
@@ -257,7 +317,6 @@ impl MirrorApp {
             slot,
             last_size: None,
             last_format: None,
-            input_tx,
             last_pointer: None,
             gilrs,
             gamepad: GamepadState {
@@ -414,6 +473,25 @@ fn map_gilrs_button(b: gilrs::Button) -> Option<u32> {
 
 impl eframe::App for MirrorApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Honour a daemon-side re-show after the user previously closed.
+        // The window thread never actually exits — winit/Wayland forbids
+        // a second `EventLoop::build` per process — so reopening the
+        // mirror means flipping the viewport back to visible.
+        if self.slot.take_show_request() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
+        // Intercept the user's X-click: don't let eframe tear the
+        // event loop down. Hide the viewport, notify the daemon so it
+        // can tell the companion to stop encoding, and short-circuit
+        // the rest of this paint (the panel is about to vanish anyway).
+        let close_req = ctx.input(|i| i.viewport().close_requested());
+        if close_req {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            self.slot.notify_close();
+            return;
+        }
         let taken = self.slot.take();
         if let Some(f) = &taken {
             let size = (f.width, f.height);
@@ -486,13 +564,18 @@ impl eframe::App for MirrorApp {
                 });
             }
         });
+        // Pull a fresh input handle each frame. Daemon-core replaces
+        // the slot's sender on every ShowScreen because the underlying
+        // QUIC stream is per-peer-connection, so a hide/show cycle
+        // through a reconnect lands a new sender here without the app
+        // ever caring.
+        let input_tx = self.slot.input_tx_clone();
         if let (Some(rect), Some((fw, fh)), Some(tx)) =
-            (hit_rect, cur_dims, self.input_tx.as_ref())
+            (hit_rect, cur_dims, input_tx.as_ref())
         {
             emit_pointer_events(ctx, &mut self.last_pointer, rect, fw, fh, tx);
         }
-        let tx_clone = self.input_tx.clone();
-        if let Some(tx) = tx_clone.as_ref() {
+        if let Some(tx) = input_tx.as_ref() {
             emit_keyboard_events(ctx, tx);
             self.poll_and_emit_gamepad(tx);
             // gilrs is poll-driven, not event-driven, so we need

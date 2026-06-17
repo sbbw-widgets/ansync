@@ -358,12 +358,21 @@ pub struct MirrorRegistry {
 pub struct MirrorEntry {
     pub slot: FrameSlot,
     pub peer_name: String,
-    /// `Some` while a window thread is alive; cleared on HideScreen.
+    /// `Some` once the window thread has been spawned. Never cleared:
+    /// winit/Wayland panics on a second `EventLoop::build` per
+    /// process, so the thread stays alive across hide/show and the
+    /// viewport flips visibility via `slot.request_show()` instead.
     window: StdMutex<Option<std::thread::JoinHandle<()>>>,
     /// `Some` while the peer is connected. `action_loop` reads this
     /// to open an outbound Input stream on ShowScreen. Cleared by
     /// `handle_connection` on disconnect.
     pub conn: StdMutex<Option<Arc<QuicConnection>>>,
+    /// Flipped to `true` by `video_stream_loop` on the first chunk
+    /// from the peer; cleared on stream close. ShowScreen consults
+    /// this to decide whether to push a `RequestScreenCapture` to the
+    /// companion — when the tile-driven path is already streaming we
+    /// must NOT re-ask the user for MediaProjection consent.
+    pub video_inbound: std::sync::atomic::AtomicBool,
 }
 
 /// Per-peer audio pipeline state. Like `CameraRegistry`, but with
@@ -535,6 +544,7 @@ impl MirrorRegistry {
                     peer_name: name.to_string(),
                     window: StdMutex::new(None),
                     conn: StdMutex::new(None),
+                    video_inbound: std::sync::atomic::AtomicBool::new(false),
                 })
             })
             .clone()
@@ -647,15 +657,9 @@ async fn action_loop(
                     warn!(%device, "ShowScreen: no mirror entry (peer not connected?)");
                     continue;
                 };
-                {
-                    let guard = entry.window.lock().expect("window slot poisoned");
-                    if guard.is_some() {
-                        debug!(%device, "ShowScreen: window already up");
-                        continue;
-                    }
-                }
-                // Open the outbound Input stream so pointer events
-                // from the host window land on the peer.
+                // Always (re)install the outbound Input pipe on the
+                // slot — daemon-core spins one per ShowScreen because
+                // the underlying QUIC stream is per-connection.
                 let conn = entry.conn.lock().expect("conn slot poisoned").clone();
                 let input_tx = if let Some(conn) = conn.clone() {
                     match conn.open(StreamKind::Input).await {
@@ -673,61 +677,72 @@ async fn action_loop(
                     warn!(%device, "ShowScreen: no live connection; window will be view-only");
                     None
                 };
-                // Ask the companion to actually start the capture pipe
-                // (MediaProjection grant + MediaCodec encoder + Video
-                // stream open). Without this the window stays blank
-                // until the user manually taps a tile on the device.
-                if let Some(conn) = conn {
-                    if let Err(e) = send_request_capture(&conn).await {
-                        warn!(%device, error = %e, "RequestScreenCapture send failed");
+                entry.slot.set_input_tx(input_tx);
+                // Only push RequestScreenCapture when the companion
+                // isn't already streaming. The tile-driven path opens
+                // Video first; pushing RequestScreenCapture there would
+                // re-pop the MediaProjection picker even though capture
+                // is live.
+                if !entry.video_inbound.load(std::sync::atomic::Ordering::Relaxed) {
+                    if let Some(conn) = conn {
+                        if let Err(e) = send_request_capture(&conn).await {
+                            warn!(%device, error = %e, "RequestScreenCapture send failed");
+                        }
                     }
                 }
+                // Thread already alive (any prior ShowScreen on this
+                // process) → just flip the viewport back to visible
+                // and focus. winit/Wayland forbids re-creating the
+                // event loop, so we never spawn a second one.
+                let already_alive = entry.window.lock().expect("window slot poisoned").is_some();
+                if already_alive {
+                    entry.slot.request_show();
+                    info!(%device, "ShowScreen: existing window revealed");
+                    continue;
+                }
+                // First show this process: spawn the window thread.
+                // Install a close-notifier channel so the user's X-click
+                // becomes a HideScreen action (the thread itself never
+                // exits — the app cancels close + hides the viewport).
+                let (close_tx, mut close_rx) = unbounded_channel::<()>();
+                entry.slot.set_close_tx(Some(close_tx));
                 let slot = entry.slot.clone();
                 let title = format!("ansync — {}", entry.peer_name);
-                // When the user closes the window we get no D-Bus
-                // HideScreen, so the companion would keep capturing
-                // and burning battery. Forward the run-exit through
-                // the action queue so HideScreen runs with the same
-                // teardown path as a D-Bus call.
-                let exit_tx = self_tx.clone();
-                let exit_device = device.clone();
                 let handle = std::thread::Builder::new()
                     .name(format!("ansync-mirror-{device}"))
                     .spawn(move || {
-                        if let Err(e) = ansync_video::sink_egui::run(title, slot, input_tx) {
+                        if let Err(e) = ansync_video::sink_egui::run(title, slot) {
                             warn!(error = %e, "mirror window exited with error");
                         }
-                        // Notify the action loop that the user closed
-                        // the window. Errors here just mean the
-                        // daemon is shutting down — ignore.
-                        let _ = exit_tx.send(DaemonAction::HideScreen { device: exit_device });
                     })
                     .ok();
                 *entry.window.lock().expect("window slot poisoned") = handle;
+                let exit_tx = self_tx.clone();
+                let exit_device = device.clone();
+                tokio::spawn(async move {
+                    while close_rx.recv().await.is_some() {
+                        let _ = exit_tx.send(DaemonAction::HideScreen {
+                            device: exit_device.clone(),
+                        });
+                    }
+                });
                 info!(%device, "ShowScreen: window spawned");
             }
             DaemonAction::HideScreen { device } => {
                 let Some(entry) = mirrors.get(&device) else {
                     continue;
                 };
-                // eframe doesn't expose a clean external close API; the
-                // user closes the window. Just clear our handle so the
-                // next ShowScreen can re-open. The thread terminates
-                // when the user closes the window. Scope the StdMutex
-                // guard so it drops before any `await`.
-                {
-                    let mut guard = entry.window.lock().expect("window slot poisoned");
-                    *guard = None;
-                }
-                // Tell the companion to drop the encoder + projection
-                // too so the device's foreground notification clears.
+                // Leave `entry.window` populated so the next
+                // ShowScreen reuses the same winit event loop. Just
+                // tell the companion to drop encoder + projection so
+                // the device's foreground notification clears.
                 let conn = entry.conn.lock().expect("conn slot poisoned").clone();
                 if let Some(conn) = conn {
                     if let Err(e) = send_stop_capture(&conn).await {
                         warn!(%device, error = %e, "StopScreenCapture send failed");
                     }
                 }
-                info!(%device, "HideScreen: handle cleared");
+                info!(%device, "HideScreen: companion notified, window kept hidden");
             }
         }
     }
@@ -882,9 +897,25 @@ async fn handle_connection(
                 tokio::spawn(files_stream_loop(stream, peer_id_inbound, perms, policy));
             }
             StreamKind::Video => {
-                let slot = mirror_entry.slot.clone();
+                let entry = mirror_entry.clone();
                 let pid = peer_id.clone();
-                tokio::spawn(video_stream_loop(stream, slot, pid));
+                // Mark the entry as already receiving BEFORE handing
+                // ShowScreen off to action_loop — otherwise the action
+                // handler's `video_inbound` check could fire on a
+                // false negative and push a needless
+                // RequestScreenCapture (which re-pops the
+                // MediaProjection picker on the device).
+                entry
+                    .video_inbound
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                // Companion-initiated mirror (QSTile MediaProjection
+                // grant) opens Video before the host has any reason
+                // to know. Fire ShowScreen so the window pops without
+                // requiring a D-Bus call.
+                if let Some(tx) = dbus_state.actions.as_ref() {
+                    let _ = tx.send(DaemonAction::ShowScreen { device: pid.clone() });
+                }
+                tokio::spawn(video_stream_loop(stream, entry, pid));
             }
             StreamKind::Camera => {
                 let entry = camera_entry.clone();
@@ -1788,7 +1819,11 @@ async fn input_writer_loop(
     info!(%peer_id, "input writer channel closed");
 }
 
-async fn video_stream_loop(mut stream: QuicStream, slot: FrameSlot, peer_id: DeviceId) {
+async fn video_stream_loop(
+    mut stream: QuicStream,
+    entry: Arc<MirrorEntry>,
+    peer_id: DeviceId,
+) {
     // Initial dimension hint is rewritten by SPS on the first IDR;
     // 1080p is a safe upper bound for the NVDEC / VA-API surface pools.
     let mut decoder = match HostDecoder::configure(VideoCodec::H264, 1920, 1080) {
@@ -1799,6 +1834,22 @@ async fn video_stream_loop(mut stream: QuicStream, slot: FrameSlot, peer_id: Dev
         }
     };
     info!(%peer_id, "video stream wired");
+    let slot = entry.slot.clone();
+    // Clear the inbound flag whenever the stream goes away so a
+    // future ShowScreen does ask the companion to capture again.
+    struct InboundGuard {
+        entry: Arc<MirrorEntry>,
+    }
+    impl Drop for InboundGuard {
+        fn drop(&mut self) {
+            self.entry
+                .video_inbound
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    let _guard = InboundGuard {
+        entry: entry.clone(),
+    };
     // Diagnostics so the user can tell whether the silence is on
     // the wire (no chunks) or the decoder (chunks arriving but
     // never producing a frame). Printed at info level so they show

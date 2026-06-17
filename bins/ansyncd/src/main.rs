@@ -64,7 +64,7 @@ fn run_play_file(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let shared = ansync_video::sink_egui::new_slot();
     mirror_window::spawn_play_file(&runtime, path, shared.clone());
-    let result = ansync_video::sink_egui::run("ansync mirror".into(), shared, None);
+    let result = ansync_video::sink_egui::run("ansync mirror".into(), shared);
     drop(runtime);
     result
 }
