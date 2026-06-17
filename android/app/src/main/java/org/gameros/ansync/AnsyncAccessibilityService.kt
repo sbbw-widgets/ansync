@@ -217,17 +217,18 @@ class AnsyncAccessibilityService : AccessibilityService() {
     //
     //   * Cursor overlay tracks the host pointer in real time so the
     //     operator sees their PC mouse move with zero perceived
-    //     latency.
+    //     latency on the device.
     //
     //   * The actual `dispatchGesture` is BUFFERED. We collect every
     //     (x, y, tMs) sample we receive while the finger is "down"
-    //     and dispatch ONE atomic gesture on release. Yes, this means
-    //     the receiving app sees no touch motion until the user lifts
-    //     — but the gesture that fires is a real continuous drag
-    //     (single ACTION_DOWN → many ACTION_MOVE → ACTION_UP), which
-    //     is what apps actually need. The sequential / continueStroke
-    //     chain experiments turned every move into a fresh tap on
-    //     Lenovo's accessibility skin, which is much worse.
+    //     and dispatch ONE atomic gesture on release. The receiving
+    //     app sees a single continuous touch session
+    //     (ACTION_DOWN → many ACTION_MOVE → ACTION_UP), which is
+    //     what apps actually need. Realtime continueStroke chaining
+    //     was tried twice (sequential + fire-and-forget with long
+    //     windows) and both turned into a fresh tap per event on
+    //     Lenovo's accessibility skin — far worse than the delayed
+    //     gesture.
     //
     // Visual feedback (cursor) + correct-but-delayed gesture gives
     // the closest UX to scrcpy that's possible without root.
@@ -242,8 +243,6 @@ class AnsyncAccessibilityService : AccessibilityService() {
         val y = sy.coerceAtLeast(0f)
         val now = android.os.SystemClock.uptimeMillis()
 
-        // Cursor always tracks the host pointer in real time,
-        // regardless of whether a gesture is in flight.
         cursor?.let {
             if (release) {
                 it.setPressed(false)
@@ -279,8 +278,8 @@ class AnsyncAccessibilityService : AccessibilityService() {
         val path = Path().apply { moveTo(first.x, first.y) }
         if (pts.size == 1) {
             // Pure tap: 1-pixel nudge so the path has non-zero
-            // geometry (Android's gesture validator rejects degenerate
-            // paths outright on some OEM builds).
+            // geometry (Android's gesture validator rejects
+            // degenerate paths outright on some OEM builds).
             path.lineTo(first.x + 1f, first.y)
         } else {
             for (i in 1 until pts.size) {
@@ -339,7 +338,7 @@ class AnsyncAccessibilityService : AccessibilityService() {
         private const val TAG = "ansync.access"
         private const val RETRY_DELAY_MS = 500L
         // Pure-tap duration. Long enough for touch consumers to
-        // register the press without it being mistaken for a long
+        // register the press without being mistaken for a long
         // press.
         private const val TAP_DURATION_MS = 60L
         // Floor on drag duration so a very fast flick still produces
