@@ -731,15 +731,28 @@ async fn action_loop(
                 let exit_tx = self_tx.clone();
                 let exit_device = device.clone();
                 let entry_for_spawn = entry.clone();
+                let entry_for_exit = entry.clone();
                 match spawn_mirror_subprocess(
                     title,
                     entry_for_spawn,
                     input_tx,
                     move || {
                         // Renderer exited (user closed the window or
-                        // process crashed). Tell the action loop so it
-                        // runs the same teardown path as a D-Bus
-                        // HideScreen.
+                        // process crashed). Clear the slots
+                        // synchronously BEFORE enqueueing HideScreen
+                        // so a fast-following ShowScreen sees a clean
+                        // subprocess slot — otherwise the
+                        // `already_up` check races against the
+                        // queued HideScreen and silently swallows the
+                        // user's reopen.
+                        *entry_for_exit
+                            .subprocess
+                            .lock()
+                            .expect("subprocess slot poisoned") = None;
+                        *entry_for_exit
+                            .video_tx
+                            .lock()
+                            .expect("video_tx slot poisoned") = None;
                         let _ = exit_tx.send(DaemonAction::HideScreen {
                             device: exit_device.clone(),
                         });
@@ -945,12 +958,13 @@ async fn handle_connection(
                     .video_inbound
                     .store(true, std::sync::atomic::Ordering::Relaxed);
                 let action_tx = dbus_state.actions.clone();
-                // Companion-initiated mirror (QSTile MediaProjection
-                // grant) opens Video before the host knows. Trigger
-                // ShowScreen so the renderer subprocess spawns.
-                if let Some(tx) = action_tx.as_ref() {
-                    let _ = tx.send(DaemonAction::ShowScreen { device: pid.clone() });
-                }
+                // No auto-ShowScreen here on purpose. The user owns
+                // the decision to open the mirror window — D-Bus
+                // ShowScreen from DMS (or the CLI). Inbound Video
+                // without an active subprocess gets fanned to
+                // `entry.video_tx == None` and dropped, which is what
+                // we want: the daemon shouldn't pop a window on its
+                // own just because the phone started capturing.
                 tokio::spawn(video_stream_loop(stream, entry, pid, action_tx));
             }
             StreamKind::Camera => {
