@@ -13,6 +13,7 @@ pub mod cable;
 #[cfg(feature = "host")]
 pub mod release;
 pub mod store;
+pub mod wifi;
 
 pub use cable::{AdbDevice, bootstrap_companion, bootstrap_host, COMPANION_PACKAGE};
 #[cfg(feature = "host")]
@@ -20,6 +21,12 @@ pub use cable::{companion_installed, install_companion_apk, list_adb_devices, pa
 #[cfg(feature = "host")]
 pub use release::{fetch_latest_companion, query_installed_version, FetchedApk};
 pub use store::{PeerStore, PeerStoreError, StoredPeer};
+pub use wifi::{
+    bootstrap_companion_wifi, bootstrap_host_wifi, read_pair_hello, respond_pair_pin,
+    CompanionWifiOutcome, PAIR_MDNS_SERVICE_TYPE, PAIR_MDNS_TXT_NAME, PAIR_MDNS_TXT_PUBKEY,
+};
+#[cfg(feature = "host")]
+pub use wifi::{browse_pair_candidates, pair_host_via_wifi, PairCandidate};
 
 #[derive(Debug, thiserror::Error)]
 pub enum PairingError {

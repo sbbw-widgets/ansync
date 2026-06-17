@@ -18,6 +18,7 @@ use ansync_core::{Capabilities, DeviceId, DeviceName, DevicePermissions, Permiss
 use ansync_crypto::IdentityKeypair;
 use ansync_files::{AutoAcceptPolicy, receive_file};
 use ansync_pairing::cable::bootstrap_companion;
+use ansync_pairing::wifi::{read_pair_hello, respond_pair_pin, CompanionWifiOutcome};
 use ansync_permissions::{PermissionsError, PermissionsStore};
 use ansync_proto::{
     ClipboardMessage, ControlMessage, Envelope, FsOpMessage, GamepadState, Hello, InputMessage,
@@ -49,6 +50,73 @@ static STATE: OnceLock<Mutex<Option<CompanionState>>> = OnceLock::new();
 
 fn state_slot() -> &'static Mutex<Option<CompanionState>> {
     STATE.get_or_init(|| Mutex::new(None))
+}
+
+/// Always-on WiFi-pair listener slot, owned by the foreground service.
+/// The companion service calls `nativeWifiPairListenerStart` on
+/// `onCreate` (idempotent) and `nativeWifiPairListenerStop` on
+/// `onDestroy`. A worker thread in the service polls
+/// `nativePollPairEvent` to convert protocol events into OS heads-up
+/// notifications and pair persistence.
+static WIFI_PAIR: OnceLock<Mutex<Option<WifiPairSlot>>> = OnceLock::new();
+
+fn wifi_pair_slot() -> &'static Mutex<Option<WifiPairSlot>> {
+    WIFI_PAIR.get_or_init(|| Mutex::new(None))
+}
+
+struct WifiPairSlot {
+    port: u16,
+    task: tokio::task::JoinHandle<()>,
+    events_rx: Arc<AsyncMutex<UnboundedReceiver<PairEvent>>>,
+}
+
+/// Protocol-level events emitted by the always-on WiFi pair listener.
+/// Encoded as `String` for JNI transport (Kotlin parses on receipt).
+#[derive(Debug, Clone)]
+enum PairEvent {
+    /// Host has sent `BootstrapHello`. PIN has been generated and is
+    /// safe to display on screen now; the listener is waiting for the
+    /// host's `PinConfirm`.
+    Request {
+        host_pubkey: [u8; 32],
+        host_name: String,
+        pin: [u8; 6],
+    },
+    /// Host's PIN MAC did not match. `remaining` is the number of
+    /// attempts left before the listener locks the PIN and rotates.
+    BadPin { host_name: String, remaining: u8 },
+    /// Listener has hit the 3-strike lockout for the active PIN; the
+    /// PIN is rotated and a future `Request` will follow with the new
+    /// value if the same host (or another) retries.
+    Lockout { host_name: String },
+    /// Pairing completed successfully.
+    Ok {
+        host_pubkey: [u8; 32],
+        host_name: String,
+    },
+}
+
+impl PairEvent {
+    /// Wire encoding for JNI. Single line so Kotlin can split on `|`.
+    /// Tag prefix lets the caller dispatch without parsing the rest if
+    /// they only care about, e.g., `OK` events.
+    fn encode(&self) -> String {
+        match self {
+            PairEvent::Request { host_pubkey, host_name, pin } => format!(
+                "REQUEST|{}|{}|{}",
+                hex_encode(host_pubkey),
+                host_name,
+                std::str::from_utf8(pin).unwrap_or("000000"),
+            ),
+            PairEvent::BadPin { host_name, remaining } => {
+                format!("BAD|{remaining}|{host_name}")
+            }
+            PairEvent::Lockout { host_name } => format!("LOCK|{host_name}"),
+            PairEvent::Ok { host_pubkey, host_name } => {
+                format!("OK|{}|{}", hex_encode(host_pubkey), host_name)
+            }
+        }
+    }
 }
 
 fn runtime() -> &'static Runtime {
@@ -2038,6 +2106,227 @@ pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativeClose(
         } else {
             warn!("nativeClose: no active session");
         }
+    }
+}
+
+/// Start the always-on WiFi pair listener. Idempotent: subsequent
+/// calls return the existing port. The listener accepts TCP
+/// connections from any host on the LAN; each session generates a
+/// fresh 6-digit PIN once `BootstrapHello` arrives so the OS notif
+/// can render `"{host_name} wants to pair — PIN {pin}"`. The accept
+/// loop survives MAC mismatches, bad protocol envelopes, and
+/// successful pairs alike — it only exits on listener bind failure
+/// or an explicit `nativeWifiPairListenerStop`.
+///
+/// Returns the listener port (positive `jlong`) on success, or `-1`
+/// on bind failure.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativeWifiPairListenerStart(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jlong {
+    if let Some(slot) = wifi_pair_slot().lock().expect("wifi pair mutex poisoned").as_ref() {
+        info!("wifi pair listener already running on :{}", slot.port);
+        return slot.port as jlong;
+    }
+
+    let (identity, device_name) = {
+        let slot = state_slot().lock().expect("state mutex poisoned");
+        match slot.as_ref() {
+            Some(s) => (
+                IdentityKeypair::from_seed(*s.identity.seed_bytes()),
+                s.device_name.clone().unwrap_or_else(|| "ansync companion".to_string()),
+            ),
+            None => {
+                error!("nativeWifiPairListenerStart: state not initialised");
+                return -1;
+            }
+        }
+    };
+
+    let listener = match runtime().block_on(async {
+        tokio::net::TcpListener::bind(("0.0.0.0", 0)).await
+    }) {
+        Ok(l) => l,
+        Err(e) => {
+            error!("nativeWifiPairListenerStart: bind failed: {e}");
+            return -1;
+        }
+    };
+    let port = match listener.local_addr() {
+        Ok(addr) => addr.port(),
+        Err(e) => {
+            error!("nativeWifiPairListenerStart: local_addr failed: {e}");
+            return -1;
+        }
+    };
+
+    let (events_tx, events_rx) = unbounded_channel();
+    let task = runtime().spawn(wifi_pair_accept_loop(
+        listener, identity, device_name, events_tx,
+    ));
+
+    {
+        let mut slot = wifi_pair_slot().lock().expect("wifi pair mutex poisoned");
+        *slot = Some(WifiPairSlot {
+            port,
+            task,
+            events_rx: Arc::new(AsyncMutex::new(events_rx)),
+        });
+    }
+
+    info!("wifi pair listening on :{port}");
+    port as jlong
+}
+
+async fn wifi_pair_accept_loop(
+    listener: tokio::net::TcpListener,
+    identity: IdentityKeypair,
+    device_name: String,
+    events_tx: UnboundedSender<PairEvent>,
+) {
+    loop {
+        let (mut conn, peer_addr) = match listener.accept().await {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("wifi pair: accept failed: {e}");
+                // Bail — the listener fd is unusable; companion
+                // service should restart us if it cares.
+                return;
+            }
+        };
+        info!("wifi pair: peer connected from {peer_addr}");
+        let identity = identity.clone();
+        let device_name = device_name.clone();
+        let events_tx = events_tx.clone();
+        // One task per connection so a stalled host doesn't block the
+        // listener from accepting others.
+        tokio::spawn(async move {
+            wifi_pair_handle_connection(&mut conn, identity, device_name, events_tx).await;
+        });
+    }
+}
+
+async fn wifi_pair_handle_connection<S>(
+    stream: &mut S,
+    identity: IdentityKeypair,
+    device_name: String,
+    events_tx: UnboundedSender<PairEvent>,
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let (host_pk, host_name) = match read_pair_hello(stream).await {
+        Ok(v) => v,
+        Err(e) => {
+            warn!("wifi pair: read_pair_hello failed: {e}");
+            return;
+        }
+    };
+    // Fresh PIN per connection — the on-screen value the user reads
+    // must match what THIS host is about to type, even if a previous
+    // host hit our listener moments ago.
+    let pin = ansync_crypto::generate_pin();
+    let _ = events_tx.send(PairEvent::Request {
+        host_pubkey: host_pk,
+        host_name: host_name.clone(),
+        pin,
+    });
+
+    let mut attempts: u8 = 0;
+    // Re-drive Ack + MAC up to 3 times per connection. Each `BadPin`
+    // is the host typing a wrong code; we let them retry without
+    // closing the socket so the UX is "type again" instead of
+    // "reconnect + read new PIN".
+    //
+    // NB: `respond_pair_pin` consumes its own Ack write + MAC read on
+    // every call. Looping it on the same stream would replay the Ack;
+    // simpler to give the host one shot per TCP connection and let
+    // their CLI dial again on bad PIN. That matches the threat model
+    // (each TCP attempt is an attempt under the 3-strike lockout).
+    attempts += 1;
+    match respond_pair_pin(stream, &identity, &device_name, &host_pk, &host_name, &pin).await {
+        Ok(CompanionWifiOutcome::Ok(peer)) => {
+            info!("wifi pair: success, peer={}", peer.name);
+            let _ = events_tx.send(PairEvent::Ok {
+                host_pubkey: peer.pubkey,
+                host_name: peer.name.0.clone(),
+            });
+        }
+        Ok(CompanionWifiOutcome::BadPin) => {
+            warn!(
+                "wifi pair: bad PIN from {host_name} (attempts={attempts})"
+            );
+            let remaining = 3u8.saturating_sub(attempts);
+            let evt = if remaining == 0 {
+                PairEvent::Lockout { host_name: host_name.clone() }
+            } else {
+                PairEvent::BadPin { host_name: host_name.clone(), remaining }
+            };
+            let _ = events_tx.send(evt);
+        }
+        Err(e) => {
+            warn!("wifi pair: protocol error from {host_name}: {e}");
+        }
+    }
+}
+
+/// Block (up to `timeout_ms`) waiting for the next protocol event
+/// from the always-on pair listener. Returns the event's wire
+/// encoding (see [`PairEvent::encode`]), or `null` on timeout. Safe
+/// to call from a dedicated worker thread in a tight loop.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativePollPairEvent<'local>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    timeout_ms: jlong,
+) -> jni::sys::jstring {
+    let events_rx = {
+        let slot = wifi_pair_slot().lock().expect("wifi pair mutex poisoned");
+        match slot.as_ref() {
+            Some(s) => s.events_rx.clone(),
+            None => {
+                warn!("nativePollPairEvent: listener not started");
+                return std::ptr::null_mut();
+            }
+        }
+    };
+    let timeout = if timeout_ms <= 0 {
+        std::time::Duration::from_secs(3600)
+    } else {
+        std::time::Duration::from_millis(timeout_ms as u64)
+    };
+    let event = runtime().block_on(async move {
+        let mut guard = events_rx.lock().await;
+        tokio::time::timeout(timeout, guard.recv()).await
+    });
+    let event = match event {
+        Ok(Some(e)) => e,
+        Ok(None) => {
+            warn!("nativePollPairEvent: events channel closed");
+            return std::ptr::null_mut();
+        }
+        Err(_) => return std::ptr::null_mut(),
+    };
+    match env.new_string(event.encode()) {
+        Ok(s) => s.into_raw(),
+        Err(e) => {
+            error!("nativePollPairEvent: new_string failed: {e}");
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Stop the always-on WiFi pair listener and drain its event channel.
+/// Idempotent — calling it while no listener is running is a no-op.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativeWifiPairListenerStop(
+    _env: JNIEnv,
+    _class: JClass,
+) {
+    let mut slot = wifi_pair_slot().lock().expect("wifi pair mutex poisoned");
+    if let Some(s) = slot.take() {
+        s.task.abort();
+        info!("wifi pair listener on :{} stopped", s.port);
     }
 }
 

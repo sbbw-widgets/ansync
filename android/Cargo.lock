@@ -81,6 +81,7 @@ dependencies = [
  "ed25519-dalek",
  "rand_core 0.6.4",
  "serde",
+ "sha2",
  "snow",
  "thiserror 2.0.18",
  "tracing",

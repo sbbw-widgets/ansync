@@ -53,6 +53,7 @@ class AnsyncCompanionService : Service() {
     @Volatile private var audioPollRunning = false
     private var clipboard: ClipboardBridge? = null
     private var dialer: HostDialer? = null
+    private var wifiPair: WifiPairManager? = null
     private var capturePollThread: HandlerThread? = null
     private var capturePollHandler: Handler? = null
     @Volatile private var capturePollRunning = false
@@ -82,6 +83,7 @@ class AnsyncCompanionService : Service() {
         startAudioControlPoller()
         clipboard = ClipboardBridge(this).also { it.start() }
         dialer = HostDialer(this).also { it.start() }
+        wifiPair = WifiPairManager(this).also { it.start() }
         startCaptureControlPoller()
         startFileControlPoller()
         registerScreenWakeReceiver()
@@ -654,6 +656,8 @@ class AnsyncCompanionService : Service() {
         clipboard = null
         dialer?.stop()
         dialer = null
+        wifiPair?.stop()
+        wifiPair = null
         capturePollRunning = false
         capturePollThread?.quitSafely()
         capturePollThread = null
@@ -712,6 +716,23 @@ class AnsyncCompanionService : Service() {
 
         /** Camera lifecycle stop (notification action button). */
         const val ACTION_STOP_CAMERA = "org.gameros.ansync.action.STOP_CAMERA"
+
+        /**
+         * Start the foreground companion service idempotently. Used by
+         * [WifiPairManager] after a successful pair so the freshly
+         * paired host is immediately reachable by [HostDialer]; also
+         * convenient for any other path that wants to wake the service
+         * without picking the right `startForegroundService` overload
+         * inline.
+         */
+        fun startSelf(ctx: Context) {
+            val svc = Intent(ctx, AnsyncCompanionService::class.java)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                ctx.startForegroundService(svc)
+            } else {
+                ctx.startService(svc)
+            }
+        }
 
         private fun ensureChannel(ctx: Context) {
             val mgr = ctx.getSystemService(NotificationManager::class.java) ?: return

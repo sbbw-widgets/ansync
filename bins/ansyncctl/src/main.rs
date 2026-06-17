@@ -40,28 +40,42 @@ enum Command {
         #[arg(long, default_value_t = 5)]
         seconds: u64,
     },
-    /// Pair with an Android device. Cable / ADB by default.
+    /// Pair with an Android device. Tries cable / ADB first; if no
+    /// device is attached, browses mDNS for pair-ready companions on
+    /// the LAN and dials the only match (or prompts when several
+    /// reply). The user only ever types the 6-digit PIN displayed on
+    /// the device.
     Pair {
-        /// ADB serial of the device. If omitted and exactly one device
-        /// is attached, that device is used; otherwise the command fails.
+        /// ADB serial. Forces the cable path even if a companion is
+        /// also reachable over the LAN.
         #[arg(long)]
         serial: Option<String>,
+        /// Explicit `ip:port` of the companion's pair listener.
+        /// Skip mDNS browse — useful when multicast is blocked
+        /// (corporate networks, AP isolation) and the user reads the
+        /// IP off the device manually.
+        #[arg(long, conflicts_with = "serial")]
+        remote_addr: Option<String>,
         /// Human-readable name advertised to the peer.
         #[arg(long)]
         name: Option<String>,
-        /// Path to the companion APK. Auto-installed if the device
-        /// does not already have `org.gameros.ansync`. Defaults to
-        /// `$ANSYNC_COMPANION_APK` env or
+        /// Path to the companion APK. Cable path only — auto-installed
+        /// if the device does not already have `org.gameros.ansync`.
+        /// Defaults to `$ANSYNC_COMPANION_APK` env or
         /// `/usr/share/ansync/companion.apk`.
         #[arg(long)]
         apk: Option<PathBuf>,
         /// Skip prompt and install the latest release if the
-        /// companion is outdated.
+        /// companion is outdated (cable only).
         #[arg(long)]
         auto_upgrade: bool,
-        /// Skip the GitHub release check entirely (offline mode).
+        /// Skip the GitHub release check entirely (cable, offline mode).
         #[arg(long)]
         skip_upgrade_check: bool,
+        /// How long to browse mDNS for pair-ready companions before
+        /// giving up. Ignored when `--serial` or `--remote-addr` is set.
+        #[arg(long, default_value_t = 5)]
+        discover_seconds: u64,
     },
     /// Forget a previously paired device.
     Forget { id: String },
@@ -119,11 +133,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Discover { seconds } => discover(seconds).await?,
         Command::Pair {
             serial,
+            remote_addr,
             name,
             apk,
             auto_upgrade,
             skip_upgrade_check,
-        } => pair(serial, name, apk, auto_upgrade, skip_upgrade_check).await?,
+            discover_seconds,
+        } => {
+            pair_dispatch(
+                serial,
+                remote_addr,
+                name,
+                apk,
+                auto_upgrade,
+                skip_upgrade_check,
+                discover_seconds,
+            )
+            .await?;
+        }
         Command::Forget { id } => println!("(skeleton) forget {id}"),
         Command::Show { id } => println!("(skeleton) show {id}"),
         Command::Push { id, path, addr, seconds } => push(id, path, addr, seconds).await?,
@@ -427,6 +454,165 @@ fn needs_upgrade(installed: Option<&str>, tag: &str) -> bool {
     };
     let tag = tag.trim_start_matches(['v', 'V']);
     installed.trim() != tag
+}
+
+/// Top-level pair dispatch. Resolves the channel (cable vs WiFi) from
+/// flags + environment with this priority:
+///
+///   1. `--remote-addr` set → WiFi against the supplied `ip:port`.
+///   2. `--serial` set OR at least one device in `adb devices` → cable.
+///   3. mDNS browse for `_ansync-pair._tcp` finds 1 companion → WiFi.
+///   4. mDNS browse finds N > 1 → interactive prompt → WiFi.
+///   5. Nothing found → error.
+async fn pair_dispatch(
+    serial: Option<String>,
+    remote_addr: Option<String>,
+    name: Option<String>,
+    apk: Option<PathBuf>,
+    auto_upgrade: bool,
+    skip_upgrade_check: bool,
+    discover_seconds: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(addr) = remote_addr {
+        let socket: std::net::SocketAddr = addr
+            .parse()
+            .map_err(|e| format!("--remote-addr must be `ip:port`: {e}"))?;
+        return pair_wifi(socket, None, name).await;
+    }
+    if serial.is_some() {
+        return pair(serial, name, apk, auto_upgrade, skip_upgrade_check).await;
+    }
+    let adb_devices = ansync_pairing::list_adb_devices().await.unwrap_or_default();
+    if !adb_devices.is_empty() {
+        return pair(serial, name, apk, auto_upgrade, skip_upgrade_check).await;
+    }
+    println!(
+        "no ADB devices; browsing LAN for pair-ready companions ({}s) …",
+        discover_seconds
+    );
+    let candidates = ansync_pairing::browse_pair_candidates(Duration::from_secs(discover_seconds))
+        .await
+        .map_err(|e| format!("mdns browse: {e}"))?;
+    let picked = match candidates.len() {
+        0 => {
+            return Err(
+                "no companions on the LAN. Make sure the device is on the same Wi-Fi or run `ansyncctl pair --remote-addr <ip:port>` to bypass mDNS.".into(),
+            );
+        }
+        1 => candidates.into_iter().next().expect("len==1"),
+        _ => pick_candidate(candidates)?,
+    };
+    println!(
+        "found `{}` at {} (pubkey={}…)",
+        picked.name,
+        picked.addr,
+        hex_short(&picked.pubkey)
+    );
+    pair_wifi(picked.addr, Some(picked.pubkey), name).await
+}
+
+async fn pair_wifi(
+    addr: std::net::SocketAddr,
+    expected_pubkey: Option<[u8; 32]>,
+    name: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let identity = load_identity()?;
+    let local_name = name
+        .or_else(hostname)
+        .unwrap_or_else(|| "ansync-host".to_string());
+
+    let pin = read_pin_interactive()?;
+    println!("dialing companion at {addr} as `{local_name}` …");
+    let stored = ansync_pairing::pair_host_via_wifi(addr, &pin, &identity, &local_name)
+        .await?;
+    if let Some(expected) = expected_pubkey {
+        if expected != stored.pubkey {
+            return Err(format!(
+                "mDNS-advertised pubkey did not match the one received over the wire — \
+                 someone else may be impersonating `{}` on the LAN. Refusing to persist.",
+                stored.name
+            )
+            .into());
+        }
+    }
+    println!("paired: device_id={} name={}", stored.id, stored.name);
+
+    let store = PeerStore::open(default_peers_dir()?)?;
+    store.put(&stored)?;
+    println!(
+        "persisted to {}/{}.toml",
+        store.root().display(),
+        stored.id
+    );
+    if let Err(e) = notify_daemon_refresh().await {
+        eprintln!("note: daemon not running or unreachable: {e}");
+    }
+    if let Err(e) = post_setup_notification(&stored.name.0).await {
+        eprintln!("note: failed to post desktop notification: {e}");
+    }
+    Ok(())
+}
+
+/// Interactive PIN prompt. PIN never comes from a CLI flag — keeping
+/// it off the shell history means the only path a 6-digit secret can
+/// be captured is from screen recorders / shoulder-surfers.
+fn read_pin_interactive() -> Result<[u8; 6], Box<dyn std::error::Error>> {
+    use std::io::{BufRead, Write};
+    print!("enter the 6-digit PIN displayed on the device: ");
+    std::io::stdout().flush()?;
+    let mut line = String::new();
+    std::io::stdin().lock().read_line(&mut line)?;
+    let digits: Vec<u8> = line
+        .chars()
+        .filter(|c| c.is_ascii_digit())
+        .map(|c| c as u8)
+        .collect();
+    if digits.len() != 6 {
+        return Err(format!(
+            "expected 6 digits, got {} after stripping non-digits",
+            digits.len()
+        )
+        .into());
+    }
+    let mut out = [0u8; 6];
+    out.copy_from_slice(&digits);
+    Ok(out)
+}
+
+fn pick_candidate(
+    candidates: Vec<ansync_pairing::PairCandidate>,
+) -> Result<ansync_pairing::PairCandidate, Box<dyn std::error::Error>> {
+    use std::io::{BufRead, Write};
+    println!("multiple pair-ready devices on the LAN:");
+    for (i, c) in candidates.iter().enumerate() {
+        println!(
+            "  [{i}] {} — {} (pubkey={}…)",
+            c.name,
+            c.addr,
+            hex_short(&c.pubkey)
+        );
+    }
+    print!("pick (0-{}) > ", candidates.len() - 1);
+    std::io::stdout().flush()?;
+    let mut line = String::new();
+    std::io::stdin().lock().read_line(&mut line)?;
+    let idx: usize = line
+        .trim()
+        .parse()
+        .map_err(|e| format!("invalid choice: {e}"))?;
+    candidates
+        .into_iter()
+        .nth(idx)
+        .ok_or_else(|| "index out of range".into())
+}
+
+fn hex_short(bytes: &[u8; 32]) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(16);
+    for b in &bytes[..8] {
+        let _ = write!(&mut s, "{b:02x}");
+    }
+    s
 }
 
 fn prompt_upgrade(old: &str, new: &str) -> Result<bool, Box<dyn std::error::Error>> {

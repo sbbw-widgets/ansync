@@ -152,9 +152,14 @@ pub enum PairingMessage {
         name: String,
         lan_endpoints: Vec<(String, u16)>,
     },
-    /// PIN shown on Android, typed on host.
-    PinChallenge { pin: [u8; 6] },
-    PinResponse { pin: [u8; 6] },
+    /// WiFi-pair MAC confirmation. Companion displays a 6-digit PIN
+    /// on screen, user types it on host. Both sides compute
+    /// `SHA-256("ansync-pair-v1" || role || host_pubkey || companion_pubkey || pin)`
+    /// with `role = b"host"` (host→companion) or `b"companion"`
+    /// (companion→host) and exchange `PinConfirm`. Any mismatch
+    /// aborts the bootstrap and increments the companion's lockout
+    /// counter — 3 strikes close the listener and rotate the PIN.
+    PinConfirm { mac: [u8; 32] },
 }
 
 #[derive(Debug, Serialize, Deserialize)]

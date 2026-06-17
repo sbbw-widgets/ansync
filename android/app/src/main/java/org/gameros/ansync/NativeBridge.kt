@@ -209,4 +209,32 @@ object NativeBridge {
 
     /** Tear the active session down. Safe to call when no session is open. */
     external fun nativeClose()
+
+    /**
+     * Start the always-on WiFi pair listener. Idempotent — subsequent
+     * calls return the already-bound port. Returns the listener port
+     * (`> 0`) on success, or `-1` on bind failure. The companion
+     * service registers an mDNS advert with this port so hosts can
+     * discover the device with no user interaction.
+     */
+    external fun nativeWifiPairListenerStart(): Long
+
+    /**
+     * Block (up to `timeoutMs`) waiting for the next pair protocol
+     * event from the always-on listener. Returns the event's wire
+     * encoding or `null` on timeout. Tag prefixes (separated by `|`):
+     *
+     *   * `REQUEST|<host_pubkey_hex>|<host_name>|<pin>` — host has
+     *     sent BootstrapHello; PIN is now safe to display.
+     *   * `BAD|<remaining>|<host_name>` — PIN MAC mismatch; the
+     *     listener will accept further attempts until `remaining`
+     *     reaches zero.
+     *   * `LOCK|<host_name>` — 3-strike lockout for the current PIN.
+     *   * `OK|<host_pubkey_hex>|<host_name>` — pair complete; persist
+     *     to SharedPreferences and dismiss the heads-up notif.
+     */
+    external fun nativePollPairEvent(timeoutMs: Long): String?
+
+    /** Stop the always-on WiFi pair listener. Idempotent. */
+    external fun nativeWifiPairListenerStop()
 }

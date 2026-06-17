@@ -14,8 +14,10 @@ use ansync_core::DeviceId;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 
 pub mod noise;
+pub mod pair_pin;
 
 pub use noise::{NoiseError, NoiseTransport, NoiseXxSession, Role};
+pub use pair_pin::{PinRole, generate_pin, pair_pin_confirm, verify_pin_confirm};
 
 #[derive(Debug, thiserror::Error)]
 pub enum CryptoError {
