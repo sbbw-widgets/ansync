@@ -46,9 +46,7 @@ pub async fn run_play_file_loop(
             continue;
         }
         if let Some(frame) = decoder.take().await? {
-            if let Ok(mut slot) = shared.lock() {
-                *slot = Some(frame);
-            }
+            shared.store(frame);
         }
         frame_period.tick().await;
     }

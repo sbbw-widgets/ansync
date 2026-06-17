@@ -5,6 +5,7 @@ import android.hardware.display.VirtualDisplay
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaFormat
+import android.os.Bundle
 import android.media.projection.MediaProjection
 import android.util.DisplayMetrics
 import android.util.Log
@@ -76,12 +77,57 @@ class CaptureSession(
         drainThread = thread(name = "ansync-encoder-drain") { drainLoop(codec) }
     }
 
+    /**
+     * Force the encoder to emit a SYNC frame (IDR / keyframe) on its
+     * next dequeue. Used after the screen wakes from off: while the
+     * display was off VirtualDisplay stops driving the input Surface,
+     * so the encoder produces nothing; the host's H.264 decoder is
+     * then sitting on stale reference frames. Asking for a fresh IDR
+     * resyncs both sides with a single self-contained frame.
+     *
+     * Safe to call even if the encoder is not running (just a no-op).
+     */
+    fun requestKeyFrame() {
+        val enc = encoder ?: return
+        try {
+            enc.setParameters(Bundle().apply {
+                putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0)
+            })
+            Log.i(TAG, "key frame requested")
+        } catch (e: IllegalStateException) {
+            Log.w(TAG, "requestKeyFrame: encoder in bad state", e)
+        }
+    }
+
     fun stop() {
+        // Teardown order matters:
+        //   1. `running = false` signals the drain loop to exit at the
+        //      next dequeue boundary.
+        //   2. Release VirtualDisplay so the encoder's input Surface
+        //      stops receiving buffers. Without this `encoder.stop()`
+        //      can block waiting for an in-flight frame.
+        //   3. Join the drain thread BEFORE calling `encoder.stop()`.
+        //      `stop()` blocks until pending output is drained, but
+        //      if the drain thread is mid-`nativeSendVideoChunk` on a
+        //      QUIC stream that's been closed the JNI call returns
+        //      Err synchronously and the loop exits cleanly.
+        //   4. Now safe to stop + release the encoder + Surface.
+        // Every step is wrapped in try/catch because any one of them
+        // can throw `IllegalStateException` if the caller hit stop()
+        // twice (MediaProjection.Callback.onStop races with our own
+        // ACTION_STOP_CAPTURE) — we want the *first* call to win and
+        // the second to be a silent no-op, not a crash.
         running = false
         try {
             virtualDisplay?.release()
         } catch (e: Exception) {
             Log.w(TAG, "virtualDisplay.release threw", e)
+        }
+        try {
+            drainThread?.join(TIMEOUT_DRAIN_JOIN_MS)
+        } catch (e: InterruptedException) {
+            Thread.currentThread().interrupt()
+            Log.w(TAG, "drainThread.join interrupted", e)
         }
         try {
             encoder?.stop()
@@ -98,7 +144,6 @@ class CaptureSession(
         } catch (e: Exception) {
             Log.w(TAG, "inputSurface.release threw", e)
         }
-        drainThread?.join(TIMEOUT_DRAIN_JOIN_MS)
         encoder = null
         virtualDisplay = null
         inputSurface = null

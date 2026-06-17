@@ -5,8 +5,10 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.ServiceInfo
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
@@ -57,6 +59,7 @@ class AnsyncCompanionService : Service() {
     private var filePollThread: HandlerThread? = null
     private var filePollHandler: Handler? = null
     @Volatile private var filePollRunning = false
+    private var screenReceiver: BroadcastReceiver? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -81,6 +84,62 @@ class AnsyncCompanionService : Service() {
         dialer = HostDialer(this).also { it.start() }
         startCaptureControlPoller()
         startFileControlPoller()
+        registerScreenWakeReceiver()
+    }
+
+    /**
+     * Watch for `ACTION_SCREEN_ON` / `ACTION_USER_PRESENT` so the
+     * capture pipeline can resync after the device wakes. While the
+     * screen is off VirtualDisplay stops feeding the encoder's input
+     * Surface, so no buffers come out; when the screen wakes the
+     * encoder restarts on a stale GOP and the host's NV12 decoder is
+     * left rendering the last frame from before sleep until the next
+     * scheduled IDR (default 5 s with `KEY_I_FRAME_INTERVAL`).
+     *
+     * Empirically a single `setParameters(REQUEST_SYNC_FRAME)` on
+     * SCREEN_ON misses the recovery on Lenovo / Samsung skins because
+     * VirtualDisplay takes several hundred milliseconds to resume
+     * feeding the input Surface after wake. We post three retries
+     * (0, 250, 750 ms) to bracket the resume window.
+     */
+    private fun registerScreenWakeReceiver() {
+        if (screenReceiver != null) return
+        val r = object : BroadcastReceiver() {
+            override fun onReceive(context: Context?, intent: Intent?) {
+                val action = intent?.action ?: return
+                Log.i(TAG, "screen receiver fired: $action")
+                if (action == Intent.ACTION_SCREEN_ON
+                    || action == Intent.ACTION_USER_PRESENT
+                ) {
+                    val handler = Handler(mainLooper)
+                    longArrayOf(0L, 250L, 750L, 1500L).forEach { delay ->
+                        handler.postDelayed({
+                            val active = capture
+                            if (active != null) {
+                                Log.i(TAG, "screen wake — key frame retry at ${delay}ms")
+                                active.requestKeyFrame()
+                            }
+                        }, delay)
+                    }
+                }
+            }
+        }
+        val filter = IntentFilter().apply {
+            addAction(Intent.ACTION_SCREEN_ON)
+            addAction(Intent.ACTION_USER_PRESENT)
+        }
+        // Android 14+ requires an explicit export flag for receivers
+        // registered at runtime. SCREEN_ON/USER_PRESENT are system
+        // broadcasts so RECEIVER_NOT_EXPORTED is the right choice —
+        // we never want to be the target of an external app's intent
+        // here. Older releases ignore the flag.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            registerReceiver(r, filter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            registerReceiver(r, filter)
+        }
+        screenReceiver = r
+        Log.i(TAG, "screen wake receiver registered")
     }
 
     /** Watches the host's Control stream for `RequestFileAccess` /
@@ -179,7 +238,20 @@ class AnsyncCompanionService : Service() {
                     }
                     if (blob.isEmpty()) continue
                     when (blob[0].toInt()) {
-                        0 -> Handler(mainLooper).post { requestCaptureFromUser() }
+                        0 -> Handler(mainLooper).post {
+                            // If a session already exists the host
+                            // probably just wants a fresh IDR (e.g.
+                            // viewer reattached, decoder reset).
+                            // Skipping the projection re-prompt avoids
+                            // a surprise dialog mid-session.
+                            val active = capture
+                            if (active != null) {
+                                Log.i(TAG, "RequestScreenCapture w/ active session — key frame instead")
+                                active.requestKeyFrame()
+                            } else {
+                                requestCaptureFromUser()
+                            }
+                        }
                         1 -> Handler(mainLooper).post { stopCapture() }
                         else -> Log.w(TAG, "unknown capture-ctrl tag ${blob[0]}")
                     }
@@ -421,12 +493,30 @@ class AnsyncCompanionService : Service() {
     }
 
     private fun stopCapture() {
-        capture?.stop()
+        // Reentrant: MediaProjection.Callback.onStop and the host's
+        // StopScreenCapture both target this method. Pull the field
+        // values out into locals + null the field first so a second
+        // concurrent call sees nothing to do.
+        val captureLocal = capture
         capture = null
-        projection?.stop()
+        val projectionLocal = projection
         projection = null
+        try {
+            captureLocal?.stop()
+        } catch (e: Exception) {
+            Log.w(TAG, "capture.stop threw", e)
+        }
+        try {
+            projectionLocal?.stop()
+        } catch (e: Exception) {
+            Log.w(TAG, "projection.stop threw", e)
+        }
         setTileState(PREF_MIRROR_ACTIVE, false)
-        refreshNotification()
+        try {
+            refreshNotification()
+        } catch (e: Exception) {
+            Log.w(TAG, "refreshNotification threw during stop", e)
+        }
     }
 
     /** QSTile-driven audio start. Re-uses [AudioRouter] but skips the
@@ -575,6 +665,12 @@ class AnsyncCompanionService : Service() {
         stopCapture()
         fsServer?.stop()
         fsServer = null
+        screenReceiver?.let {
+            try { unregisterReceiver(it) } catch (e: IllegalArgumentException) {
+                Log.w(TAG, "unregisterReceiver screen wake threw", e)
+            }
+        }
+        screenReceiver = null
         NativeBridge.nativeClose()
         super.onDestroy()
     }

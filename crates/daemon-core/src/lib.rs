@@ -37,7 +37,7 @@ use ansync_transport::{
     Connection, QuicConnection, QuicServer, QuicStream, QuicTransport, Stream as _, StreamKind,
 };
 use ansync_video::sink_egui::{FrameSlot, new_slot};
-use ansync_video::{DecodedFrame, HostDecoder, PixelFormat, VideoCodec, VideoDecoder};
+use ansync_video::{HostDecoder, PixelFormat, VideoCodec, VideoDecoder};
 use directories::BaseDirs;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::Mutex;
@@ -202,7 +202,7 @@ impl Daemon {
                 peers.clone(),
                 permissions.clone(),
             )
-            .with_actions(action_tx),
+            .with_actions(action_tx.clone()),
         );
         if let Ok(mut g) = state.listen_endpoints.lock() {
             *g = local_endpoints;
@@ -216,6 +216,7 @@ impl Daemon {
         let audios = Arc::new(AudioRegistry::default());
         let action_handle = tokio::spawn(action_loop(
             action_rx,
+            action_tx.clone(),
             mirrors.clone(),
             cameras.clone(),
             audios.clone(),
@@ -242,6 +243,14 @@ impl Daemon {
                 }
             }
         };
+        // RAM diagnostic: print VmRSS every 30 s under
+        // `RUST_LOG=ansync_daemon_core=debug`. Useful for telling
+        // allocator-side fragmentation ("RSS climbs then plateaus")
+        // apart from a real leak ("RSS climbs without bound"). The
+        // task is fire-and-forget — there's no shutdown handshake
+        // because reading `/proc/self/status` has no resource to
+        // release on drop.
+        let mem_stats_handle = tokio::spawn(mem_stats_loop());
         let dbus_conn_arc = Arc::new(dbus_conn);
         let accept_handle = tokio::spawn(accept_loop(AcceptCtx {
             server,
@@ -263,6 +272,7 @@ impl Daemon {
 
         accept_handle.abort();
         action_handle.abort();
+        mem_stats_handle.abort();
         if let Err(e) = mdns.stop_announce().await {
             warn!(error = %e, "mDNS stop_announce failed");
         }
@@ -462,6 +472,7 @@ impl MirrorRegistry {
 
 async fn action_loop(
     mut rx: UnboundedReceiver<DaemonAction>,
+    self_tx: tokio::sync::mpsc::UnboundedSender<DaemonAction>,
     mirrors: Arc<MirrorRegistry>,
     cameras: Arc<CameraRegistry>,
     audios: Arc<AudioRegistry>,
@@ -581,12 +592,23 @@ async fn action_loop(
                 }
                 let slot = entry.slot.clone();
                 let title = format!("ansync — {}", entry.peer_name);
+                // When the user closes the window we get no D-Bus
+                // HideScreen, so the companion would keep capturing
+                // and burning battery. Forward the run-exit through
+                // the action queue so HideScreen runs with the same
+                // teardown path as a D-Bus call.
+                let exit_tx = self_tx.clone();
+                let exit_device = device.clone();
                 let handle = std::thread::Builder::new()
                     .name(format!("ansync-mirror-{device}"))
                     .spawn(move || {
                         if let Err(e) = ansync_video::sink_egui::run(title, slot, input_tx) {
                             warn!(error = %e, "mirror window exited with error");
                         }
+                        // Notify the action loop that the user closed
+                        // the window. Errors here just mean the
+                        // daemon is shutting down — ignore.
+                        let _ = exit_tx.send(DaemonAction::HideScreen { device: exit_device });
                     })
                     .ok();
                 *entry.window.lock().expect("window slot poisoned") = handle;
@@ -1126,43 +1148,54 @@ async fn notification_inbound_loop(
                 return;
             }
         };
-    loop {
-        let bytes = match stream.recv().await {
-            Ok(b) => b,
-            Err(ansync_transport::TransportError::Closed) => return,
-            Err(e) => {
-                warn!(%peer_id, error = %e, "notification recv error");
-                return;
-            }
-        };
-        let msg: NotificationMessage = match postcard::from_bytes(&bytes) {
-            Ok(m) => m,
-            Err(e) => {
-                warn!(%peer_id, error = %e, "notification postcard decode failed");
-                continue;
-            }
-        };
-        // Per-message gate. Toggling `notifications` off mid-stream
-        // drops further events without killing the QUIC stream.
-        match permissions.check(&peer_id, Permission::Notifications).await {
-            Ok(true) => {}
-            Ok(false) => continue,
-            Err(e) => {
-                warn!(%peer_id, error = %e, "notifications perm check failed; dropping event");
-                continue;
-            }
+    // Companion opens a fresh QUIC stream per notification (see
+    // `send_notification` on the device side — the stream is dropped
+    // after `send`). So the daemon expects exactly ONE frame here;
+    // anything after that would be a protocol error. Reading in a
+    // loop floods the journal with `early eof` warnings as quinn
+    // surfaces each finished stream's FIN to us.
+    let bytes = match stream.recv().await {
+        Ok(b) => b,
+        Err(ansync_transport::TransportError::Closed) => return,
+        Err(ansync_transport::TransportError::Io(e))
+            if e.kind() == std::io::ErrorKind::UnexpectedEof =>
+        {
+            // Sender closed the stream without writing a frame. Not
+            // an error worth logging at warn level.
+            return;
         }
-        let result = match &msg {
-            NotificationMessage::Posted { id, app, title, body } => {
-                ansync_dbus::Device::notification_posted(&emitter, *id, app, title, body).await
-            }
-            NotificationMessage::Removed { id } => {
-                ansync_dbus::Device::notification_removed(&emitter, *id).await
-            }
-        };
-        if let Err(e) = result {
-            warn!(%peer_id, error = %e, "D-Bus signal emit failed");
+        Err(e) => {
+            warn!(%peer_id, error = %e, "notification recv error");
+            return;
         }
+    };
+    let msg: NotificationMessage = match postcard::from_bytes(&bytes) {
+        Ok(m) => m,
+        Err(e) => {
+            warn!(%peer_id, error = %e, "notification postcard decode failed");
+            return;
+        }
+    };
+    // Per-message permission gate. Disabling `notifications` after
+    // pairing drops the event silently without breaking the wire.
+    match permissions.check(&peer_id, Permission::Notifications).await {
+        Ok(true) => {}
+        Ok(false) => return,
+        Err(e) => {
+            warn!(%peer_id, error = %e, "notifications perm check failed; dropping event");
+            return;
+        }
+    }
+    let result = match &msg {
+        NotificationMessage::Posted { id, app, title, body } => {
+            ansync_dbus::Device::notification_posted(&emitter, *id, app, title, body).await
+        }
+        NotificationMessage::Removed { id } => {
+            ansync_dbus::Device::notification_removed(&emitter, *id).await
+        }
+    };
+    if let Err(e) = result {
+        warn!(%peer_id, error = %e, "D-Bus signal emit failed");
     }
 }
 
@@ -1652,6 +1685,14 @@ async fn video_stream_loop(mut stream: QuicStream, slot: FrameSlot, peer_id: Dev
         }
     };
     info!(%peer_id, "video stream wired");
+    // Diagnostics so the user can tell whether the silence is on
+    // the wire (no chunks) or the decoder (chunks arriving but
+    // never producing a frame). Printed at info level so they show
+    // up under default RUST_LOG=info.
+    let mut first_chunk_logged = false;
+    let mut first_frame_logged = false;
+    let mut frames_since_log: u64 = 0;
+    let mut last_stat = std::time::Instant::now();
     loop {
         let bytes = match stream.recv().await {
             Ok(b) => b,
@@ -1664,44 +1705,44 @@ async fn video_stream_loop(mut stream: QuicStream, slot: FrameSlot, peer_id: Dev
                 return;
             }
         };
+        if !first_chunk_logged {
+            info!(%peer_id, bytes = bytes.len(), "first video chunk from peer");
+            first_chunk_logged = true;
+        }
         if let Err(e) = decoder.feed(bytes).await {
             warn!(%peer_id, error = %e, "decoder feed failed; continuing");
             continue;
         }
-        // Drain every decoded frame the backend produced for this
-        // feed and keep only the latest. Live mirror prefers latency
-        // over completeness, and NVDEC's internal surface pool grows
-        // unbounded if decoded frames sit in its output queue
-        // (observed ~680 MB/s RSS growth at 1080p60). The first
-        // take blocks until at least one frame is ready; subsequent
-        // takes are bounded by a tight timeout so we don't deadlock
-        // when ferricast's `take().await` waits forever for more
-        // output — async take doesn't surface a non-blocking variant.
-        let mut latest: Option<DecodedFrame> = None;
+        // ferricast's `HostDecoder::feed` already pumps the inner
+        // backend's `next_frame()` once per call and stashes the
+        // result in an instance-local mailbox. A single `take()` here
+        // moves the latest into the renderer's slot; with H.264
+        // Baseline (no B-frames) and `max_display_delay=0` the
+        // input/output ratio is 1:1 so nothing accumulates in NVDEC's
+        // surface pool. `take()` is non-async (just a `Mutex::take`)
+        // so no busy-loop timeout games.
         match decoder.take().await {
-            Ok(Some(frame)) => latest = Some(frame),
+            Ok(Some(frame)) => {
+                if !first_frame_logged {
+                    info!(
+                        %peer_id,
+                        width = frame.width,
+                        height = frame.height,
+                        format = ?frame.format,
+                        "first decoded frame; mirror wired end-to-end"
+                    );
+                    first_frame_logged = true;
+                }
+                frames_since_log += 1;
+                slot.store(frame);
+            }
             Ok(None) => {}
             Err(e) => warn!(%peer_id, error = %e, "decoder take failed"),
         }
-        // Drain remainder with a 1 ms budget — enough to mop up any
-        // frames already produced for this feed, not enough to stall
-        // the loop or hold the tokio worker thread.
-        while let Ok(res) =
-            tokio::time::timeout(std::time::Duration::from_millis(1), decoder.take()).await
-        {
-            match res {
-                Ok(Some(frame)) => latest = Some(frame),
-                Ok(None) => break,
-                Err(e) => {
-                    warn!(%peer_id, error = %e, "decoder drain failed");
-                    break;
-                }
-            }
-        }
-        if let Some(frame) = latest {
-            if let Ok(mut s) = slot.lock() {
-                *s = Some(frame);
-            }
+        if last_stat.elapsed() >= std::time::Duration::from_secs(5) {
+            debug!(%peer_id, fps = frames_since_log / 5, "video stream stats");
+            frames_since_log = 0;
+            last_stat = std::time::Instant::now();
         }
     }
 }
@@ -1811,4 +1852,43 @@ async fn wait_for_shutdown() -> Result<(), DaemonError> {
         _ = int.recv() => info!("SIGINT"),
     }
     Ok(())
+}
+
+/// Periodic resident-memory probe. Reads `VmRSS` + `VmHWM` from
+/// `/proc/self/status` and emits one debug line per cycle. Goes to
+/// debug (not info) so the journal isn't polluted in release; flip
+/// `ansync_daemon_core` to debug to see the trace.
+async fn mem_stats_loop() {
+    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(30));
+    // Skip the very first tick (fires instantly) — give the process a
+    // moment to settle so the first sample isn't pre-LAN-up noise.
+    ticker.tick().await;
+    loop {
+        ticker.tick().await;
+        let Ok(status) = tokio::fs::read_to_string("/proc/self/status").await else {
+            continue;
+        };
+        let mut rss_kb: Option<u64> = None;
+        let mut hwm_kb: Option<u64> = None;
+        for line in status.lines() {
+            if let Some(rest) = line.strip_prefix("VmRSS:") {
+                rss_kb = parse_kb(rest);
+            } else if let Some(rest) = line.strip_prefix("VmHWM:") {
+                hwm_kb = parse_kb(rest);
+            }
+        }
+        if let (Some(rss), Some(hwm)) = (rss_kb, hwm_kb) {
+            debug!(
+                rss_mib = rss / 1024,
+                hwm_mib = hwm / 1024,
+                "mem stats"
+            );
+        }
+    }
+}
+
+fn parse_kb(rest: &str) -> Option<u64> {
+    let trimmed = rest.trim();
+    let num = trimmed.strip_suffix(" kB").unwrap_or(trimmed).trim();
+    num.parse::<u64>().ok()
 }

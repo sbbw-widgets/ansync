@@ -90,9 +90,16 @@ fn install_logging() -> Result<(), Box<dyn std::error::Error>> {
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     tracing_subscriber::registry()
         .with(env_filter)
-        .with(tracing_subscriber::fmt::layer().with_target(false))
+        .with(tracing_subscriber::fmt::layer().with_target(true))
         .with(tracing_journald::layer().ok())
         .try_init()?;
+    // wgpu / naga / winit emit through `log::*`; bridge so the same
+    // EnvFilter applies. Without this any wgpu validation error is
+    // silently discarded — exactly the kind of thing that shows up
+    // as "the mirror window stays blank but no error is logged".
+    // Errors are non-fatal: if a global tracing dispatcher predated
+    // us (test harness) it just returns AlreadyInUse and we move on.
+    let _ = tracing_log::LogTracer::init();
     Ok(())
 }
 

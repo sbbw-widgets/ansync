@@ -25,6 +25,11 @@ tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 tracing-journald.workspace = true
+# wgpu, naga, winit emit diagnostics via the `log` crate. Without a
+# bridge tracing_subscriber drops them silently, which means we
+# can't see GPU validation errors. tracing-log forwards `log` records
+# into tracing so the same EnvFilter and journald sink picks them up.
+tracing-log = "0.2"
 clap.workspace = true
 eframe.workspace = true
 egui.workspace = true

@@ -100,12 +100,23 @@ class AnsyncAccessibilityService : AccessibilityService() {
     }
 
     private fun dispatchTouch(t: WireInputMessage.TouchSlot) {
-        // Single-finger swipe: synthesise a 16 ms gesture from the
-        // (x,y) point. The host already dedupes per-slot motion, so
-        // multi-finger follow-up lands in Step 7e+ once we track
-        // active slots into composite gestures.
+        // `trackingId < 0` = release event from the host; we synthesise
+        // the touch-up in the gesture itself (Android Accessibility
+        // strokes auto-finish at the end of their duration), so just
+        // drop the standalone release.
         if (t.trackingId < 0) return
-        val path = Path().apply { moveTo(t.x.toFloat(), t.y.toFloat()) }
+        // `Path.moveTo` alone is a zero-length path — Android's
+        // AccessibilityService rejects it as a malformed gesture and
+        // (on some OEM builds, notably Lenovo tablets) routes the
+        // rejected gesture to the global Power dialog handler, which
+        // turns the screen off. Adding a 1-pixel `lineTo` forces a
+        // valid stroke that registers as a real tap.
+        val x = t.x.toFloat().coerceAtLeast(0f)
+        val y = t.y.toFloat().coerceAtLeast(0f)
+        val path = Path().apply {
+            moveTo(x, y)
+            lineTo(x + 1f, y)
+        }
         val stroke = GestureDescription.StrokeDescription(path, 0L, GESTURE_DURATION_MS)
         val gesture = GestureDescription.Builder().addStroke(stroke).build()
         dispatchGesture(gesture, null, null)
