@@ -25,7 +25,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use ansync_proto::InputMessage;
+use ansync_proto::{GamepadState, InputMessage};
 use eframe::egui_wgpu;
 use eframe::wgpu;
 use tokio::sync::mpsc::UnboundedSender;
@@ -161,7 +161,14 @@ pub fn run(
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([960.0, 540.0])
-            .with_title(title.clone()),
+            .with_title(title.clone())
+            // Hide the window until the first decoded frame lands.
+            // Otherwise the user sees a 1-2 second flash of the egui
+            // default theme + "waiting for first decoded frame…"
+            // placeholder before video catches up — and on slow
+            // networks the placeholder can linger long enough to
+            // make the daemon look broken.
+            .with_visible(false),
         renderer: eframe::Renderer::Wgpu,
         wgpu_options,
         event_loop_builder: Some(event_loop_builder),
@@ -207,18 +214,202 @@ pub struct MirrorApp {
     last_format: Option<PixelFormat>,
     input_tx: Option<UnboundedSender<InputMessage>>,
     last_pointer: Option<egui::Pos2>,
+    /// `Gilrs` reads /dev/input/event* under the hood, so we keep one
+    /// instance for the lifetime of the window and poll it each
+    /// `update`. `None` when the daemon doesn't have permission to
+    /// open the evdev nodes (no `input` group membership) — we
+    /// degrade to "mirror works but gamepad doesn't" instead of
+    /// crashing the window thread.
+    gilrs: Option<gilrs::Gilrs>,
+    /// Snapshot of the most recently-sent gamepad state. We diff
+    /// against this on every poll so a peer never receives a packet
+    /// for a frame where nothing changed.
+    gamepad: GamepadState,
+    gamepad_dirty: bool,
 }
+
+/// Evdev-style button index for each gamepad bit. The order has to
+/// match the companion's `WireInputMessage.Gamepad` decoder + the
+/// `GP_BTN_LIST` shipped by `ansync_input::uinput`. Adding a button?
+/// Bump both sides in lock-step.
+const GP_BIT_A: u32 = 1 << 0;
+const GP_BIT_B: u32 = 1 << 1;
+const GP_BIT_Y: u32 = 1 << 2;
+const GP_BIT_X: u32 = 1 << 3;
+const GP_BIT_L1: u32 = 1 << 4;
+const GP_BIT_R1: u32 = 1 << 5;
+const GP_BIT_SELECT: u32 = 1 << 6;
+const GP_BIT_START: u32 = 1 << 7;
+const GP_BIT_MODE: u32 = 1 << 8;
+const GP_BIT_THUMBL: u32 = 1 << 9;
+const GP_BIT_THUMBR: u32 = 1 << 10;
 
 impl MirrorApp {
     pub fn new(slot: FrameSlot, input_tx: Option<UnboundedSender<InputMessage>>) -> Self {
+        let gilrs = match gilrs::Gilrs::new() {
+            Ok(g) => Some(g),
+            Err(e) => {
+                warn!(error = %e, "gilrs init failed; gamepad forwarding disabled");
+                None
+            }
+        };
         Self {
             slot,
             last_size: None,
             last_format: None,
             input_tx,
             last_pointer: None,
+            gilrs,
+            gamepad: GamepadState {
+                buttons: 0,
+                lx: 0,
+                ly: 0,
+                rx: 0,
+                ry: 0,
+                lt: 0,
+                rt: 0,
+            },
+            gamepad_dirty: false,
         }
     }
+
+    fn poll_and_emit_gamepad(&mut self, tx: &UnboundedSender<InputMessage>) {
+        if self.gilrs.is_none() {
+            return;
+        }
+        // Drain every queued event into a buffer first so we can
+        // release the `&mut self.gilrs` borrow before mutating other
+        // fields via `apply_axis` / button bitmask updates.
+        let mut events: Vec<gilrs::EventType> = Vec::new();
+        {
+            let gilrs = self.gilrs.as_mut().expect("checked Some above");
+            while let Some(gilrs::Event { event, .. }) = gilrs.next_event() {
+                events.push(event);
+            }
+        }
+        for event in events {
+            match event {
+                gilrs::EventType::ButtonPressed(btn, _) => {
+                    if let Some(mask) = map_gilrs_button(btn) {
+                        let new = self.gamepad.buttons | mask;
+                        if new != self.gamepad.buttons {
+                            self.gamepad.buttons = new;
+                            self.gamepad_dirty = true;
+                        }
+                    }
+                }
+                gilrs::EventType::ButtonReleased(btn, _) => {
+                    if let Some(mask) = map_gilrs_button(btn) {
+                        let new = self.gamepad.buttons & !mask;
+                        if new != self.gamepad.buttons {
+                            self.gamepad.buttons = new;
+                            self.gamepad_dirty = true;
+                        }
+                    }
+                }
+                gilrs::EventType::AxisChanged(axis, value, _) => {
+                    self.apply_axis(axis, value);
+                }
+                gilrs::EventType::ButtonChanged(btn, value, _) => {
+                    // gilrs reports analog triggers as button changes
+                    // with `value` in [0, 1]; quantise to evdev's
+                    // u8 trigger range.
+                    match btn {
+                        gilrs::Button::LeftTrigger2 => {
+                            let v = (value.clamp(0.0, 1.0) * 255.0) as u8;
+                            if self.gamepad.lt != v {
+                                self.gamepad.lt = v;
+                                self.gamepad_dirty = true;
+                            }
+                        }
+                        gilrs::Button::RightTrigger2 => {
+                            let v = (value.clamp(0.0, 1.0) * 255.0) as u8;
+                            if self.gamepad.rt != v {
+                                self.gamepad.rt = v;
+                                self.gamepad_dirty = true;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+        if self.gamepad_dirty {
+            let snapshot = GamepadState {
+                buttons: self.gamepad.buttons,
+                lx: self.gamepad.lx,
+                ly: self.gamepad.ly,
+                rx: self.gamepad.rx,
+                ry: self.gamepad.ry,
+                lt: self.gamepad.lt,
+                rt: self.gamepad.rt,
+            };
+            let _ = send_input(tx, InputMessage::Gamepad(snapshot));
+            self.gamepad_dirty = false;
+        }
+    }
+
+    fn apply_axis(&mut self, axis: gilrs::Axis, value: f32) {
+        // f32 ∈ [-1, 1] → i16 ∈ [-32767, 32767]. Y axes are flipped
+        // so "stick up" reads as positive across drivers.
+        let q = (value.clamp(-1.0, 1.0) * 32767.0) as i16;
+        let updated = match axis {
+            gilrs::Axis::LeftStickX => set_axis(&mut self.gamepad.lx, q),
+            gilrs::Axis::LeftStickY => set_axis(&mut self.gamepad.ly, q),
+            gilrs::Axis::RightStickX => set_axis(&mut self.gamepad.rx, q),
+            gilrs::Axis::RightStickY => set_axis(&mut self.gamepad.ry, q),
+            gilrs::Axis::LeftZ => {
+                let v = ((value.clamp(0.0, 1.0)) * 255.0) as u8;
+                if self.gamepad.lt != v {
+                    self.gamepad.lt = v;
+                    true
+                } else {
+                    false
+                }
+            }
+            gilrs::Axis::RightZ => {
+                let v = ((value.clamp(0.0, 1.0)) * 255.0) as u8;
+                if self.gamepad.rt != v {
+                    self.gamepad.rt = v;
+                    true
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        };
+        if updated {
+            self.gamepad_dirty = true;
+        }
+    }
+}
+
+fn set_axis(slot: &mut i16, value: i16) -> bool {
+    if *slot != value {
+        *slot = value;
+        true
+    } else {
+        false
+    }
+}
+
+fn map_gilrs_button(b: gilrs::Button) -> Option<u32> {
+    use gilrs::Button::*;
+    Some(match b {
+        South => GP_BIT_A,
+        East => GP_BIT_B,
+        North => GP_BIT_Y,
+        West => GP_BIT_X,
+        LeftTrigger => GP_BIT_L1,
+        RightTrigger => GP_BIT_R1,
+        Select => GP_BIT_SELECT,
+        Start => GP_BIT_START,
+        Mode => GP_BIT_MODE,
+        LeftThumb => GP_BIT_THUMBL,
+        RightThumb => GP_BIT_THUMBR,
+        _ => return None,
+    })
 }
 
 impl eframe::App for MirrorApp {
@@ -229,6 +420,13 @@ impl eframe::App for MirrorApp {
             if self.last_size != Some(size) {
                 info!(width = size.0, height = size.1, format = ?f.format, "first frame uploaded");
                 self.last_size = Some(size);
+                // Reveal the window now that we have something to show.
+                // `Visible(true)` is idempotent, but we cache via
+                // `last_size` so it only fires on the first frame.
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                // Also pull focus on first show so input goes straight
+                // to the mirror without an extra alt-tab.
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
             }
             if self.last_format != Some(f.format) {
                 self.last_format = Some(f.format);
@@ -237,7 +435,19 @@ impl eframe::App for MirrorApp {
         let cur_dims = self.last_size;
 
         let mut hit_rect: Option<egui::Rect> = None;
-        egui::CentralPanel::default().show(ctx, |ui| {
+        // No frame, no padding, no inner margin — the texture should
+        // fill the viewport. Background black so letterbox bars (when
+        // the window aspect doesn't match the source) read as
+        // "nothing here" instead of egui's default panel colour.
+        let panel_frame = egui::Frame {
+            inner_margin: egui::Margin::ZERO,
+            outer_margin: egui::Margin::ZERO,
+            fill: egui::Color32::BLACK,
+            stroke: egui::Stroke::NONE,
+            corner_radius: egui::CornerRadius::ZERO,
+            shadow: egui::epaint::Shadow::NONE,
+        };
+        egui::CentralPanel::default().frame(panel_frame).show(ctx, |ui| {
             if let Some((fw, fh)) = cur_dims {
                 // egui_wgpu's renderer skips paint callbacks when the
                 // primitive's CLIP RECT (the painter's clip, not the
@@ -263,20 +473,11 @@ impl eframe::App for MirrorApp {
                         "mirror: first layout (rect goes to paint callback)"
                     );
                 }
-                // Diagnostic: paint a magenta rect underneath the
-                // callback. If the user sees magenta but no video,
-                // egui's mesh path renders fine into the rect and the
-                // problem is specific to the wgpu paint-callback
-                // bridge. If the rect is also missing, the rect is
-                // being clipped out entirely upstream. Remove once
-                // we're confident the callback path is working.
-                let painter = ui.painter_at(rect);
-                painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(255, 0, 255));
                 let cb = egui_wgpu::Callback::new_paint_callback(
                     rect,
                     MirrorCallback { frame: taken },
                 );
-                painter.add(cb);
+                ui.painter_at(rect).add(cb);
                 let _ = ui.allocate_rect(rect, egui::Sense::click_and_drag());
                 hit_rect = Some(rect);
             } else {
@@ -289,6 +490,25 @@ impl eframe::App for MirrorApp {
             (hit_rect, cur_dims, self.input_tx.as_ref())
         {
             emit_pointer_events(ctx, &mut self.last_pointer, rect, fw, fh, tx);
+        }
+        let tx_clone = self.input_tx.clone();
+        if let Some(tx) = tx_clone.as_ref() {
+            emit_keyboard_events(ctx, tx);
+            self.poll_and_emit_gamepad(tx);
+            // gilrs is poll-driven, not event-driven, so we need
+            // egui to wake periodically while a controller is
+            // attached even if the video stream pauses. 16 ms (~60
+            // Hz) matches typical input cadence and won't burn CPU
+            // when no gamepad is connected (`request_repaint_after`
+            // coalesces with any other repaint trigger).
+            if self
+                .gilrs
+                .as_ref()
+                .map(|g| g.gamepads().count() > 0)
+                .unwrap_or(false)
+            {
+                ctx.request_repaint_after(std::time::Duration::from_millis(16));
+            }
         }
         // No `request_repaint_after`: the producer wakes us via
         // `MirrorSlot::store` → `ctx.request_repaint()` whenever a
@@ -828,13 +1048,8 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let y_raw = textureSample(y_tex, samp, in.uv).r;
     let uv_raw = textureSample(uv_tex, samp, in.uv).rg;
     // BT.709 limited-range YUV → RGB. Android MediaCodec H.264
-    // encodes 1080p screen capture in BT.709 (HD primaries) with the
-    // standard limited range (Y in [16/255, 235/255], C in
-    // [16/255, 240/255]). Y scaled by 255/219 to map to [0,1]; Cb/Cr
-    // recentred at 128/255 then scaled by 255/224 to map to
-    // [-0.5, 0.5]. Skipping the chroma scale (`uv_raw - 0.5` only)
-    // leaves chroma under-saturated and gives the "washed out"
-    // colour look users see on Wayland targets.
+    // encodes 1080p screen capture in BT.709 with standard limited
+    // range (Y in [16/255, 235/255], C in [16/255, 240/255]).
     let y = (y_raw - 16.0 / 255.0) * (255.0 / 219.0);
     let cb = (uv_raw.r - 128.0 / 255.0) * (255.0 / 224.0);
     let cr = (uv_raw.g - 128.0 / 255.0) * (255.0 / 224.0);
@@ -979,4 +1194,91 @@ fn send_input(
         info!(?msg, "mirror: first input event dispatched");
     }
     tx.send(msg)
+}
+
+/// Forward keyboard events from the host window to the peer. Each
+/// `egui::Event::Key` becomes an `InputMessage::KeyPress { keycode,
+/// pressed }` where `keycode` is the evdev `KEY_*` code (the
+/// companion's `AnsyncAccessibilityService` then maps a curated
+/// subset to `performGlobalAction`s; arbitrary text input requires a
+/// future IME companion and is dropped silently for now).
+///
+/// Auto-repeat events are filtered out — Android's accessibility
+/// gestures fire on every press, so forwarding 30 Hz auto-repeat for
+/// the Backspace key would erase the buffer 30× per second of held
+/// key. The host can simulate hold semantics by sending press +
+/// release explicitly if a future flow requires it.
+fn emit_keyboard_events(ctx: &egui::Context, tx: &UnboundedSender<InputMessage>) {
+    ctx.input(|i| {
+        for event in &i.events {
+            match event {
+                egui::Event::Key {
+                    key,
+                    pressed,
+                    repeat,
+                    ..
+                } => {
+                    if *repeat {
+                        continue;
+                    }
+                    if let Some(keycode) = map_egui_key_to_evdev(*key) {
+                        let _ = send_input(
+                            tx,
+                            InputMessage::KeyPress {
+                                keycode,
+                                pressed: *pressed,
+                            },
+                        );
+                    }
+                }
+                egui::Event::Text(s) if !s.is_empty() => {
+                    // egui emits `Text` after IME composition / dead
+                    // keys, so this is the right event to forward as
+                    // an arbitrary-string insert (the companion calls
+                    // `ACTION_SET_TEXT` on the focused EditText).
+                    let _ = send_input(tx, InputMessage::Text(s.clone()));
+                }
+                _ => {}
+            }
+        }
+    });
+}
+
+/// `egui::Key` → Linux evdev `KEY_*` integer codes. Covers the keys
+/// the companion can actually replay (system navigation, DPAD on API
+/// 33+); everything else returns `None` so the dispatcher drops it
+/// without a round-trip across the wire.
+fn map_egui_key_to_evdev(k: egui::Key) -> Option<u32> {
+    use egui::Key::*;
+    Some(match k {
+        Escape => 1,
+        F1 => 59, F2 => 60, F3 => 61, F4 => 62, F5 => 63, F6 => 64,
+        F7 => 65, F8 => 66, F9 => 67, F10 => 68, F11 => 87, F12 => 88,
+        Backspace => 14,
+        Tab => 15,
+        Enter => 28,
+        Space => 57,
+        ArrowUp => 103,
+        ArrowDown => 108,
+        ArrowLeft => 105,
+        ArrowRight => 106,
+        Home => 102,
+        End => 107,
+        PageUp => 104,
+        PageDown => 109,
+        Delete => 111,
+        Insert => 110,
+        A => 30, B => 48, C => 46, D => 32, E => 18, F => 33,
+        G => 34, H => 35, I => 23, J => 36, K => 37, L => 38,
+        M => 50, N => 49, O => 24, P => 25, Q => 16, R => 19,
+        S => 31, T => 20, U => 22, V => 47, W => 17, X => 45,
+        Y => 21, Z => 44,
+        Num0 => 11, Num1 => 2, Num2 => 3, Num3 => 4, Num4 => 5,
+        Num5 => 6, Num6 => 7, Num7 => 8, Num8 => 9, Num9 => 10,
+        Minus => 12, Equals => 13,
+        OpenBracket => 26, CloseBracket => 27,
+        Backslash => 43, Semicolon => 39, Quote => 40,
+        Backtick => 41, Comma => 51, Period => 52, Slash => 53,
+        _ => return None,
+    })
 }

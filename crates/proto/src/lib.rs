@@ -221,6 +221,14 @@ pub enum InputMessage {
     TouchSlot { slot: u8, x: i32, y: i32, pressure: u16, tracking_id: i32 },
     Stylus { x: i32, y: i32, pressure: u16, tilt_x: i16, tilt_y: i16, btn: u8 },
     Gamepad(GamepadState),
+    /// Insert this UTF-8 string at the focused text field on the
+    /// peer. Used by the mirror window's keyboard handler for
+    /// arbitrary characters that the evdev `KeyPress` path can't
+    /// represent (everything past the curated system-key set the
+    /// `AccessibilityService` knows about). On Android the companion
+    /// realizes this via `AccessibilityNodeInfo.ACTION_SET_TEXT` on
+    /// the focused `EditText`.
+    Text(String),
 }
 
 #[derive(Debug, Serialize, Deserialize)]

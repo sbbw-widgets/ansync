@@ -3,6 +3,7 @@ package org.gameros.ansync
 import android.app.Activity
 import android.content.Context
 import android.content.Intent
+import android.media.projection.MediaProjectionConfig
 import android.media.projection.MediaProjectionManager
 import android.os.Build
 import android.os.Bundle
@@ -43,6 +44,20 @@ class GrantScreenCaptureActivity : ComponentActivity() {
             finish()
         }
         val mgr = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-        launcher.launch(mgr.createScreenCaptureIntent())
+        // Android 14+ ships `MediaProjectionConfig.createConfigForDefaultDisplay()`
+        // which pre-selects the full default display in the SystemUI
+        // chooser. The user still has to tap "Start now" — that's the
+        // OS-mandated security gate, we can't bypass it — but the
+        // intermediate "what do you want to share" step is skipped so
+        // it feels like a single confirmation, not a two-step picker.
+        // Older Android versions just see the standard intent.
+        val intent = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            mgr.createScreenCaptureIntent(
+                MediaProjectionConfig.createConfigForDefaultDisplay()
+            )
+        } else {
+            mgr.createScreenCaptureIntent()
+        }
+        launcher.launch(intent)
     }
 }

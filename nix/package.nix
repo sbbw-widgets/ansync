@@ -52,6 +52,7 @@ let
       wayland
       libGL
       libxkbcommon
+      udev
       vulkan-loader
       wl-clipboard
     ];

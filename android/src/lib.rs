@@ -1188,6 +1188,12 @@ fn encode_for_kotlin(msg: &InputMessage) -> Vec<u8> {
             out.push(state.lt);
             out.push(state.rt);
         }
+        InputMessage::Text(s) => {
+            out.push(7);
+            let bytes = s.as_bytes();
+            out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+            out.extend_from_slice(bytes);
+        }
     }
     out
 }
@@ -1377,6 +1383,14 @@ fn decode_input_from_kotlin(bytes: &[u8]) -> Result<InputMessage, String> {
             lt: c.take(1)?[0],
             rt: c.take(1)?[0],
         })),
+        7 => {
+            let len = c.take_u32()? as usize;
+            let bytes = c.take(len)?;
+            let s = std::str::from_utf8(bytes)
+                .map_err(|e| format!("Text: invalid utf8: {e}"))?
+                .to_string();
+            Ok(InputMessage::Text(s))
+        }
         other => Err(format!("unknown InputMessage tag {other}")),
     }
 }

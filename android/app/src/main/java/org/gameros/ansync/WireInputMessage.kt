@@ -40,6 +40,8 @@ sealed class WireInputMessage {
         val lt: Byte,
         val rt: Byte,
     ) : WireInputMessage()
+    /** UTF-8 text to inject at the focused text field. */
+    data class Text(val text: String) : WireInputMessage()
 
     fun encode(): ByteArray {
         val buf = mutableListOf<Byte>()
@@ -89,6 +91,12 @@ sealed class WireInputMessage {
                 u8(lt.toInt() and 0xFF)
                 u8(rt.toInt() and 0xFF)
             }
+            is Text -> {
+                u8(7)
+                val payload = text.toByteArray(Charsets.UTF_8)
+                u32(payload.size)
+                payload.forEach { buf.add(it) }
+            }
         }
         return buf.toByteArray()
     }
@@ -126,6 +134,12 @@ sealed class WireInputMessage {
                     lt = buf.get(),
                     rt = buf.get(),
                 )
+                7 -> {
+                    val len = buf.int
+                    val arr = ByteArray(len)
+                    buf.get(arr)
+                    Text(String(arr, Charsets.UTF_8))
+                }
                 else -> throw IllegalArgumentException("unknown WireInputMessage tag $tag")
             }
         }

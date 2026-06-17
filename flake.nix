@@ -73,6 +73,12 @@
             # Bluetooth
             bluez
 
+            # Gamepad input — `gilrs` opens evdev nodes for connected
+            # controllers and pulls hot-plug events from libudev. We
+            # use `eudev` (the systemd-less fork) so the runtime
+            # closure doesn't drag in the full init system.
+            eudev
+
             # GUI — wgpu + eframe runtime
             wayland
             libGL

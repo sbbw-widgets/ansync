@@ -235,5 +235,10 @@ fn wire_to_event(msg: InputMessage) -> InputEvent {
             lt: state.lt,
             rt: state.rt,
         },
+        // Text injection is a host → peer message (Android side
+        // realises it via `ACTION_SET_TEXT`); there's no uinput event
+        // that would let the host evdev sink consume it, so map to
+        // `Sync` as a no-op.
+        InputMessage::Text(_) => InputEvent::Sync,
     }
 }

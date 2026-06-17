@@ -34,6 +34,10 @@ wgpu.workspace = true
 # main). Version pinned to match what eframe 0.31 transitively
 # requires; cargo dedupes if either side moves.
 winit = { version = "0.30", default-features = false, features = ["x11", "wayland"] }
+# Gamepad input forwarded from the host window to the peer device.
+# `gilrs` reads /dev/input/event* directly on Linux so neither the
+# eframe window nor the wgpu adapter has to know about controllers.
+gilrs = "0.11"
 
 [features]
 default = []

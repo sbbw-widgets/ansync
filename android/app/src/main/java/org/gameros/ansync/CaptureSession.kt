@@ -1,11 +1,13 @@
 package org.gameros.ansync
 
+import android.content.Context
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaFormat
 import android.os.Bundle
+import android.view.WindowManager
 import android.media.projection.MediaProjection
 import android.util.DisplayMetrics
 import android.util.Log
@@ -28,6 +30,7 @@ import kotlin.concurrent.thread
  * explicitly when a new viewer attaches in Step 7d-4).
  */
 class CaptureSession(
+    private val context: Context,
     private val projection: MediaProjection,
     private val config: CaptureConfig,
 ) {
@@ -39,8 +42,15 @@ class CaptureSession(
 
     fun start() {
         if (running) return
+        // Capture at the device display's native aspect ratio,
+        // capped to `config.maxWidth`. This avoids the pillarbox
+        // bands that `VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR` adds when
+        // the encoder size doesn't match the display aspect — those
+        // bands threw off the host's `scaleToDisplay` math at the
+        // screen edges, so taps landed ~150 px off in corners.
+        val (capW, capH, dpi) = resolveCaptureDims()
         val mimeType = MediaFormat.MIMETYPE_VIDEO_AVC
-        val format = MediaFormat.createVideoFormat(mimeType, config.width, config.height).apply {
+        val format = MediaFormat.createVideoFormat(mimeType, capW, capH).apply {
             setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
             setInteger(MediaFormat.KEY_BIT_RATE, config.bitrateKbps * 1000)
             setInteger(MediaFormat.KEY_FRAME_RATE, config.fps)
@@ -57,16 +67,11 @@ class CaptureSession(
         }
         encoder = codec
 
-        val metrics = DisplayMetrics().apply {
-            densityDpi = config.densityDpi
-            widthPixels = config.width
-            heightPixels = config.height
-        }
         virtualDisplay = projection.createVirtualDisplay(
             VIRTUAL_DISPLAY_NAME,
-            config.width,
-            config.height,
-            metrics.densityDpi,
+            capW,
+            capH,
+            dpi,
             DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
             inputSurface,
             null,
@@ -74,8 +79,43 @@ class CaptureSession(
         )
 
         running = true
+        // Publish the actual capture dimensions so input replay can
+        // map coordinates correctly. Reads from `lastCapture*` are
+        // racey but harmless: stale read just means one off-screen
+        // tap until the next replay tick refreshes.
+        lastCaptureWidth = capW
+        lastCaptureHeight = capH
+        Log.i(TAG, "capture started at ${capW}x${capH} @ ${dpi}dpi")
         drainThread = thread(name = "ansync-encoder-drain") { drainLoop(codec) }
     }
+
+    /**
+     * Read the device's real display metrics and derive an encoder-
+     * friendly size that preserves the source aspect. Caps width at
+     * `config.maxWidth` so we don't try to push 2944-wide native
+     * panels through the Baseline encoder at full resolution.
+     * Returns `Triple(width, height, densityDpi)` — both width and
+     * height are forced even so the H.264 encoder accepts them.
+     */
+    private fun resolveCaptureDims(): Triple<Int, Int, Int> {
+        val wm = context.getSystemService(Context.WINDOW_SERVICE) as? WindowManager
+        val dm = DisplayMetrics().also {
+            @Suppress("DEPRECATION")
+            wm?.defaultDisplay?.getRealMetrics(it)
+        }
+        val nativeW = dm.widthPixels.coerceAtLeast(1)
+        val nativeH = dm.heightPixels.coerceAtLeast(1)
+        val nativeDpi = dm.densityDpi.coerceAtLeast(120)
+        val (w, h) = if (nativeW > config.maxWidth) {
+            val scale = config.maxWidth.toFloat() / nativeW.toFloat()
+            (config.maxWidth.toEven()) to (nativeH * scale).toInt().toEven()
+        } else {
+            nativeW.toEven() to nativeH.toEven()
+        }
+        return Triple(w, h, nativeDpi)
+    }
+
+    private fun Int.toEven(): Int = if (this % 2 == 0) this else this - 1
 
     /**
      * Force the encoder to emit a SYNC frame (IDR / keyframe) on its
@@ -194,6 +234,18 @@ class CaptureSession(
         private const val TAG = "ansync.capture"
         private const val VIRTUAL_DISPLAY_NAME = "ansync-mirror"
         private const val TIMEOUT_DRAIN_JOIN_MS = 1_000L
+
+        /**
+         * Last-published capture dimensions. Other companion components
+         * (notably [AnsyncAccessibilityService]) read these to map host
+         * coordinates back into the device's display pixel grid. Volatile
+         * because writes happen on the capture-init thread and reads can
+         * land on the AccessibilityService poller thread.
+         */
+        @Volatile var lastCaptureWidth: Int = 1920
+            private set
+        @Volatile var lastCaptureHeight: Int = 1080
+            private set
     }
 }
 
@@ -204,9 +256,11 @@ class CaptureSession(
  * Step 7d-4.
  */
 data class CaptureConfig(
-    val width: Int = 1920,
-    val height: Int = 1080,
-    val densityDpi: Int = 320,
+    /** Upper bound on the encoded width. Native display panels can
+     *  exceed this (e.g. 2944 px on the Lenovo P12); we downscale so
+     *  the Baseline encoder doesn't churn at 4K. Height is always
+     *  derived from the native aspect to avoid pillarboxing. */
+    val maxWidth: Int = 1920,
     val bitrateKbps: Int = 8_000,
     val fps: Int = 60,
     val iFrameIntervalSec: Int = 5,

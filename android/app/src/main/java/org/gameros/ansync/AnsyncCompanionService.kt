@@ -476,7 +476,7 @@ class AnsyncCompanionService : Service() {
                             Handler(mainLooper).post { stopCapture() }
                         }
                     }, Handler(mainLooper))
-                    val session = CaptureSession(proj, CaptureConfig()).also { it.start() }
+                    val session = CaptureSession(this, proj, CaptureConfig()).also { it.start() }
                     Handler(mainLooper).post {
                         projection = proj
                         capture = session
