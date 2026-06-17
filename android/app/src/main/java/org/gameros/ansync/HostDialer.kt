@@ -93,6 +93,26 @@ class HostDialer(private val ctx: Context) {
         // so if we're already on Wi-Fi at start-up we'd otherwise
         // sit idle until the user toggles airplane mode.
         handler.post(::dialOnce)
+        // Liveness poll: the network callbacks fire on link drops but
+        // NOT on a peer dying mid-session (daemon restart, QUIC idle
+        // timeout). Ask the native side every few seconds whether the
+        // QUIC session is still up; flip our local `connected` cache
+        // + redial when it isn't.
+        handler.postDelayed(livenessProbe, LIVENESS_INTERVAL_MS)
+    }
+
+    private val livenessProbe = object : Runnable {
+        override fun run() {
+            if (callback == null) return
+            if (connected && !NativeBridge.nativeIsConnected()) {
+                Log.i(TAG, "native reports session down — redialing")
+                connected = false
+                backoffMs = INITIAL_BACKOFF_MS
+                publishSearchingIfPaired()
+                handler.post(::dialOnce)
+            }
+            handler.postDelayed(this, LIVENESS_INTERVAL_MS)
+        }
     }
 
     fun stop() {
@@ -229,5 +249,9 @@ class HostDialer(private val ctx: Context) {
         /** mDNS gets ~5 s grace; after that we try direct addresses
          *  the host shared during cable pair. */
         private const val FALLBACK_DELAY_MS = 5_000L
+        /** Liveness probe cadence. Low enough that a daemon restart
+         *  reconnects within a couple of seconds, high enough that
+         *  it costs nothing on idle. */
+        private const val LIVENESS_INTERVAL_MS = 3_000L
     }
 }

@@ -12,7 +12,21 @@
 //! via `nativePollInputMessage`.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
+
+/// Global liveness flag for the active QUIC session against the host.
+/// Set to `true` after a successful `nativeOpenConnection` handshake
+/// and cleared by `streams_accept_loop` the moment the accept side
+/// errors out (peer closed, daemon restarted, network dropped, …).
+/// `HostDialer` polls this so it can clear its Kotlin-side
+/// `connected` cache + reschedule a dial without waiting for a
+/// network transition.
+static CONNECTED: AtomicBool = AtomicBool::new(false);
+
+fn mark_connected(state: bool) {
+    CONNECTED.store(state, Ordering::Relaxed);
+}
 
 use ansync_core::{Capabilities, DeviceId, DeviceName, DevicePermissions, Permission};
 use ansync_crypto::IdentityKeypair;
@@ -544,7 +558,23 @@ pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativeOpenConnection
     if let Some(s) = slot.as_mut() {
         s.session = Some(session);
     }
+    mark_connected(true);
     jni::sys::JNI_TRUE
+}
+
+/// Polled by `HostDialer` (Kotlin) to detect post-handshake drops
+/// the network callbacks can't see — daemon restart, QUIC idle
+/// timeout, peer reset. Returns `true` while the session is live.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativeIsConnected<'local>(
+    _env: JNIEnv<'local>,
+    _class: JClass<'local>,
+) -> jboolean {
+    if CONNECTED.load(Ordering::Relaxed) {
+        jni::sys::JNI_TRUE
+    } else {
+        jni::sys::JNI_FALSE
+    }
 }
 
 async fn streams_accept_loop(
@@ -564,6 +594,16 @@ async fn streams_accept_loop(
     file_ctrl_tx: Arc<UnboundedSender<Vec<u8>>>,
 ) {
     let permissions: Arc<dyn PermissionsStore> = Arc::new(PermissivePermissions);
+    // Helper struct so any early return out of the accept loop —
+    // graceful Closed or a hard error — flips the global liveness
+    // flag and unblocks HostDialer's poll. Drop = transport gone.
+    struct ConnGuard;
+    impl Drop for ConnGuard {
+        fn drop(&mut self) {
+            mark_connected(false);
+        }
+    }
+    let _guard = ConnGuard;
     loop {
         let (kind, stream) = match conn.accept().await {
             Ok(v) => v,

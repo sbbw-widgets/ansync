@@ -211,6 +211,15 @@ object NativeBridge {
     external fun nativeClose()
 
     /**
+     * `true` while the QUIC session against the host is still up.
+     * Flips back to `false` the moment the native accept loop sees
+     * the connection closed (daemon restart, idle timeout, network
+     * drop). [HostDialer] polls this so it can redial without
+     * waiting for the OS to surface a network transition.
+     */
+    external fun nativeIsConnected(): Boolean
+
+    /**
      * Start the always-on WiFi pair listener. Idempotent — subsequent
      * calls return the already-bound port. Returns the listener port
      * (`> 0`) on success, or `-1` on bind failure. The companion
