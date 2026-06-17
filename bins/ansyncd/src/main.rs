@@ -47,20 +47,17 @@ struct Args {
 #[derive(Debug, Subcommand)]
 enum SubCmd {
     /// Per-window mirror renderer subprocess. Spawned by the daemon —
-    /// not meant to be invoked directly.
-    MirrorRenderer {
-        /// Unix socket path the daemon set up for this window.
-        #[arg(long)]
-        sock: PathBuf,
-    },
+    /// not meant to be invoked directly. Reads `HostMsg` frames from
+    /// stdin, writes `RendererMsg` frames to stdout.
+    MirrorRenderer,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     install_logging()?;
     let args = Args::parse();
 
-    if let Some(SubCmd::MirrorRenderer { sock }) = &args.cmd {
-        return mirror_renderer::run(sock.clone());
+    if let Some(SubCmd::MirrorRenderer) = &args.cmd {
+        return mirror_renderer::run();
     }
 
     let runtime = tokio::runtime::Builder::new_multi_thread()

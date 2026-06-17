@@ -47,7 +47,7 @@ ansync-dbus = { path = "crates/dbus" }
 ansync-daemon-core = { path = "crates/daemon-core" }
 
 # Async runtime
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "fs", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "fs", "signal", "process"] }
 futures = "0.3"
 async-trait = "0.1"
 

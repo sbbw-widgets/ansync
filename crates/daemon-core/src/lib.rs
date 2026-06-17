@@ -380,16 +380,17 @@ pub struct MirrorEntry {
     pub video_inbound: std::sync::atomic::AtomicBool,
 }
 
-/// Handle to a running mirror subprocess. Dropping it doesn't kill
-/// the child — that's the action loop's job via
-/// `MirrorSubprocess::shutdown_via_socket`.
+/// Handle to a running mirror subprocess. The child itself is
+/// awaited inside `mirror_subprocess::spawn_mirror_subprocess`'s wait
+/// task; this struct only carries the pieces the action loop needs
+/// to request a graceful shutdown.
 pub struct MirrorSubprocess {
-    pub child: std::process::Child,
-    /// `Some` so we can ask the child to exit cleanly over the IPC
-    /// socket. Cleared after a successful shutdown so a follow-up
-    /// HideScreen doesn't re-send.
+    /// `Some` so we can ask the child to exit cleanly via a
+    /// `HostMsg::Shutdown` frame on stdin. Cleared after a successful
+    /// shutdown so a follow-up HideScreen doesn't re-send.
     pub host_tx: Option<UnboundedSender<ansync_video::ipc::HostMsg>>,
-    pub sock_path: std::path::PathBuf,
+    /// Best-effort PID for tracing diagnostics.
+    pub pid: u32,
 }
 
 /// Per-peer audio pipeline state. Like `CameraRegistry`, but with
@@ -770,7 +771,10 @@ async fn action_loop(
                     if let Some(tx) = sp.host_tx.take() {
                         let _ = tx.send(ansync_video::ipc::HostMsg::Shutdown);
                     }
-                    let _ = sp.child.kill();
+                    // Closing host_tx → writer task drops child_stdin
+                    // → renderer sees EOF → exits. `kill_on_drop` on
+                    // the child handle in `spawn_mirror_subprocess`
+                    // is the safety net if the renderer hangs.
                 }
                 // Tell the companion to drop the encoder + projection
                 // too so the device's foreground notification clears.
@@ -937,21 +941,17 @@ async fn handle_connection(
             StreamKind::Video => {
                 let entry = mirror_entry.clone();
                 let pid = peer_id.clone();
-                // Mark inbound BEFORE handing ShowScreen to the
-                // action loop — otherwise the handler's
-                // `video_inbound` check could fire on a false
-                // negative and push an unwanted
-                // `RequestScreenCapture` to the device.
                 entry
                     .video_inbound
                     .store(true, std::sync::atomic::Ordering::Relaxed);
+                let action_tx = dbus_state.actions.clone();
                 // Companion-initiated mirror (QSTile MediaProjection
                 // grant) opens Video before the host knows. Trigger
                 // ShowScreen so the renderer subprocess spawns.
-                if let Some(tx) = dbus_state.actions.as_ref() {
+                if let Some(tx) = action_tx.as_ref() {
                     let _ = tx.send(DaemonAction::ShowScreen { device: pid.clone() });
                 }
-                tokio::spawn(video_stream_loop(stream, entry, pid));
+                tokio::spawn(video_stream_loop(stream, entry, pid, action_tx));
             }
             StreamKind::Camera => {
                 let entry = camera_entry.clone();
@@ -1859,6 +1859,7 @@ async fn video_stream_loop(
     mut stream: QuicStream,
     entry: Arc<MirrorEntry>,
     peer_id: DeviceId,
+    action_tx: Option<UnboundedSender<DaemonAction>>,
 ) {
     info!(%peer_id, "video stream wired");
     // The decoder lives in the per-window mirror subprocess now.
@@ -1868,18 +1869,32 @@ async fn video_stream_loop(
     // are dropped silently, which is fine: the companion keeps
     // capturing only because the device-side decision (QSTile / D-Bus)
     // told it to.
+    // When the QUIC video stream ends (Android stopped capturing,
+    // tile flipped off, peer disconnected, etc.) tear the mirror
+    // window down too — there's no point keeping a renderer
+    // subprocess alive showing the last frozen frame, and the user
+    // explicitly does NOT want a window that outlives the stream.
     struct InboundGuard {
         entry: Arc<MirrorEntry>,
+        peer_id: DeviceId,
+        action_tx: Option<UnboundedSender<DaemonAction>>,
     }
     impl Drop for InboundGuard {
         fn drop(&mut self) {
             self.entry
                 .video_inbound
                 .store(false, std::sync::atomic::Ordering::Relaxed);
+            if let Some(tx) = self.action_tx.as_ref() {
+                let _ = tx.send(DaemonAction::HideScreen {
+                    device: self.peer_id.clone(),
+                });
+            }
         }
     }
     let _guard = InboundGuard {
         entry: entry.clone(),
+        peer_id: peer_id.clone(),
+        action_tx,
     };
     let mut first_chunk_logged = false;
     let mut chunks_since_log: u64 = 0;
