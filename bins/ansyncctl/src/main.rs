@@ -464,6 +464,11 @@ fn needs_upgrade(installed: Option<&str>, tag: &str) -> bool {
 ///   3. mDNS browse for `_ansync-pair._tcp` finds 1 companion → WiFi.
 ///   4. mDNS browse finds N > 1 → interactive prompt → WiFi.
 ///   5. Nothing found → error.
+///
+/// All WiFi paths go through D-Bus (`Manager.StartPairing` +
+/// `PairingSession`) when the daemon is up so the widget and the CLI
+/// observe the same session lifecycle. The direct fallback only kicks
+/// in when D-Bus is unreachable.
 async fn pair_dispatch(
     serial: Option<String>,
     remote_addr: Option<String>,
@@ -474,10 +479,7 @@ async fn pair_dispatch(
     discover_seconds: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(addr) = remote_addr {
-        let socket: std::net::SocketAddr = addr
-            .parse()
-            .map_err(|e| format!("--remote-addr must be `ip:port`: {e}"))?;
-        return pair_wifi(socket, None, name).await;
+        return pair_wifi_addr(addr, None, name, discover_seconds).await;
     }
     if serial.is_some() {
         return pair(serial, name, apk, auto_upgrade, skip_upgrade_check).await;
@@ -490,9 +492,7 @@ async fn pair_dispatch(
         "no ADB devices; browsing LAN for pair-ready companions ({}s) …",
         discover_seconds
     );
-    let candidates = ansync_pairing::browse_pair_candidates(Duration::from_secs(discover_seconds))
-        .await
-        .map_err(|e| format!("mdns browse: {e}"))?;
+    let candidates = browse_via_dbus_or_local(discover_seconds).await?;
     let picked = match candidates.len() {
         0 => {
             return Err(
@@ -508,10 +508,234 @@ async fn pair_dispatch(
         picked.addr,
         hex_short(&picked.pubkey)
     );
-    pair_wifi(picked.addr, Some(picked.pubkey), name).await
+    pair_wifi_addr(
+        picked.addr.to_string(),
+        Some(picked.pubkey),
+        name,
+        discover_seconds,
+    )
+    .await
 }
 
-async fn pair_wifi(
+/// Browse via the running daemon when it is up (so both the widget
+/// and the CLI walk the same mdns daemon and don't double-bind the
+/// 5353 socket), otherwise fall back to a local mDNS browse.
+async fn browse_via_dbus_or_local(
+    seconds: u64,
+) -> Result<Vec<ansync_pairing::PairCandidate>, Box<dyn std::error::Error>> {
+    match dbus_browse_available(seconds as u32).await {
+        Ok(v) if !v.is_empty() => Ok(v),
+        Ok(_) => Ok(ansync_pairing::browse_pair_candidates(Duration::from_secs(seconds))
+            .await
+            .map_err(|e| format!("mdns browse: {e}"))?),
+        Err(e) => {
+            eprintln!("note: daemon D-Bus browse failed ({e}); using direct mdns");
+            Ok(ansync_pairing::browse_pair_candidates(Duration::from_secs(seconds))
+                .await
+                .map_err(|e| format!("mdns browse: {e}"))?)
+        }
+    }
+}
+
+async fn dbus_browse_available(
+    seconds: u32,
+) -> Result<Vec<ansync_pairing::PairCandidate>, Box<dyn std::error::Error>> {
+    let conn = zbus::Connection::session().await?;
+    let proxy = zbus::Proxy::new(
+        &conn,
+        ansync_dbus::SERVICE_NAME,
+        ansync_dbus::PATH_MANAGER,
+        "org.gameros.Ansync1.Manager",
+    )
+    .await?;
+    let raw: Vec<(String, String, String)> = proxy.call("BrowseAvailable", &seconds).await?;
+    let mut out = Vec::with_capacity(raw.len());
+    for (name, addr, pubkey_hex) in raw {
+        let addr: std::net::SocketAddr = match addr.parse() {
+            Ok(a) => a,
+            Err(_) => continue,
+        };
+        let bytes = match hex::decode(&pubkey_hex) {
+            Ok(b) if b.len() == 32 => b,
+            _ => continue,
+        };
+        let mut pubkey = [0u8; 32];
+        pubkey.copy_from_slice(&bytes);
+        out.push(ansync_pairing::PairCandidate { addr, pubkey, name });
+    }
+    Ok(out)
+}
+
+/// Try the D-Bus path first (so the widget and the CLI stay in sync
+/// on session lifecycle); fall back to direct dial when the daemon is
+/// not running.
+async fn pair_wifi_addr(
+    addr: String,
+    expected_pubkey: Option<[u8; 32]>,
+    name: Option<String>,
+    _seconds: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let socket: std::net::SocketAddr = addr
+        .parse()
+        .map_err(|e| format!("addr must be `ip:port`: {e}"))?;
+    match pair_wifi_via_dbus(&addr, expected_pubkey).await {
+        Ok(()) => Ok(()),
+        Err(DbusPairError::Daemon(e)) => {
+            eprintln!("note: daemon D-Bus pair failed ({e}); falling back to direct dial");
+            pair_wifi_direct(socket, expected_pubkey, name).await
+        }
+        Err(DbusPairError::Pair(e)) => Err(e),
+    }
+}
+
+#[derive(Debug)]
+enum DbusPairError {
+    /// Could not reach the daemon at all (no D-Bus connection, no
+    /// well-known name, no Manager interface). Caller falls back to
+    /// the direct path.
+    Daemon(String),
+    /// Daemon reachable but the pair itself failed (wrong PIN,
+    /// network drop, peer impersonation). Caller bubbles up.
+    Pair(Box<dyn std::error::Error>),
+}
+
+/// Drive the pair through `Manager.StartPairing` + the returned
+/// `PairingSession` interface. Listens to `PropertiesChanged` to know
+/// when to prompt for the PIN, and to `Completed`/`Failed` to know
+/// when the worker terminates.
+async fn pair_wifi_via_dbus(
+    addr: &str,
+    expected_pubkey: Option<[u8; 32]>,
+) -> Result<(), DbusPairError> {
+    use futures::StreamExt;
+
+    let conn = zbus::Connection::session()
+        .await
+        .map_err(|e| DbusPairError::Daemon(format!("session bus: {e}")))?;
+    let mgr = zbus::Proxy::new(
+        &conn,
+        ansync_dbus::SERVICE_NAME,
+        ansync_dbus::PATH_MANAGER,
+        "org.gameros.Ansync1.Manager",
+    )
+    .await
+    .map_err(|e| DbusPairError::Daemon(format!("manager proxy: {e}")))?;
+
+    let pubkey_hex = expected_pubkey
+        .map(|pk| hex::encode(pk))
+        .unwrap_or_default();
+    let session_path: zbus::zvariant::OwnedObjectPath = mgr
+        .call("StartPairing", &(addr.to_string(), pubkey_hex))
+        .await
+        .map_err(|e| match e {
+            zbus::Error::MethodError(name, _, _) => {
+                DbusPairError::Pair(format!("StartPairing: {name}").into())
+            }
+            other => DbusPairError::Daemon(format!("StartPairing: {other}")),
+        })?;
+
+    println!("pair session at {}", session_path.as_str());
+
+    let session = zbus::Proxy::new(
+        &conn,
+        ansync_dbus::SERVICE_NAME,
+        session_path.as_ref(),
+        "org.gameros.Ansync1.PairingSession",
+    )
+    .await
+    .map_err(|e| DbusPairError::Pair(format!("session proxy: {e}").into()))?;
+
+    let props = zbus::fdo::PropertiesProxy::builder(&conn)
+        .destination(ansync_dbus::SERVICE_NAME)
+        .map_err(|e| DbusPairError::Pair(format!("props builder dest: {e}").into()))?
+        .path(session_path.as_ref())
+        .map_err(|e| DbusPairError::Pair(format!("props builder path: {e}").into()))?
+        .build()
+        .await
+        .map_err(|e| DbusPairError::Pair(format!("props proxy: {e}").into()))?;
+
+    let mut completed_signal = session
+        .receive_signal("Completed")
+        .await
+        .map_err(|e| DbusPairError::Pair(format!("subscribe Completed: {e}").into()))?;
+    let mut failed_signal = session
+        .receive_signal("Failed")
+        .await
+        .map_err(|e| DbusPairError::Pair(format!("subscribe Failed: {e}").into()))?;
+    let mut props_changed = props
+        .receive_properties_changed()
+        .await
+        .map_err(|e| DbusPairError::Pair(format!("subscribe PropertiesChanged: {e}").into()))?;
+
+    let mut pin_submitted = false;
+    if read_session_state(&session).await.as_deref() == Some("awaiting_pin") {
+        submit_pin_via_session(&session).await?;
+        pin_submitted = true;
+    }
+
+    loop {
+        tokio::select! {
+            biased;
+            Some(msg) = completed_signal.next() => {
+                let body: (String, String) = msg
+                    .body()
+                    .deserialize()
+                    .map_err(|e| DbusPairError::Pair(format!("Completed body: {e}").into()))?;
+                println!("paired: device_id={} name={}", body.0, body.1);
+                if let Err(e) = post_setup_notification(&body.1).await {
+                    eprintln!("note: failed to post desktop notification: {e}");
+                }
+                return Ok(());
+            }
+            Some(msg) = failed_signal.next() => {
+                let body: (String,) = msg
+                    .body()
+                    .deserialize()
+                    .map_err(|e| DbusPairError::Pair(format!("Failed body: {e}").into()))?;
+                return Err(DbusPairError::Pair(format!("pair failed: {}", body.0).into()));
+            }
+            Some(_) = props_changed.next() => {
+                if pin_submitted { continue; }
+                let state = read_session_state(&session).await;
+                if state.as_deref() == Some("awaiting_pin") {
+                    submit_pin_via_session(&session).await?;
+                    pin_submitted = true;
+                }
+            }
+        }
+    }
+}
+
+async fn read_session_state(session: &zbus::Proxy<'_>) -> Option<String> {
+    session.get_property::<String>("State").await.ok()
+}
+
+async fn submit_pin_via_session(session: &zbus::Proxy<'_>) -> Result<(), DbusPairError> {
+    let host_name = session
+        .get_property::<String>("HostName")
+        .await
+        .unwrap_or_default();
+    if !host_name.is_empty() {
+        println!("device replied: `{host_name}`");
+    }
+    let pin = read_pin_interactive()
+        .map_err(|e| DbusPairError::Pair(format!("read PIN: {e}").into()))?;
+    let pin_str = std::str::from_utf8(&pin)
+        .map_err(|e| DbusPairError::Pair(format!("PIN utf8: {e}").into()))?
+        .to_string();
+    session
+        .call::<_, _, ()>("SubmitPin", &pin_str)
+        .await
+        .map_err(|e| match e {
+            zbus::Error::MethodError(name, body, _) => DbusPairError::Pair(
+                format!("SubmitPin rejected: {name} {body:?}").into(),
+            ),
+            other => DbusPairError::Daemon(format!("SubmitPin: {other}")),
+        })?;
+    Ok(())
+}
+
+async fn pair_wifi_direct(
     addr: std::net::SocketAddr,
     expected_pubkey: Option<[u8; 32]>,
     name: Option<String>,

@@ -481,6 +481,7 @@ dependencies = [
  "clap",
  "directories",
  "futures",
+ "hex",
  "tokio",
  "tracing",
  "tracing-subscriber",
