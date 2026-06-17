@@ -261,6 +261,84 @@ pub struct PairCandidate {
     pub name: String,
 }
 
+/// Long-lived presence event from [`watch_pair_candidates`]. Resolves
+/// to a continuously-updated picture of "which paired companions are
+/// on the LAN right now" — daemon uses it to emit
+/// `Manager.DeviceReachable` signals so widgets can paint green / red
+/// without waiting for the companion to actually dial in.
+#[cfg(feature = "host")]
+#[derive(Debug, Clone)]
+pub enum PairWatchEvent {
+    /// A companion advertised its pair-ready listener.
+    Resolved(PairCandidate),
+    /// A previously-resolved companion stopped advertising — typically
+    /// because the device dropped off Wi-Fi or the service was torn
+    /// down. The `instance` is the mDNS instance name (typically
+    /// `ansync-<Build.MODEL>`).
+    Removed(String),
+}
+
+/// Open a long-lived mDNS browser for [`PAIR_MDNS_SERVICE_TYPE`]
+/// returning a tokio `UnboundedReceiver` of [`PairWatchEvent`]. The
+/// returned [`mdns_sd::ServiceDaemon`] handle keeps the browser alive;
+/// dropping it shuts the browser down.
+#[cfg(feature = "host")]
+pub fn watch_pair_candidates() -> Result<
+    (
+        mdns_sd::ServiceDaemon,
+        tokio::sync::mpsc::UnboundedReceiver<PairWatchEvent>,
+    ),
+    PairingError,
+> {
+    use mdns_sd::{ServiceDaemon, ServiceEvent};
+
+    let daemon = ServiceDaemon::new()
+        .map_err(|e| PairingError::Protocol(format!("mdns daemon: {e}")))?;
+    let receiver = daemon
+        .browse(PAIR_MDNS_SERVICE_TYPE)
+        .map_err(|e| PairingError::Protocol(format!("mdns browse: {e}")))?;
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Ok(event) = receiver.recv_async().await {
+            match event {
+                ServiceEvent::ServiceResolved(info) => {
+                    let Some(pubkey_hex) = info.get_property_val_str(PAIR_MDNS_TXT_PUBKEY) else {
+                        continue;
+                    };
+                    let Some(name) = info.get_property_val_str(PAIR_MDNS_TXT_NAME) else {
+                        continue;
+                    };
+                    let Some(pubkey) = parse_pubkey_hex(pubkey_hex) else {
+                        continue;
+                    };
+                    let port = info.get_port();
+                    let Some(&ip) = info.get_addresses().iter().next() else {
+                        continue;
+                    };
+                    let addr = std::net::SocketAddr::new(ip, port);
+                    if tx
+                        .send(PairWatchEvent::Resolved(PairCandidate {
+                            addr,
+                            pubkey,
+                            name: name.to_string(),
+                        }))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                ServiceEvent::ServiceRemoved(_, fullname) => {
+                    if tx.send(PairWatchEvent::Removed(fullname)).is_err() {
+                        break;
+                    }
+                }
+                _ => continue,
+            }
+        }
+    });
+    Ok((daemon, rx))
+}
+
 /// Browse the LAN for companions advertising [`PAIR_MDNS_SERVICE_TYPE`].
 /// Blocks (cooperatively) for `timeout` and returns one entry per
 /// resolved pubkey (deduped — companions answer on every NIC).

@@ -26,7 +26,10 @@ pub use wifi::{
     CompanionWifiOutcome, PAIR_MDNS_SERVICE_TYPE, PAIR_MDNS_TXT_NAME, PAIR_MDNS_TXT_PUBKEY,
 };
 #[cfg(feature = "host")]
-pub use wifi::{browse_pair_candidates, pair_host_via_wifi, PairCandidate};
+pub use wifi::{
+    browse_pair_candidates, pair_host_via_wifi, watch_pair_candidates, PairCandidate,
+    PairWatchEvent,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum PairingError {

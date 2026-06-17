@@ -430,10 +430,10 @@ Surfaceado tras primera ronda de smoke test real con DMS widget + companion. PLA
   - Companion Kotlin: `AnsyncCompanionService.startCaptureControlPoller()` worker thread `ansync-cap-ctrl`. Tag 0 → `requestCaptureFromUser()` (high-priority notif "tap to grant" → `GrantScreenCaptureActivity` → MediaProjection picker → `ACTION_START_CAPTURE`). Tag 1 → `stopCapture()`.
   - Auto-connect: `HostDialer` (U4c) cubre el escenario "device unlocks → wifi up → companion dials host automáticamente". Host-side mDNS host-discovers-companion deferred (companion already announces via daemon's mDNS announce; host browse mechanism = follow-up).
 
-- [ ] **U5 — Auto-connect mDNS host-side** (cierra síntoma 5)
-  - Host descubre companion via mDNS al boot del daemon → si pubkey matchea `PeerStore` → connect automático.
-  - Drop "Connect to X (IP)" botón del companion (ya implementado en post-9.5 gap closer pero ahora redundante).
-  - Re-connect on suspend/resume via netlink watch.
+- [x] **U5 — Auto-connect mDNS host-side** (cierra síntoma 5)
+  - Topología real: companion = QUIC client (dials host), host = QUIC server. Companion ya auto-dial via `HostDialer` con `ConnectivityManager.NetworkCallback` + exponential backoff (Steps post-9.5 + U4c). "Host-side auto-connect" se materializa como **presence-watcher**, no como dial: daemon-core `companion_watcher` task corre `ansync_pairing::watch_pair_candidates()` (mdns-sd long-lived browse de `_ansync-pair._tcp.local.`). Cada `Resolved` cruzado contra `PeerStore` → si pubkey matchea, persiste `(DeviceId, SocketAddr)` en `DaemonState.reachable` + emite `Manager.DeviceReachable(id, addr)`. `Removed` → clear + `Manager.DeviceUnreachable(id)`. Snapshot accesible via `Manager.ReachableDevices() → a(ss)`. Widget pinta presence dot antes de que QUIC handshake complete (estado "active") — semáforo gris/amarillo/verde queda con tres datos: ConnState (handshake), reachable (mDNS visibility), Hello fresh (caps known).
+  - Companion HostDialer ya cubre re-connect en suspend/resume vía NetworkCallback onAvailable; netlink-watch host-side innecesario porque el companion siempre es el iniciador del QUIC.
+  - "Connect to X (IP)" botón companion ya estaba dropeado en U4a (headless). Verified.
 
 ### Tradeoffs
 

@@ -114,6 +114,15 @@ pub struct DaemonState {
     /// fall back to a direct unicast dial when the host's mDNS
     /// multicast doesn't reach (Wi-Fi AP isolation, hotspots, etc.).
     pub listen_endpoints: Arc<StdMutex<Vec<(String, u16)>>>,
+    /// Paired companions currently advertising
+    /// `_ansync-pair._tcp.local.` on the LAN. Populated by the
+    /// daemon-core `companion_watcher` task; cleared when the mDNS
+    /// announcement disappears. Exposed via
+    /// `Manager.ReachableDevices()` and the
+    /// `Manager.DeviceReachable` / `DeviceUnreachable` signals so
+    /// widgets can paint a presence dot before the companion's
+    /// `HostDialer` finishes its dance with the QUIC server.
+    pub reachable: Arc<StdMutex<HashMap<DeviceId, std::net::SocketAddr>>>,
 }
 
 impl DaemonState {
@@ -131,6 +140,7 @@ impl DaemonState {
             actions: None,
             connectivity: Arc::new(StdMutex::new(HashMap::new())),
             listen_endpoints: Arc::new(StdMutex::new(Vec::new())),
+            reachable: Arc::new(StdMutex::new(HashMap::new())),
         }
     }
 

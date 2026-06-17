@@ -252,6 +252,10 @@ impl Daemon {
         // release on drop.
         let mem_stats_handle = tokio::spawn(mem_stats_loop());
         let dbus_conn_arc = Arc::new(dbus_conn);
+        let watcher_handle = tokio::spawn(companion_watcher(
+            state.clone(),
+            dbus_conn_arc.clone(),
+        ));
         let accept_handle = tokio::spawn(accept_loop(AcceptCtx {
             server,
             peers,
@@ -273,6 +277,7 @@ impl Daemon {
         accept_handle.abort();
         action_handle.abort();
         mem_stats_handle.abort();
+        watcher_handle.abort();
         if let Err(e) = mdns.stop_announce().await {
             warn!(error = %e, "mDNS stop_announce failed");
         }
@@ -1891,4 +1896,97 @@ fn parse_kb(rest: &str) -> Option<u64> {
     let trimmed = rest.trim();
     let num = trimmed.strip_suffix(" kB").unwrap_or(trimmed).trim();
     num.parse::<u64>().ok()
+}
+
+/// Long-lived background task that browses `_ansync-pair._tcp.local.`
+/// continuously and emits `Manager.DeviceReachable` /
+/// `DeviceUnreachable` signals every time a paired companion's mDNS
+/// presence flips. Caller is responsible for aborting the returned
+/// `JoinHandle` on shutdown — drop() of the inner `ServiceDaemon`
+/// also tears the underlying socket down.
+///
+/// The watcher does NOT initiate a connection; the companion stays
+/// the QUIC client (it dials the host on Wi-Fi up via its
+/// `HostDialer`). The signals are presence indicators for the widget
+/// — a paired companion can be "Reachable" (mDNS visible) without
+/// being "Active" (QUIC + Hello complete) when the device is still
+/// negotiating the handshake.
+async fn companion_watcher(state: Arc<DaemonState>, conn: Arc<zbus::Connection>) {
+    let (_daemon, mut rx) = match ansync_pairing::watch_pair_candidates() {
+        Ok(pair) => pair,
+        Err(e) => {
+            warn!(error = %e, "companion_watcher: mdns browse start failed");
+            return;
+        }
+    };
+
+    let manager_path = match zbus::zvariant::ObjectPath::try_from(ansync_dbus::PATH_MANAGER) {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(error = %e, "companion_watcher: build manager path failed");
+            return;
+        }
+    };
+    let emitter = match zbus::object_server::SignalEmitter::new(&*conn, manager_path) {
+        Ok(e) => e,
+        Err(e) => {
+            warn!(error = %e, "companion_watcher: signal emitter build failed");
+            return;
+        }
+    };
+
+    // Map mDNS instance fullnames → DeviceId so a ServiceRemoved
+    // event (which only carries the instance name) can be translated
+    // back into the corresponding D-Bus path id.
+    let mut instance_to_id: HashMap<String, DeviceId> = HashMap::new();
+
+    while let Some(event) = rx.recv().await {
+        match event {
+            ansync_pairing::PairWatchEvent::Resolved(c) => {
+                let known = match state.peers.list() {
+                    Ok(list) => list,
+                    Err(e) => {
+                        warn!(error = %e, "companion_watcher: peers.list failed");
+                        continue;
+                    }
+                };
+                let Some(stored) = known.into_iter().find(|p| p.pubkey == c.pubkey) else {
+                    // Unpaired companion advertising — ignore (the
+                    // pair surface picks these up via `BrowseAvailable`).
+                    continue;
+                };
+                let device_id = stored.id.clone();
+                let id_str = device_id.to_string();
+                let prev = {
+                    let mut g = state.reachable.lock().expect("reachable poisoned");
+                    g.insert(device_id.clone(), c.addr)
+                };
+                instance_to_id.insert(c.name.clone(), device_id.clone());
+                if prev.map_or(true, |old| old != c.addr) {
+                    info!(%id_str, addr = %c.addr, "companion reachable on LAN");
+                    let _ = ansync_dbus::Manager::device_reachable(
+                        &emitter,
+                        &id_str,
+                        &c.addr.to_string(),
+                    )
+                    .await;
+                }
+            }
+            ansync_pairing::PairWatchEvent::Removed(instance) => {
+                let Some(device_id) = instance_to_id.remove(&instance) else {
+                    continue;
+                };
+                let removed = {
+                    let mut g = state.reachable.lock().expect("reachable poisoned");
+                    g.remove(&device_id)
+                };
+                if removed.is_some() {
+                    let id_str = device_id.to_string();
+                    info!(%id_str, "companion left LAN");
+                    let _ = ansync_dbus::Manager::device_unreachable(&emitter, &id_str).await;
+                }
+            }
+        }
+    }
+    warn!("companion_watcher: pair watch stream closed");
 }

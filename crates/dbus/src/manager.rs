@@ -150,6 +150,43 @@ impl Manager {
         state: &str,
     ) -> zbus::Result<()>;
 
+    /// Fired by the daemon's `companion_watcher` when a paired
+    /// companion is first observed (or re-observed) advertising
+    /// `_ansync-pair._tcp.local.` on the LAN. Subscribers paint a
+    /// presence dot before the companion's `HostDialer` finishes the
+    /// QUIC handshake.
+    #[zbus(signal)]
+    pub async fn device_reachable(
+        ctxt: &zbus::object_server::SignalEmitter<'_>,
+        id: &str,
+        addr: &str,
+    ) -> zbus::Result<()>;
+
+    /// Fired when the previously-reachable companion's mDNS record
+    /// disappears. `id` is the device id; widgets clear the presence
+    /// dot.
+    #[zbus(signal)]
+    pub async fn device_unreachable(
+        ctxt: &zbus::object_server::SignalEmitter<'_>,
+        id: &str,
+    ) -> zbus::Result<()>;
+
+    /// Snapshot of currently-reachable paired companions. Each entry
+    /// is `(device_id, "ip:port")`. Suitable for first-paint state
+    /// before any signals fire.
+    #[zbus(name = "ReachableDevices")]
+    async fn reachable_devices(&self) -> Vec<(String, String)> {
+        self.state
+            .reachable
+            .lock()
+            .map(|g| {
+                g.iter()
+                    .map(|(id, addr)| (id.to_string(), addr.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// Return the (ip, port) pairs the QUIC listener is reachable on
     /// across non-loopback interfaces. `ansyncctl pair` queries this
     /// before kicking the cable bootstrap so the host can hand the
