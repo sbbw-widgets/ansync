@@ -12,7 +12,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use ansync_daemon_core::{Daemon, DaemonConfig};
-use clap::Parser;
+use ansyncd::mirror_renderer;
+use clap::{Parser, Subcommand};
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 #[cfg(feature = "dev-playback")]
@@ -39,11 +40,28 @@ struct Args {
     #[cfg(feature = "dev-playback")]
     #[arg(long, value_name = "PATH")]
     play_file: Option<PathBuf>,
+    #[command(subcommand)]
+    cmd: Option<SubCmd>,
+}
+
+#[derive(Debug, Subcommand)]
+enum SubCmd {
+    /// Per-window mirror renderer subprocess. Spawned by the daemon —
+    /// not meant to be invoked directly.
+    MirrorRenderer {
+        /// Unix socket path the daemon set up for this window.
+        #[arg(long)]
+        sock: PathBuf,
+    },
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     install_logging()?;
     let args = Args::parse();
+
+    if let Some(SubCmd::MirrorRenderer { sock }) = &args.cmd {
+        return mirror_renderer::run(sock.clone());
+    }
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -64,13 +82,7 @@ fn run_play_file(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let shared = ansync_video::sink_egui::new_slot();
     mirror_window::spawn_play_file(&runtime, path, shared.clone());
-    let deck = ansync_video::sink_egui::WindowDeck::new();
-    deck.open(ansync_video::sink_egui::DeckEntry::new(
-        "dev-playback".into(),
-        "ansync mirror".into(),
-        shared,
-    ));
-    let result = ansync_video::sink_egui::run_deck(deck);
+    let result = ansync_video::sink_egui::run("ansync mirror".into(), shared, None);
     drop(runtime);
     result
 }

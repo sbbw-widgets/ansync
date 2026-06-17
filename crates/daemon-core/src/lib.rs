@@ -36,12 +36,14 @@ use ansync_transport::pinning::TrustedPeers;
 use ansync_transport::{
     Connection, QuicConnection, QuicServer, QuicStream, QuicTransport, Stream as _, StreamKind,
 };
-use ansync_video::sink_egui::{DeckEntry, FrameSlot, WindowDeck, new_slot};
 use ansync_video::{HostDecoder, PixelFormat, VideoCodec, VideoDecoder};
+
+mod mirror_subprocess;
+use mirror_subprocess::spawn_mirror_subprocess;
 use directories::BaseDirs;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::Mutex;
-use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tracing::{debug, error, info, warn};
 
 #[derive(Debug, thiserror::Error)]
@@ -215,26 +217,6 @@ impl Daemon {
         let cameras = Arc::new(CameraRegistry::default());
         let audios = Arc::new(AudioRegistry::default());
         let clipboard_sync = ClipboardSync::default();
-        // One eframe instance serves every peer's mirror window via
-        // deferred viewports. The event loop blocks the calling
-        // thread forever, so we spawn it on a dedicated OS thread and
-        // share `Arc<WindowDeck>` with `action_loop`. winit refuses a
-        // second `EventLoop::build` per process, so this single-host
-        // model is the only legal way to get multiple native windows.
-        let deck = WindowDeck::new();
-        {
-            let deck = deck.clone();
-            std::thread::Builder::new()
-                .name("ansync-mirror-deck".into())
-                .spawn(move || {
-                    if let Err(e) = ansync_video::sink_egui::run_deck(deck) {
-                        error!(error = %e, "mirror deck exited");
-                    }
-                })
-                .map_err(|e| {
-                    DaemonError::Startup(format!("spawn mirror-deck thread: {e}"))
-                })?;
-        }
         let action_handle = tokio::spawn(action_loop(
             action_rx,
             action_tx.clone(),
@@ -243,7 +225,6 @@ impl Daemon {
             audios.clone(),
             permissions.clone(),
             clipboard_sync.clone(),
-            deck.clone(),
         ));
 
         let device_name = DeviceName(self.config.device_name.clone());
@@ -369,26 +350,46 @@ struct AcceptCtx {
     clipboard_sync: ClipboardSync,
 }
 
-/// Per-peer mirror state: frame slot the decoder populates and the
-/// thread handle of the open window (if any).
+/// Per-peer mirror state. The window itself lives in a subprocess so
+/// each ShowScreen gets a fresh `EventLoop::build` and the user can
+/// close + reopen without winit's once-per-process guard blocking us.
 #[derive(Default)]
 pub struct MirrorRegistry {
     entries: StdMutex<HashMap<DeviceId, Arc<MirrorEntry>>>,
 }
 
 pub struct MirrorEntry {
-    pub slot: FrameSlot,
     pub peer_name: String,
     /// `Some` while the peer is connected. `action_loop` reads this
     /// to open an outbound Input stream on ShowScreen. Cleared by
     /// `handle_connection` on disconnect.
     pub conn: StdMutex<Option<Arc<QuicConnection>>>,
-    /// Flipped to `true` by `video_stream_loop` on first chunk; cleared
-    /// on stream close. ShowScreen consults this to decide whether to
-    /// push a `RequestScreenCapture` to the companion — when the
-    /// tile-driven path is already streaming we must NOT re-ask the
-    /// user for MediaProjection consent.
+    /// `Some` while a mirror subprocess for this peer is alive.
+    /// `video_stream_loop` writes inbound encoded chunks here so the
+    /// renderer subprocess can decode them; on `None` the chunks are
+    /// dropped (no open window).
+    pub video_tx: StdMutex<Option<UnboundedSender<bytes::Bytes>>>,
+    /// `Some` while the subprocess is alive — holds the child handle
+    /// and the sender wired to the input bridge.
+    pub subprocess: StdMutex<Option<MirrorSubprocess>>,
+    /// Flipped to `true` by `video_stream_loop` on first chunk;
+    /// cleared on stream close. ShowScreen consults this so the
+    /// QSTile-driven path doesn't trigger a second
+    /// `RequestScreenCapture` (which re-pops the MediaProjection
+    /// picker on the device).
     pub video_inbound: std::sync::atomic::AtomicBool,
+}
+
+/// Handle to a running mirror subprocess. Dropping it doesn't kill
+/// the child — that's the action loop's job via
+/// `MirrorSubprocess::shutdown_via_socket`.
+pub struct MirrorSubprocess {
+    pub child: std::process::Child,
+    /// `Some` so we can ask the child to exit cleanly over the IPC
+    /// socket. Cleared after a successful shutdown so a follow-up
+    /// HideScreen doesn't re-send.
+    pub host_tx: Option<UnboundedSender<ansync_video::ipc::HostMsg>>,
+    pub sock_path: std::path::PathBuf,
 }
 
 /// Per-peer audio pipeline state. Like `CameraRegistry`, but with
@@ -556,9 +557,10 @@ impl MirrorRegistry {
             .entry(id.clone())
             .or_insert_with(|| {
                 Arc::new(MirrorEntry {
-                    slot: new_slot(),
                     peer_name: name.to_string(),
                     conn: StdMutex::new(None),
+                    video_tx: StdMutex::new(None),
+                    subprocess: StdMutex::new(None),
                     video_inbound: std::sync::atomic::AtomicBool::new(false),
                 })
             })
@@ -592,7 +594,6 @@ async fn action_loop(
     audios: Arc<AudioRegistry>,
     permissions: Arc<dyn ansync_permissions::PermissionsStore>,
     clipboard_sync: ClipboardSync,
-    deck: Arc<WindowDeck>,
 ) {
     while let Some(action) = rx.recv().await {
         match action {
@@ -673,13 +674,17 @@ async fn action_loop(
                     warn!(%device, "ShowScreen: no mirror entry (peer not connected?)");
                     continue;
                 };
-                let key = device.to_string();
-                // Idempotent: dropping the user back into an already
-                // open window just refreshes its input pipe and
-                // (optionally) re-asks the companion to start its
-                // capture pipe.
-                let already_open = deck.is_open(&key);
+                // Idempotent: if a renderer is already up for this
+                // peer, only refresh the input pipe + (maybe) re-ask
+                // the companion to start capture.
+                let already_up = entry
+                    .subprocess
+                    .lock()
+                    .expect("subprocess slot poisoned")
+                    .is_some();
 
+                // Open the outbound Input stream so renderer-side
+                // pointer/keyboard/gamepad events reach the peer.
                 let conn = entry.conn.lock().expect("conn slot poisoned").clone();
                 let input_tx = if let Some(conn) = conn.clone() {
                     match conn.open(StreamKind::Input).await {
@@ -697,6 +702,11 @@ async fn action_loop(
                     warn!(%device, "ShowScreen: no live connection; window will be view-only");
                     None
                 };
+
+                // Only ask the companion to start capture when the
+                // tile-driven path hasn't already opened the Video
+                // stream — otherwise we re-pop the MediaProjection
+                // picker on the device.
                 if !entry.video_inbound.load(std::sync::atomic::Ordering::Relaxed) {
                     if let Some(conn) = conn {
                         if let Err(e) = send_request_capture(&conn).await {
@@ -705,67 +715,72 @@ async fn action_loop(
                     }
                 }
 
-                // Build (or rebuild) the deck entry. The deck keeps
-                // any prior entry under the same key alive across
-                // hide/show cycles? Actually no — the user closing
-                // the window removes the entry, so each ShowScreen
-                // after a close gets a fresh `DeckEntry` (and a fresh
-                // `ViewportId` from the same key, since the prior
-                // viewport is gone by the time we reopen). On an
-                // already-open viewport we just swap in the latest
-                // input pipe + close notifier so the same window
-                // keeps working.
-                if already_open {
-                    if let Some(existing) = deck.get(&key) {
-                        existing.set_input_tx(input_tx);
-                        let (close_tx, mut close_rx) = unbounded_channel::<()>();
-                        existing.set_close_tx(Some(close_tx));
-                        let exit_tx = self_tx.clone();
-                        let exit_device = device.clone();
-                        tokio::spawn(async move {
-                            while close_rx.recv().await.is_some() {
-                                let _ = exit_tx.send(DaemonAction::HideScreen {
-                                    device: exit_device.clone(),
-                                });
-                            }
-                        });
-                    }
-                    info!(%device, "ShowScreen: existing viewport refreshed");
+                if already_up {
+                    info!(%device, "ShowScreen: subprocess already up");
+                    // The existing subprocess keeps consuming chunks
+                    // from `entry.video_tx`. Input pipe was per-conn
+                    // and we already swapped a fresh one above (it'll
+                    // simply replace whatever the previous Input
+                    // writer was using on next user input).
+                    let _ = input_tx;
                     continue;
                 }
 
-                let new_entry = DeckEntry::new(
-                    key.clone(),
-                    format!("ansync — {}", entry.peer_name),
-                    entry.slot.clone(),
-                );
-                new_entry.set_input_tx(input_tx);
-                let (close_tx, mut close_rx) = unbounded_channel::<()>();
-                new_entry.set_close_tx(Some(close_tx));
-                deck.open(new_entry);
+                let title = format!("ansync — {}", entry.peer_name);
                 let exit_tx = self_tx.clone();
                 let exit_device = device.clone();
-                tokio::spawn(async move {
-                    while close_rx.recv().await.is_some() {
+                let entry_for_spawn = entry.clone();
+                match spawn_mirror_subprocess(
+                    title,
+                    entry_for_spawn,
+                    input_tx,
+                    move || {
+                        // Renderer exited (user closed the window or
+                        // process crashed). Tell the action loop so it
+                        // runs the same teardown path as a D-Bus
+                        // HideScreen.
                         let _ = exit_tx.send(DaemonAction::HideScreen {
                             device: exit_device.clone(),
                         });
-                    }
-                });
-                info!(%device, "ShowScreen: viewport opened");
+                    },
+                )
+                .await
+                {
+                    Ok(()) => info!(%device, "ShowScreen: subprocess spawned"),
+                    Err(e) => warn!(%device, error = %e, "ShowScreen subprocess failed"),
+                }
             }
             DaemonAction::HideScreen { device } => {
-                let key = device.to_string();
-                deck.close(&key);
-                if let Some(entry) = mirrors.get(&device) {
-                    let conn = entry.conn.lock().expect("conn slot poisoned").clone();
-                    if let Some(conn) = conn {
-                        if let Err(e) = send_stop_capture(&conn).await {
-                            warn!(%device, error = %e, "StopScreenCapture send failed");
-                        }
+                let Some(entry) = mirrors.get(&device) else {
+                    continue;
+                };
+                // Pull the subprocess handle out and ask it to exit.
+                // Drop the video fan-out sender so any in-flight
+                // chunks stop reaching the (about-to-die) child.
+                {
+                    let mut tx_slot = entry.video_tx.lock().expect("video_tx slot poisoned");
+                    *tx_slot = None;
+                }
+                let taken = entry
+                    .subprocess
+                    .lock()
+                    .expect("subprocess slot poisoned")
+                    .take();
+                if let Some(mut sp) = taken {
+                    if let Some(tx) = sp.host_tx.take() {
+                        let _ = tx.send(ansync_video::ipc::HostMsg::Shutdown);
+                    }
+                    let _ = sp.child.kill();
+                }
+                // Tell the companion to drop the encoder + projection
+                // too so the device's foreground notification clears.
+                let conn = entry.conn.lock().expect("conn slot poisoned").clone();
+                if let Some(conn) = conn {
+                    if let Err(e) = send_stop_capture(&conn).await {
+                        warn!(%device, error = %e, "StopScreenCapture send failed");
                     }
                 }
-                info!(%device, "HideScreen: viewport closed, companion notified");
+                info!(%device, "HideScreen: subprocess down, companion notified");
             }
         }
     }
@@ -922,19 +937,17 @@ async fn handle_connection(
             StreamKind::Video => {
                 let entry = mirror_entry.clone();
                 let pid = peer_id.clone();
-                // Mark the entry as already receiving BEFORE handing
-                // ShowScreen off to action_loop — otherwise the action
-                // handler's `video_inbound` check could fire on a
-                // false negative and push a needless
-                // RequestScreenCapture (which re-pops the
-                // MediaProjection picker on the device).
+                // Mark inbound BEFORE handing ShowScreen to the
+                // action loop — otherwise the handler's
+                // `video_inbound` check could fire on a false
+                // negative and push an unwanted
+                // `RequestScreenCapture` to the device.
                 entry
                     .video_inbound
                     .store(true, std::sync::atomic::Ordering::Relaxed);
                 // Companion-initiated mirror (QSTile MediaProjection
-                // grant) opens Video before the host has any reason
-                // to know. Fire ShowScreen so the window pops without
-                // requiring a D-Bus call.
+                // grant) opens Video before the host knows. Trigger
+                // ShowScreen so the renderer subprocess spawns.
                 if let Some(tx) = dbus_state.actions.as_ref() {
                     let _ = tx.send(DaemonAction::ShowScreen { device: pid.clone() });
                 }
@@ -1847,19 +1860,14 @@ async fn video_stream_loop(
     entry: Arc<MirrorEntry>,
     peer_id: DeviceId,
 ) {
-    // Initial dimension hint is rewritten by SPS on the first IDR;
-    // 1080p is a safe upper bound for the NVDEC / VA-API surface pools.
-    let mut decoder = match HostDecoder::configure(VideoCodec::H264, 1920, 1080) {
-        Ok(d) => d,
-        Err(e) => {
-            warn!(%peer_id, error = %e, "video decoder unavailable");
-            return;
-        }
-    };
     info!(%peer_id, "video stream wired");
-    let slot = entry.slot.clone();
-    // Clear the inbound flag whenever the stream goes away so a
-    // future ShowScreen does ask the companion to capture again.
+    // The decoder lives in the per-window mirror subprocess now.
+    // This loop's only job is to fan encoded NAL chunks off the QUIC
+    // stream into whichever subprocess (if any) currently owns the
+    // window for this peer. No window open → no subscriber → chunks
+    // are dropped silently, which is fine: the companion keeps
+    // capturing only because the device-side decision (QSTile / D-Bus)
+    // told it to.
     struct InboundGuard {
         entry: Arc<MirrorEntry>,
     }
@@ -1873,13 +1881,8 @@ async fn video_stream_loop(
     let _guard = InboundGuard {
         entry: entry.clone(),
     };
-    // Diagnostics so the user can tell whether the silence is on
-    // the wire (no chunks) or the decoder (chunks arriving but
-    // never producing a frame). Printed at info level so they show
-    // up under default RUST_LOG=info.
     let mut first_chunk_logged = false;
-    let mut first_frame_logged = false;
-    let mut frames_since_log: u64 = 0;
+    let mut chunks_since_log: u64 = 0;
     let mut last_stat = std::time::Instant::now();
     loop {
         let bytes = match stream.recv().await {
@@ -1897,39 +1900,23 @@ async fn video_stream_loop(
             info!(%peer_id, bytes = bytes.len(), "first video chunk from peer");
             first_chunk_logged = true;
         }
-        if let Err(e) = decoder.feed(bytes).await {
-            warn!(%peer_id, error = %e, "decoder feed failed; continuing");
-            continue;
-        }
-        // ferricast's `HostDecoder::feed` already pumps the inner
-        // backend's `next_frame()` once per call and stashes the
-        // result in an instance-local mailbox. A single `take()` here
-        // moves the latest into the renderer's slot; with H.264
-        // Baseline (no B-frames) and `max_display_delay=0` the
-        // input/output ratio is 1:1 so nothing accumulates in NVDEC's
-        // surface pool. `take()` is non-async (just a `Mutex::take`)
-        // so no busy-loop timeout games.
-        match decoder.take().await {
-            Ok(Some(frame)) => {
-                if !first_frame_logged {
-                    info!(
-                        %peer_id,
-                        width = frame.width,
-                        height = frame.height,
-                        format = ?frame.format,
-                        "first decoded frame; mirror wired end-to-end"
-                    );
-                    first_frame_logged = true;
-                }
-                frames_since_log += 1;
-                slot.store(frame);
+        chunks_since_log += 1;
+        let sender = entry
+            .video_tx
+            .lock()
+            .expect("video_tx slot poisoned")
+            .clone();
+        if let Some(tx) = sender {
+            if tx.send(bytes).is_err() {
+                // Renderer subprocess died or was closed by the user.
+                // Drop the sender so future ShowScreen actions
+                // re-bootstrap from scratch.
+                *entry.video_tx.lock().expect("video_tx slot poisoned") = None;
             }
-            Ok(None) => {}
-            Err(e) => warn!(%peer_id, error = %e, "decoder take failed"),
         }
         if last_stat.elapsed() >= std::time::Duration::from_secs(5) {
-            debug!(%peer_id, fps = frames_since_log / 5, "video stream stats");
-            frames_since_log = 0;
+            debug!(%peer_id, chunks = chunks_since_log / 5, "video stream stats");
+            chunks_since_log = 0;
             last_stat = std::time::Instant::now();
         }
     }
