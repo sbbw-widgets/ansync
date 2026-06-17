@@ -895,9 +895,23 @@ async fn handle_connection(
 
     // Ensure the mirror entry exists for this peer so the Video
     // stream loop can populate it as soon as the companion opens its
-    // Video bidi stream.
+    // Video bidi stream. If a stale conn for the same peer is still
+    // registered (companion redialed before keep-alive killed the
+    // old session) close it explicitly here so its accept loop
+    // unblocks and exits — preventing two concurrent
+    // `handle_connection` tasks racing on the same per-peer
+    // registries.
     let mirror_entry = mirrors.ensure(&peer_id, &peer.name.0);
-    *mirror_entry.conn.lock().expect("conn slot poisoned") = Some(conn_arc.clone());
+    let prior = {
+        let mut slot = mirror_entry.conn.lock().expect("conn slot poisoned");
+        let prior = slot.take();
+        *slot = Some(conn_arc.clone());
+        prior
+    };
+    if let Some(prev) = prior {
+        info!(%peer_id, "evicting stale conn for redialed peer");
+        let _ = prev.close("superseded by redial").await;
+    }
     let camera_entry = cameras.ensure(&peer_id, &peer.name.0);
     let audio_entry = audios.ensure(&peer_id, &peer.name.0);
 
@@ -1002,9 +1016,23 @@ async fn handle_connection(
         }
     }
     input_session.lock().await.shutdown().await;
-    // Clear the conn slot so ShowScreen won't try to open streams on
-    // a closed connection until the peer reconnects.
-    *mirror_entry.conn.lock().expect("conn slot poisoned") = None;
+    // Only clear the conn slot + emit Disconnected when the conn we
+    // just lost is the one currently registered for this peer. When
+    // the companion races a redial against our keep-alive (rare but
+    // visible — produces two `peer connected` log lines and two
+    // concurrent `handle_connection` tasks) the stale task's exit
+    // would otherwise wipe the live conn out from under the other
+    // task and the UI would flap to Disconnected then back to Active.
+    let conn_still_current = mirror_entry
+        .conn
+        .lock()
+        .expect("conn slot poisoned")
+        .as_ref()
+        .map(|c| Arc::ptr_eq(c, &conn_arc))
+        .unwrap_or(false);
+    if conn_still_current {
+        *mirror_entry.conn.lock().expect("conn slot poisoned") = None;
+    }
     // Camera pipeline is per-action; if it was running, kill its
     // task and unregister the sink so the v4l2 device is free.
     if let Some(handle) = camera_entry
@@ -1043,11 +1071,22 @@ async fn handle_connection(
         .lock()
         .expect("audio inbound tx poisoned") = None;
     *audio_entry.sink.lock().await = None;
-    if let Err(e) =
-        Device::emit_state_changed(&dbus_conn, &dbus_state, &peer_id, ConnState::Disconnected)
-            .await
-    {
-        warn!(%peer_id, error = %e, "emit Disconnected state failed");
+    if conn_still_current {
+        if let Err(e) = Device::emit_state_changed(
+            &dbus_conn,
+            &dbus_state,
+            &peer_id,
+            ConnState::Disconnected,
+        )
+        .await
+        {
+            warn!(%peer_id, error = %e, "emit Disconnected state failed");
+        }
+    } else {
+        debug!(
+            %peer_id,
+            "handle_connection exit: superseded by a newer conn — skip Disconnected emit"
+        );
     }
     Ok(())
 }

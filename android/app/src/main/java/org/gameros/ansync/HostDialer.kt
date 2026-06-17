@@ -104,7 +104,18 @@ class HostDialer(private val ctx: Context) {
     private val livenessProbe = object : Runnable {
         override fun run() {
             if (callback == null) return
-            if (connected && !NativeBridge.nativeIsConnected()) {
+            // Wrapped: an APK that predates the new `nativeIsConnected`
+            // symbol would throw `UnsatisfiedLinkError` the first time
+            // we poke it and kill the foreground service. Skip the
+            // probe silently instead — the network-callback path still
+            // covers link drops in that build.
+            val native = try {
+                NativeBridge.nativeIsConnected()
+            } catch (t: Throwable) {
+                Log.w(TAG, "nativeIsConnected unavailable; liveness probe disabled", t)
+                return
+            }
+            if (connected && !native) {
                 Log.i(TAG, "native reports session down — redialing")
                 connected = false
                 backoffMs = INITIAL_BACKOFF_MS
