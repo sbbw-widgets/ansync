@@ -111,18 +111,30 @@ pub struct DevicePermissions {
 
 impl Default for DevicePermissions {
     fn default() -> Self {
+        // Defaults tuned for "just-paired device works end-to-end":
+        // screen mirror, files, clipboard, audio routes, notifications
+        // are all on. Camera / virtual input / FUSE mount stay off
+        // because they require host-side hardware glue (v4l2loopback,
+        // /dev/uinput, fuser) that may not be set up, and surprising
+        // a user with an active webcam or fake mouse is worse than
+        // surprising them with their clipboard syncing.
+        //
+        // The PC owns the gates: re-tighten any of these via
+        // `Permissions/{id}.Set(<flag>, false)` on D-Bus or by editing
+        // `$XDG_CONFIG_HOME/ansync/devices/{id}.toml` directly. A
+        // re-pair re-applies these defaults.
         Self {
             screen_mirror: true,
             camera_video: false,
             camera_audio: false,
             mic: false,
-            audio_in: false,
-            audio_out: false,
+            audio_in: true,
+            audio_out: true,
             files_send: true,
             files_receive: true,
             files_mount: false,
-            clipboard_in: ClipboardPolicy::Prompt,
-            clipboard_out: ClipboardPolicy::Prompt,
+            clipboard_in: ClipboardPolicy::Allow,
+            clipboard_out: ClipboardPolicy::Allow,
             input_from_device: false,
             input_to_device: false,
             notifications: true,

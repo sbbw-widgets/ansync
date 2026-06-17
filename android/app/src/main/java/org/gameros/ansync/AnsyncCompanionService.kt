@@ -55,6 +55,9 @@ class AnsyncCompanionService : Service() {
     private var dialer: HostDialer? = null
     private var wifiPair: WifiPairManager? = null
     private var mediaSession: AudioMediaSession? = null
+    private var hostNamePoller: HandlerThread? = null
+    private var hostNameHandler: Handler? = null
+    @Volatile private var hostNamePollRunning = false
     @Volatile private var hostStatus: HostStatus = HostStatus.NotPaired
     private var capturePollThread: HandlerThread? = null
     private var capturePollHandler: Handler? = null
@@ -94,7 +97,46 @@ class AnsyncCompanionService : Service() {
         wifiPair = WifiPairManager(this).also { it.start() }
         startCaptureControlPoller()
         startFileControlPoller()
+        startHostNamePoller()
         registerScreenWakeReceiver()
+    }
+
+    /** Pull the latest host name learned from the inbound Hello frame
+     *  every 5 s and persist it as [PairingReceiver.PREF_HOST_NAME] so
+     *  the dialer / notif reflect what the host *currently* calls
+     *  itself, not the stale value captured at pair time. Without this
+     *  worker the name is stuck at whatever was sent during the
+     *  bootstrap envelope — typically still right, but goes stale if
+     *  the user renames their machine. */
+    private fun startHostNamePoller() {
+        if (hostNamePoller != null) return
+        val ht = HandlerThread("ansync-hostname").also { it.start() }
+        hostNamePoller = ht
+        hostNameHandler = Handler(ht.looper)
+        hostNamePollRunning = true
+        hostNameHandler?.post(object : Runnable {
+            override fun run() {
+                while (hostNamePollRunning) {
+                    val fresh = try {
+                        NativeBridge.nativePollHostName()
+                    } catch (e: Throwable) {
+                        Log.w(TAG, "pollHostName threw", e)
+                        null
+                    }
+                    if (!fresh.isNullOrBlank()) {
+                        val prefs = getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                        val current = prefs.getString(PairingReceiver.PREF_HOST_NAME, null)
+                        if (current != fresh) {
+                            prefs.edit()
+                                .putString(PairingReceiver.PREF_HOST_NAME, fresh)
+                                .apply()
+                            Log.i(TAG, "host name refreshed: $fresh")
+                        }
+                    }
+                    try { Thread.sleep(5_000) } catch (_: InterruptedException) { return }
+                }
+            }
+        })
     }
 
     /**
@@ -691,6 +733,10 @@ class AnsyncCompanionService : Service() {
         filePollThread?.quitSafely()
         filePollThread = null
         filePollHandler = null
+        hostNamePollRunning = false
+        hostNamePoller?.quitSafely()
+        hostNamePoller = null
+        hostNameHandler = null
         stopCapture()
         fsServer?.stop()
         fsServer = null
