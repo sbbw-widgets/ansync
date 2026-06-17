@@ -317,9 +317,10 @@ Gaps identificados al cerrar el roadmap. Ordenados por severidad. Cada uno es bo
 ### v1 known-limitations aceptables (UX polish)
 
 - [x] **R3 — Clipboard bidi listener-driven (sin UI)**
-  - `ClipboardBridge.start()` ahora registra `ClipboardManager.OnPrimaryClipChangedListener` que llama `pushToHost()` en cada cambio. `stop()` desregistra. Companion side sin gate (Android otorga todo); host decide via `ClipboardIn`/`ClipboardOut`.
-  - Echo guard: `lastFingerprint` (`"t:<text>"` para plain, `"u:<uri>"` para image MediaStore URI) seteado antes de cada `setPrimaryClip` inbound. Listener compara antes de pushear → cero ping-pong.
-  - Host → companion ya wired desde Step 12 (`SyncClipboard` D-Bus + `clipboard_in_loop`).
+  - **device → host**: `ClipboardBridge.start()` registra `ClipboardManager.OnPrimaryClipChangedListener` que llama `pushToHost()` en cada cambio. `stop()` desregistra. Companion side sin gate (Android otorga todo); host decide via `ClipboardIn`/`ClipboardOut`.
+  - Echo guard companion: `lastFingerprint` (`"t:<text>"` para plain, `"u:<uri>"` para image MediaStore URI) seteado antes de cada `setPrimaryClip` inbound. Listener compara antes de pushear → cero ping-pong.
+  - **host → device**: `ansync_clipboard::WaylandClipboardWatcher` (feature `wayland`) bind `zwlr_data_control_manager_v1` + `data_device` para el seat default. Worker thread dedicado corre `EventQueue::blocking_dispatch`; cada `selection` / `primary_selection` event emite `()` en mpsc tokio. Daemon-core `host_clipboard_watcher` task drena el receiver, debounce 50ms, itera `MirrorRegistry.entries()`, gate per-peer `ClipboardOut`, llama `push_clipboard_to_peer`. Compositors soportados: sway/hyprland/river/KDE Plasma 6+/COSMIC/niri. GNOME (mutter) degrada a manual via `Device.SyncClipboard` con info-log explícito.
+  - X11 fuera de scope v1; pattern análogo con `xfixes` queda para feature flag futuro si surge demanda.
 
 - [x] **R5 — SAF FS mutaciones (cerrar Step 9e)**
   - `AnsyncFsServer` retorna ENOSYS para `write/create/unlink/rename/truncate/chmod`. Implementar usando `DocumentsContract.createDocument` / `deleteDocument` / `renameDocument` / `OutputStream` via `openOutputStream(uri, "w" | "wa" | "rwt")`. `chmod` deja `ENOSYS` (SAF no expone modes — limitación intencional).

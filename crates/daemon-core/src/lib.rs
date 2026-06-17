@@ -256,6 +256,10 @@ impl Daemon {
             state.clone(),
             dbus_conn_arc.clone(),
         ));
+        let clip_watcher_handle = tokio::spawn(host_clipboard_watcher(
+            mirrors.clone(),
+            permissions.clone(),
+        ));
         let accept_handle = tokio::spawn(accept_loop(AcceptCtx {
             server,
             peers,
@@ -278,6 +282,7 @@ impl Daemon {
         action_handle.abort();
         mem_stats_handle.abort();
         watcher_handle.abort();
+        clip_watcher_handle.abort();
         if let Err(e) = mdns.stop_announce().await {
             warn!(error = %e, "mDNS stop_announce failed");
         }
@@ -472,6 +477,17 @@ impl MirrorRegistry {
             .lock()
             .ok()
             .and_then(|e| e.get(id).cloned())
+    }
+
+    /// Snapshot all currently-tracked entries. Used by the host
+    /// clipboard watcher to fan auto-push events out to every peer
+    /// that has an active QUIC connection.
+    pub fn entries(&self) -> Vec<(DeviceId, Arc<MirrorEntry>)> {
+        self.entries
+            .lock()
+            .ok()
+            .map(|e| e.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+            .unwrap_or_default()
     }
 }
 
@@ -1989,4 +2005,67 @@ async fn companion_watcher(state: Arc<DaemonState>, conn: Arc<zbus::Connection>)
         }
     }
     warn!("companion_watcher: pair watch stream closed");
+}
+
+/// Native Wayland clipboard watcher → auto-push to every connected
+/// peer with `ClipboardOut` on. Uses `zwlr_data_control_v1` (wlroots,
+/// KDE Plasma 6, COSMIC, niri); gracefully degrades to manual-only
+/// sync on compositors that don't expose the protocol (GNOME today).
+///
+/// Debounces back-to-back `selection` events with a 50 ms quiet
+/// window — desktops emit two changes for some apps (clear + set)
+/// which would otherwise double-push.
+async fn host_clipboard_watcher(
+    mirrors: Arc<MirrorRegistry>,
+    permissions: Arc<dyn ansync_permissions::PermissionsStore>,
+) {
+    let mut watcher = match ansync_clipboard::WaylandClipboardWatcher::start() {
+        Ok(w) => w,
+        Err(ansync_clipboard::WatcherError::ProtocolUnsupported) => {
+            info!(
+                "host clipboard watcher: compositor lacks zwlr_data_control_v1 — \
+                 host→device clipboard remains manual via Device.SyncClipboard"
+            );
+            return;
+        }
+        Err(e) => {
+            warn!(error = %e, "host clipboard watcher start failed; manual sync only");
+            return;
+        }
+    };
+    info!("host clipboard watcher active");
+    let debounce = std::time::Duration::from_millis(50);
+    loop {
+        // Block until at least one change.
+        if watcher.rx().recv().await.is_none() {
+            warn!("host clipboard watcher channel closed");
+            return;
+        }
+        // Drain coalesced events within the debounce window.
+        let deadline = tokio::time::Instant::now() + debounce;
+        loop {
+            match tokio::time::timeout_at(deadline, watcher.rx().recv()).await {
+                Ok(Some(())) => continue,
+                Ok(None) => {
+                    warn!("host clipboard watcher channel closed mid-drain");
+                    return;
+                }
+                Err(_) => break,
+            }
+        }
+        // Fan out to every connected peer with ClipboardOut on.
+        for (id, _entry) in mirrors.entries() {
+            match permissions.check(&id, Permission::ClipboardOut).await {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(e) => {
+                    warn!(%id, error = %e, "clipboard_out perm check failed; skipping");
+                    continue;
+                }
+            }
+            if let Err(e) = push_clipboard_to_peer(&mirrors, &permissions, &id).await {
+                warn!(%id, error = %e, "auto-push clipboard failed");
+            }
+        }
+    }
 }

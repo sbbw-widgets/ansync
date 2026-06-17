@@ -132,6 +132,8 @@ fuser = "0.15"
 
 # Clipboard (consumed in Step 12)
 wl-clipboard-rs = "0.9"
+wayland-client = "0.31"
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 
 # CLI
 clap = { version = "4", features = ["derive"] }

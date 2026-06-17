@@ -252,6 +252,8 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "wayland-client",
+ "wayland-protocols-wlr",
  "wl-clipboard-rs",
 ]
 

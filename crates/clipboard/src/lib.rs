@@ -8,9 +8,13 @@ use async_trait::async_trait;
 
 #[cfg(feature = "wayland")]
 pub mod wayland;
+#[cfg(feature = "wayland")]
+pub mod wayland_watcher;
 
 #[cfg(feature = "wayland")]
 pub use wayland::WaylandClipboard;
+#[cfg(feature = "wayland")]
+pub use wayland_watcher::{WaylandClipboardWatcher, WatcherError};
 
 #[derive(Debug, Clone)]
 pub enum ClipboardContent {
