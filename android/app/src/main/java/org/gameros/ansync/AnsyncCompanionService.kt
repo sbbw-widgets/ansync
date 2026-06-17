@@ -54,6 +54,7 @@ class AnsyncCompanionService : Service() {
     private var clipboard: ClipboardBridge? = null
     private var dialer: HostDialer? = null
     private var wifiPair: WifiPairManager? = null
+    private var mediaSession: AudioMediaSession? = null
     @Volatile private var hostStatus: HostStatus = HostStatus.NotPaired
     private var capturePollThread: HandlerThread? = null
     private var capturePollHandler: Handler? = null
@@ -304,6 +305,8 @@ class AnsyncCompanionService : Service() {
             )
         }
         audio = AudioRouter(msg.direction).also { it.start() }
+        val ms = mediaSession ?: AudioMediaSession(this).also { mediaSession = it }
+        ms.start(msg.direction)
         Log.i(TAG, "audio route started ${msg.direction}")
         refreshNotification()
     }
@@ -311,6 +314,8 @@ class AnsyncCompanionService : Service() {
     private fun handleStopAudio() {
         audio?.stop()
         audio = null
+        mediaSession?.release()
+        mediaSession = null
         Log.i(TAG, "audio route stopped")
         refreshNotification()
     }
@@ -534,18 +539,23 @@ class AnsyncCompanionService : Service() {
      *  way it does for a `Device.StartAudioRoute` D-Bus call. */
     private fun startAudioFromTile(direction: WireAudioControl.Direction) {
         val existing = audio
+        val effective: WireAudioControl.Direction
         if (existing != null) {
             // Merge directions: if the current router is `DeviceToHost`
             // and the user enables sink → upgrade to `Both`; vice
             // versa. Otherwise no-op.
             val merged = mergeDirections(existing.direction, direction)
+            effective = merged
             if (merged != existing.direction) {
                 existing.stop()
                 audio = AudioRouter(merged).also { it.start() }
             }
         } else {
             audio = AudioRouter(direction).also { it.start() }
+            effective = direction
         }
+        val ms = mediaSession ?: AudioMediaSession(this).also { mediaSession = it }
+        ms.start(effective)
         refreshNotification()
         when (direction) {
             WireAudioControl.Direction.DeviceToHost -> {
@@ -575,6 +585,12 @@ class AnsyncCompanionService : Service() {
         val remaining = removeDirection(existing.direction, direction)
         existing.stop()
         audio = remaining?.let { AudioRouter(it).also { r -> r.start() } }
+        if (remaining == null) {
+            mediaSession?.release()
+            mediaSession = null
+        } else {
+            mediaSession?.start(remaining)
+        }
         refreshNotification()
         when (direction) {
             WireAudioControl.Direction.DeviceToHost -> setTileState(PREF_MIC_ACTIVE, false)
@@ -656,6 +672,8 @@ class AnsyncCompanionService : Service() {
         audioPollRunning = false
         audio?.stop()
         audio = null
+        mediaSession?.release()
+        mediaSession = null
         audioPollThread?.quitSafely()
         audioPollThread = null
         audioPollHandler = null

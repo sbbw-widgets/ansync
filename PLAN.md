@@ -334,9 +334,12 @@ Gaps identificados al cerrar el roadmap. Ordenados por severidad. Cada uno es bo
   - `daemon-core::DaemonConfig` gana `input_backend: InputBackend{Uinput|BtHid}` enum. `Daemon::run` construye `BtHidFactory` si elegido.
   - Files: `crates/input/src/bt_hid.rs`, `crates/daemon-core/src/lib.rs`.
 
-- [ ] **R7 — Android MediaSession widget para audio route**
-  - Cuando `AudioRouter` start, registrar `MediaSession` + post notification con play/pause/stop actions. Tap stop → broadcast a `AnsyncCompanionService` → `AudioRouter.stop()`. Mejora UX para cortar mic share sin abrir app.
-  - Files: `android/app/src/main/java/.../AudioRouter.kt`, nueva `AudioRouteNotification.kt`.
+- [x] **R7 — Android MediaSession widget para audio route**
+  - `AudioMediaSession.kt` envuelve `android.media.session.MediaSession` (raw API, no Compat — minSdk 26 ya cubre). `FLAG_HANDLES_MEDIA_BUTTONS | FLAG_HANDLES_TRANSPORT_CONTROLS` activa AVRCP / hardware media keys / Wear OS / Auto. Lock-screen widget aparece automático cuando `PlaybackState = PLAYING`.
+  - `AudioFocusRequest` con `AUDIOFOCUS_GAIN` + listener: call entrante → `AUDIOFOCUS_LOSS_TRANSIENT` → pausa; vuelta → resume. `AUDIOFOCUS_LOSS` permanente → teardown via `startService(ACTION_STOP_*)`.
+  - `MediaStyle` notif (LOW importance, channel `ansync.media`, NOTIFICATION_ID 5) muestra título según dirección (`Mic → PC` / `PC audio → phone` / `Two-way audio`), action(s) "Stop mic"/"Stop PC audio" en compact view. Persistent notif principal sigue mostrando streams como antes (R7 suma, no reemplaza).
+  - Wired en `AnsyncCompanionService.handleStartAudio` + `handleStopAudio` + `startAudioFromTile` + `stopAudioFromTile` + `onDestroy`. Dirección merge/peel mantiene MediaSession sincronizada con `AudioRouter` actual.
+  - Gradle: `androidx.media:media:1.7.0` agregado al version catalog para `androidx.media.app.NotificationCompat.MediaStyle`.
 
 - [ ] **R8 — v4l2loopback card_label per-peer** (limitación upstream, no fixable host-side)
   - Documentado en README. Opciones futuras: feature request a v4l2loopback upstream, o switch a PipeWire-camera backend cuando madure el API (alternative implementation behind `pipewire-camera` feature flag, future trait impl en `ansync_camera`).
