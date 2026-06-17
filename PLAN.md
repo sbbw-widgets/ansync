@@ -316,9 +316,11 @@ Gaps identificados al cerrar el roadmap. Ordenados por severidad. Cada uno es bo
 
 ### v1 known-limitations aceptables (UX polish)
 
-- [ ] **R3 — Botón "Push clipboard to host" en MainActivity**
-  - `ClipboardBridge.pushToHost()` callable pero sin caller. Add botón en `MainActivity` Compose que invoque + muestre Toast con resultado.
-  - Files: `android/app/src/main/java/.../MainActivity.kt`.
+- [ ] **R3 — Clipboard bidi listener-driven (sin UI)**
+  - U4a dropeó `MainActivity` → botón manual ya no aplica. Reframe: clipboard fluye en ambas direcciones automático, perms los maneja la PC.
+  - Companion → host: `ClipboardManager.OnPrimaryClipChangedListener` registrado en `ClipboardBridge.start()` dispara `pushToHost()` en cada cambio. Android otorga todo lo que pide → companion side sin gate, host lo descarta vía `ClipboardIn` si está off.
+  - Host → companion: ya wired (`SyncClipboard` D-Bus + `clipboard_in_loop` con gate `ClipboardOut` host-side).
+  - Files: `android/app/src/main/java/.../ClipboardBridge.kt` (~10 líneas: addPrimaryClipChangedListener + removePrimaryClipChangedListener en stop()).
 
 - [x] **R5 — SAF FS mutaciones (cerrar Step 9e)**
   - `AnsyncFsServer` retorna ENOSYS para `write/create/unlink/rename/truncate/chmod`. Implementar usando `DocumentsContract.createDocument` / `deleteDocument` / `renameDocument` / `OutputStream` via `openOutputStream(uri, "w" | "wa" | "rwt")`. `chmod` deja `ENOSYS` (SAF no expone modes — limitación intencional).
