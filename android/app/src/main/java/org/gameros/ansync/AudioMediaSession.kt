@@ -13,6 +13,7 @@ import android.media.MediaMetadata
 import android.media.session.MediaSession
 import android.media.session.PlaybackState
 import android.os.Build
+import android.support.v4.media.session.MediaSessionCompat
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.media.app.NotificationCompat as MediaStyle
@@ -219,8 +220,15 @@ class AudioMediaSession(private val svc: AnsyncCompanionService) {
                 ),
             )
 
+        // `androidx.media.app.NotificationCompat.MediaStyle` ships with
+        // the legacy AndroidX-media surface and only accepts the
+        // `MediaSessionCompat.Token` shape. Framework `MediaSession`
+        // exposes its native `Token` which `MediaSessionCompat.Token
+        // .fromToken(...)` wraps for free — no `MediaSessionCompat`
+        // instance needed.
+        val compatToken = MediaSessionCompat.Token.fromToken(sess.sessionToken)
         val mediaStyle = MediaStyle.MediaStyle()
-            .setMediaSession(sess.sessionToken)
+            .setMediaSession(compatToken)
         // Show single action button compactly on lock screen.
         mediaStyle.setShowActionsInCompactView(0)
 
