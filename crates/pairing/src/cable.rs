@@ -327,28 +327,26 @@ async fn wait_and_bootstrap(
 
 #[cfg(feature = "host")]
 async fn add_adb_reverse(serial: &str, port: u16) -> Result<(), PairingError> {
-    // adb_client 2.1.x ships a `reverse(...)` that sends the right
-    // wire bytes but never actually installs the listener on the
-    // device's adbd (verified empirically: the `adb reverse --list`
-    // mapping shows up host-side but the device never opens a
-    // matching `LISTEN` socket, so the companion's `connect("127.0.0.1",
-    // port)` ETIMEDOUTs). Until the upstream bug is fixed we shell out
-    // to the official `adb` binary — `Step 16` removed adb-stdout
-    // *parsing*, not adb-binary usage; reverse has no stdout to parse
-    // beyond an exit code so this stays clean.
+    // We talk to the local adb server (`127.0.0.1:5037`) directly
+    // instead of shelling out to the `adb` binary OR using
+    // `adb_client::ADBServerDevice::reverse(...)`.
+    //
+    // `adb_client` 2.1.19's `reverse()` reads the first OKAY (the
+    // server's "request accepted") and returns. The reverse-forward
+    // protocol requires a SECOND OKAY from adbd on the device after
+    // the listener is actually bound — without it the host closes
+    // the TCP connection before adbd finishes installing the
+    // listener and the companion's `connect(127.0.0.1, port)`
+    // ETIMEDOUTs.
+    //
+    // Driving the wire protocol manually is a few dozen lines and
+    // keeps us free of `adb` CLI shell-outs.
     let serial = serial.to_string();
     tokio::task::spawn_blocking(move || {
-        let output = std::process::Command::new("adb")
-            .args(["-s", &serial, "reverse", &format!("tcp:{port}"), &format!("tcp:{port}")])
-            .output()
-            .map_err(|e| pairing_err("spawn adb reverse", e))?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(PairingError::Protocol(format!(
-                "adb reverse exited {}: {}",
-                output.status, stderr.trim()
-            )));
-        }
+        let mut stream = open_adbd()?;
+        adb_send_cmd(&mut stream, &format!("host:transport:{serial}"))?;
+        adb_send_cmd(&mut stream, &format!("reverse:forward:tcp:{port};tcp:{port}"))?;
+        adb_read_status(&mut stream)?;
         Ok(())
     })
     .await
@@ -417,18 +415,78 @@ async fn trigger_companion_pair(
 
 #[cfg(feature = "host")]
 async fn remove_adb_reverse(serial: &str, _port: u16) -> Result<(), PairingError> {
-    // Mirror of `add_adb_reverse`: shell out until adb_client's
-    // reverse impl is fixed upstream. Failure here is best-effort —
-    // we still return Ok so the pair-success path isn't shadowed by
-    // a cleanup hiccup.
+    // Best-effort cleanup over the same raw adbd protocol path as
+    // `add_adb_reverse`. Failures are swallowed so a hiccup here
+    // doesn't shadow a successful pair.
     let serial = serial.to_string();
-    let _ = tokio::task::spawn_blocking(move || {
-        let _ = std::process::Command::new("adb")
-            .args(["-s", &serial, "reverse", "--remove-all"])
-            .output();
+    let _ = tokio::task::spawn_blocking(move || -> Result<(), PairingError> {
+        let mut stream = open_adbd()?;
+        adb_send_cmd(&mut stream, &format!("host:transport:{serial}"))?;
+        adb_send_cmd(&mut stream, "reverse:killforward-all")?;
+        Ok(())
     })
     .await;
     Ok(())
+}
+
+/// Open a TCP connection to the local adb server. adbd doesn't
+/// expose a Unix socket on Linux — `5037` over loopback is the
+/// canonical surface.
+#[cfg(feature = "host")]
+fn open_adbd() -> Result<std::net::TcpStream, PairingError> {
+    let port = std::env::var("ANDROID_ADB_SERVER_PORT")
+        .ok()
+        .and_then(|v| v.parse::<u16>().ok())
+        .unwrap_or(5037);
+    std::net::TcpStream::connect(("127.0.0.1", port))
+        .map_err(|e| pairing_err("connect adb server", e))
+}
+
+/// Send a length-prefixed ASCII command and read the immediate
+/// OKAY / FAIL response. adb's wire format: `%04x%s` where the
+/// hex prefix is the body length.
+#[cfg(feature = "host")]
+fn adb_send_cmd(
+    stream: &mut std::net::TcpStream,
+    cmd: &str,
+) -> Result<(), PairingError> {
+    use std::io::Write;
+    let req = format!("{:04x}{}", cmd.len(), cmd);
+    stream
+        .write_all(req.as_bytes())
+        .map_err(|e| pairing_err("adb write", e))?;
+    adb_read_status(stream)
+}
+
+/// Read a single 4-byte OKAY / FAIL status. On FAIL, read the
+/// following hex-length-prefixed error body and surface it.
+#[cfg(feature = "host")]
+fn adb_read_status(stream: &mut std::net::TcpStream) -> Result<(), PairingError> {
+    use std::io::Read;
+    let mut buf = [0u8; 4];
+    stream
+        .read_exact(&mut buf)
+        .map_err(|e| pairing_err("adb read status", e))?;
+    match &buf {
+        b"OKAY" => Ok(()),
+        b"FAIL" => {
+            let mut len_buf = [0u8; 4];
+            let _ = stream.read_exact(&mut len_buf);
+            let len = std::str::from_utf8(&len_buf)
+                .ok()
+                .and_then(|s| u32::from_str_radix(s, 16).ok())
+                .unwrap_or(0) as usize;
+            let mut msg = vec![0u8; len];
+            let _ = stream.read_exact(&mut msg);
+            Err(PairingError::Protocol(format!(
+                "adb FAIL: {}",
+                String::from_utf8_lossy(&msg)
+            )))
+        }
+        other => Err(PairingError::Protocol(format!(
+            "adb unexpected response: {other:?}"
+        ))),
+    }
 }
 
 #[cfg(feature = "host")]
