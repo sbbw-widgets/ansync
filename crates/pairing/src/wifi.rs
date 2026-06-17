@@ -382,22 +382,67 @@ pub async fn browse_pair_candidates(
                 continue;
             };
             let port = info.get_port();
-            let Some(&ip) = info.get_addresses().iter().next() else {
+            // mDNS replies carry every NIC's address. Pick the one
+            // the kernel can actually connect to: IPv4 first (simpler
+            // routing), then IPv6 global. IPv6 link-local needs a
+            // scope id that `SocketAddr` doesn't carry, so a
+            // `connect` against fe80:: returns EINVAL; APIPA
+            // (169.254/16) means DHCP never assigned a real lease and
+            // the peer isn't actually reachable.
+            let Some(ip) = info
+                .get_addresses()
+                .iter()
+                .copied()
+                .filter(|ip| !is_unreachable_pair_addr(*ip))
+                .min_by_key(|ip| pair_addr_rank(*ip))
+            else {
                 continue;
             };
             let addr = std::net::SocketAddr::new(ip, port);
-            found.insert(
-                pubkey,
-                PairCandidate {
-                    addr,
-                    pubkey,
-                    name: name.to_string(),
-                },
-            );
+            // Dedup by pubkey but only overwrite when the new
+            // candidate has a strictly better rank — otherwise a
+            // late link-local reply from the same peer would clobber
+            // a usable IPv4 we already picked.
+            let new_rank = pair_addr_rank(addr.ip());
+            match found.get(&pubkey) {
+                Some(existing) if pair_addr_rank(existing.addr.ip()) <= new_rank => {}
+                _ => {
+                    found.insert(
+                        pubkey,
+                        PairCandidate {
+                            addr,
+                            pubkey,
+                            name: name.to_string(),
+                        },
+                    );
+                }
+            }
         }
     }
     let _ = daemon.shutdown();
     Ok(found.into_values().collect())
+}
+
+#[cfg(feature = "host")]
+fn is_unreachable_pair_addr(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => v4.is_link_local() || v4.is_unspecified() || v4.is_loopback(),
+        std::net::IpAddr::V6(v6) => {
+            // fe80::/10 — link-local, needs scope id we can't carry.
+            // ::1 + unspecified — pointless to dial.
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || (v6.segments()[0] & 0xffc0) == 0xfe80
+        }
+    }
+}
+
+#[cfg(feature = "host")]
+fn pair_addr_rank(ip: std::net::IpAddr) -> u8 {
+    match ip {
+        std::net::IpAddr::V4(_) => 0,
+        std::net::IpAddr::V6(_) => 1,
+    }
 }
 
 #[cfg(feature = "host")]
