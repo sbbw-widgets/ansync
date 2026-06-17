@@ -317,10 +317,12 @@ dependencies = [
  "ansync-permissions",
  "ansync-proto",
  "async-trait",
+ "hex",
  "serde",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "uuid",
  "zbus",
 ]
 

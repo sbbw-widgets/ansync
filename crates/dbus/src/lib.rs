@@ -16,12 +16,17 @@ use zbus::Connection;
 
 mod device;
 pub mod manager;
+pub mod pair;
 mod permissions;
 pub mod state;
 mod util;
 
 pub use device::Device;
 pub use manager::Manager;
+pub use pair::{
+    allocate as allocate_pair_session, path_pair_session, spawn_session as spawn_pair_session,
+    PairSessionSnapshot, PairState, PairingSessionIface,
+};
 pub use permissions::PermissionsIface;
 pub use state::{ConnState, DaemonAction, DaemonState};
 pub use util::parse_device_id;

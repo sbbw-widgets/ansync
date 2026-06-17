@@ -39,11 +39,103 @@ impl Manager {
         Ok(())
     }
 
-    async fn start_pairing(&self, _method: String) -> zbus::fdo::Result<String> {
-        Err(zbus::fdo::Error::NotSupported(
-            "StartPairing over D-Bus lands in a later step; use `ansyncctl pair` for now"
-                .into(),
-        ))
+    /// Browse the LAN for companions advertising
+    /// `_ansync-pair._tcp.local.`. Returns one entry per resolved
+    /// pubkey (deduplicated across NIC replies). `seconds = 0` falls
+    /// back to a 5 s budget.
+    ///
+    /// The widget calls this to populate a "devices nearby" list and
+    /// then dispatches the user's pick to [`Self::start_pairing`].
+    #[zbus(name = "BrowseAvailable")]
+    async fn browse_available(
+        &self,
+        seconds: u32,
+    ) -> zbus::fdo::Result<Vec<(String, String, String)>> {
+        let secs = if seconds == 0 { 5 } else { seconds as u64 };
+        let timeout = std::time::Duration::from_secs(secs);
+        let found = ansync_pairing::browse_pair_candidates(timeout)
+            .await
+            .map_err(|e| zbus::fdo::Error::Failed(format!("mdns browse: {e}")))?;
+        Ok(found
+            .into_iter()
+            .map(|c| (c.name, c.addr.to_string(), hex::encode(c.pubkey)))
+            .collect())
+    }
+
+    /// Kick off a WiFi-PIN pair against `addr` (`ip:port`). Returns
+    /// the object path of a fresh
+    /// `org.gameros.Ansync1.PairingSession` — the caller subscribes to
+    /// its `PropertiesChanged` for the `State` transition into
+    /// `awaiting_pin`, prompts the user, and dispatches the typed PIN
+    /// via `SubmitPin`.
+    ///
+    /// `expected_pubkey_hex` is optional: when non-empty (typically
+    /// populated from a prior `BrowseAvailable` result) the worker
+    /// rejects the session if the pubkey carried in `BootstrapAck`
+    /// does not match. Set to empty string to skip the check (e.g.
+    /// `--remote-addr` style manual entry).
+    #[zbus(name = "StartPairing")]
+    async fn start_pairing(
+        &self,
+        addr: String,
+        expected_pubkey_hex: String,
+        #[zbus(connection)] conn: &zbus::Connection,
+    ) -> zbus::fdo::Result<zbus::zvariant::ObjectPath<'static>> {
+        let socket: std::net::SocketAddr = addr.parse().map_err(|e| {
+            zbus::fdo::Error::InvalidArgs(format!("addr must be `ip:port`: {e}"))
+        })?;
+        let expected_pubkey = if expected_pubkey_hex.is_empty() {
+            None
+        } else {
+            let bytes = hex::decode(&expected_pubkey_hex).map_err(|e| {
+                zbus::fdo::Error::InvalidArgs(format!("expected_pubkey_hex: {e}"))
+            })?;
+            if bytes.len() != 32 {
+                return Err(zbus::fdo::Error::InvalidArgs(format!(
+                    "expected_pubkey_hex must be 64 hex chars, got {}",
+                    bytes.len() * 2
+                )));
+            }
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&bytes);
+            Some(arr)
+        };
+
+        let session_id = uuid::Uuid::new_v4().simple().to_string();
+        let path = crate::pair::path_pair_session(&session_id);
+        let object_path = zbus::zvariant::ObjectPath::try_from(path.as_str())
+            .map_err(|e| zbus::fdo::Error::Failed(format!("bad session path: {e}")))?;
+
+        let (snapshot, pin_tx, pin_rx, cancel_tx, cancel_rx) =
+            crate::pair::allocate();
+        snapshot
+            .lock()
+            .expect("snapshot poisoned")
+            .address = socket.to_string();
+
+        let iface = crate::pair::PairingSessionIface {
+            id: session_id.clone(),
+            snapshot: snapshot.clone(),
+            pin_tx,
+            cancel_tx,
+        };
+        conn.object_server()
+            .at(object_path.clone(), iface)
+            .await
+            .map_err(|e| zbus::fdo::Error::Failed(format!("register session: {e}")))?;
+
+        crate::pair::spawn_session(
+            conn.clone(),
+            self.state.clone(),
+            session_id,
+            socket,
+            expected_pubkey,
+            snapshot,
+            pin_rx,
+            cancel_rx,
+        );
+
+        Ok(object_path.into_owned())
     }
 
     /// Fired by `daemon-core` whenever a peer transitions through the

@@ -17,5 +17,7 @@ async-trait.workspace = true
 zbus.workspace = true
 serde.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["sync"] }
+tokio = { workspace = true, features = ["sync", "net", "io-util", "time", "rt"] }
 tracing.workspace = true
+uuid.workspace = true
+hex.workspace = true
