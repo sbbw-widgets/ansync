@@ -38,6 +38,16 @@
          in Step 11 (audio routing controls). -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
 
+    <!-- Doze whitelist: lets the user grant the companion service a
+         permanent exemption from idle-doze power restrictions. Without
+         it Android can throttle Wi-Fi / CPU after ~30 min of screen-off
+         and the host loses the QUIC session silently. The Setup notif
+         walks the user through this — Google Play would reject a
+         pre-installed apk that bundles the doze grant, so we ask. -->
+    <uses-permission
+        android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS"
+        tools:ignore="BatteryLife" />
+
     <!-- Auto-restart the companion service after device reboot (U4c). -->
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
 

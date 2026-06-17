@@ -3,6 +3,7 @@ package org.gameros.ansync
 import android.Manifest
 import android.content.Context
 import android.content.Intent
+import android.net.Uri
 import android.os.Bundle
 import android.provider.Settings
 import android.util.Log
@@ -80,6 +81,31 @@ class SetupStepActivity : ComponentActivity() {
                 Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS)
             )
             SetupStep.MiuiAutostart -> launchMiuiAutostart()
+            SetupStep.BatteryWhitelist -> launchBatteryWhitelist()
+        }
+    }
+
+    private fun launchBatteryWhitelist() {
+        // ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS pops a system
+        // dialog asking the user to add the app to the unrestricted
+        // list. Skips the menu trawl through Settings → Battery →
+        // Optimisations. Requires the matching manifest permission.
+        val intent = Intent(
+            Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+            Uri.fromParts("package", packageName, null),
+        )
+        try {
+            settingsLauncher.launch(intent)
+        } catch (e: Exception) {
+            Log.w(TAG, "battery whitelist launch failed; falling back to settings", e)
+            try {
+                settingsLauncher.launch(
+                    Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)
+                )
+            } catch (e2: Exception) {
+                Log.w(TAG, "battery settings fallback failed too", e2)
+                afterStep()
+            }
         }
     }
 

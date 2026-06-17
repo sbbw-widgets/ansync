@@ -59,6 +59,13 @@ enum class SetupStep(
         "MIUI freezes background services by default. Enable Autostart + Background pop-up " +
             "so ansync stays reachable after the screen turns off.",
     ),
+    BatteryWhitelist(
+        "battery_whitelist",
+        "Disable battery optimisation",
+        "Android puts background apps into deep sleep after ~30 min idle, which silently " +
+            "drops the QUIC connection to your PC. Adding ansync to the unrestricted list " +
+            "keeps it reachable while your phone is locked.",
+    ),
     ;
 
     fun isDone(ctx: Context): Boolean = when (this) {
@@ -74,6 +81,7 @@ enum class SetupStep(
         NotificationListener -> isNotifListenerEnabled(ctx)
         MiuiAutostart -> ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
             .getBoolean(PREF_MIUI_AUTOSTART_DONE, false)
+        BatteryWhitelist -> KeepAlive.isBatteryWhitelisted(ctx)
     }
 
     fun isApplicable(): Boolean = when (this) {

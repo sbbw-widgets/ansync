@@ -66,10 +66,17 @@ class AnsyncCompanionService : Service() {
     private var filePollHandler: Handler? = null
     @Volatile private var filePollRunning = false
     private var screenReceiver: BroadcastReceiver? = null
+    private var keepAlive: KeepAlive? = null
 
     override fun onCreate() {
         super.onCreate()
         ensureChannel(this)
+        // Acquire the Wi-Fi lock immediately so the radio stays in
+        // full-power mode for the entire service lifetime. Cheap to
+        // hold + the only thing that prevents idle-doze from dropping
+        // QUIC keep-alive pings between us and the host. Battery
+        // whitelist is the other half — covered by `SetupStep.BatteryWhitelist`.
+        keepAlive = KeepAlive(this).also { it.acquire() }
         NativeBridge.nativeInit(filesDir.absolutePath)
         NativeBridge.nativeSetDeviceName("${Build.MANUFACTURER} ${Build.MODEL}")
         val storedHostPubkey = getSharedPreferences(PREFS, Context.MODE_PRIVATE)
@@ -746,6 +753,8 @@ class AnsyncCompanionService : Service() {
             }
         }
         screenReceiver = null
+        keepAlive?.release()
+        keepAlive = null
         NativeBridge.nativeClose()
         super.onDestroy()
     }
