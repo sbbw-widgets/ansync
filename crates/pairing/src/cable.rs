@@ -281,6 +281,28 @@ pub async fn install_companion_apk(
         device
             .install(&apk)
             .map_err(|e| pairing_err("adb install", e))?;
+        // Grant the runtime perm `PairingReceiver` needs to surface
+        // its heads-up notif. Without it the broadcast fires, the
+        // receiver runs, `mgr.notify` returns success — but Android
+        // suppresses the notification because the perm is denied,
+        // and the user has no UI affordance to finish the pair.
+        // `--include-stopped-packages` covers the receiver delivery
+        // side; this covers the visibility side.
+        let mut buf = Vec::with_capacity(64);
+        if let Err(e) = device.shell_command(
+            &[
+                "pm",
+                "grant",
+                COMPANION_PACKAGE,
+                "android.permission.POST_NOTIFICATIONS",
+            ],
+            &mut buf,
+        ) {
+            tracing::warn!(
+                error = %e,
+                "pm grant POST_NOTIFICATIONS failed; pair notif may not appear"
+            );
+        }
         Ok(())
     })
     .await
@@ -344,11 +366,30 @@ async fn trigger_companion_pair(
     tokio::task::spawn_blocking(move || {
         let mut device = get_device(&serial)?;
         let mut buf = Vec::with_capacity(256);
+        // Idempotent re-grant in case the user revoked POST_NOTIFICATIONS
+        // (or this is the skip-install-on-version-match path so the
+        // grant from `install_companion_apk` never ran).
+        let _ = device.shell_command(
+            &[
+                "pm",
+                "grant",
+                COMPANION_PACKAGE,
+                "android.permission.POST_NOTIFICATIONS",
+            ],
+            &mut buf,
+        );
+        buf.clear();
         device
             .shell_command(
                 &[
                     "am",
                     "broadcast",
+                    // Required when the companion has been installed
+                    // but never opened (Android keeps the app in
+                    // "stopped" state until the user launches it
+                    // once, and stopped-state apps silently drop all
+                    // broadcasts that don't carry this flag).
+                    "--include-stopped-packages",
                     "-a",
                     "org.gameros.ansync.action.PAIR",
                     "-n",
