@@ -36,7 +36,7 @@ use ansync_transport::pinning::TrustedPeers;
 use ansync_transport::{
     Connection, QuicConnection, QuicServer, QuicStream, QuicTransport, Stream as _, StreamKind,
 };
-use ansync_video::sink_egui::{FrameSlot, new_slot};
+use ansync_video::sink_egui::{DeckEntry, FrameSlot, WindowDeck, new_slot};
 use ansync_video::{HostDecoder, PixelFormat, VideoCodec, VideoDecoder};
 use directories::BaseDirs;
 use tokio::signal::unix::{SignalKind, signal};
@@ -215,6 +215,26 @@ impl Daemon {
         let cameras = Arc::new(CameraRegistry::default());
         let audios = Arc::new(AudioRegistry::default());
         let clipboard_sync = ClipboardSync::default();
+        // One eframe instance serves every peer's mirror window via
+        // deferred viewports. The event loop blocks the calling
+        // thread forever, so we spawn it on a dedicated OS thread and
+        // share `Arc<WindowDeck>` with `action_loop`. winit refuses a
+        // second `EventLoop::build` per process, so this single-host
+        // model is the only legal way to get multiple native windows.
+        let deck = WindowDeck::new();
+        {
+            let deck = deck.clone();
+            std::thread::Builder::new()
+                .name("ansync-mirror-deck".into())
+                .spawn(move || {
+                    if let Err(e) = ansync_video::sink_egui::run_deck(deck) {
+                        error!(error = %e, "mirror deck exited");
+                    }
+                })
+                .map_err(|e| {
+                    DaemonError::Startup(format!("spawn mirror-deck thread: {e}"))
+                })?;
+        }
         let action_handle = tokio::spawn(action_loop(
             action_rx,
             action_tx.clone(),
@@ -223,6 +243,7 @@ impl Daemon {
             audios.clone(),
             permissions.clone(),
             clipboard_sync.clone(),
+            deck.clone(),
         ));
 
         let device_name = DeviceName(self.config.device_name.clone());
@@ -358,20 +379,15 @@ pub struct MirrorRegistry {
 pub struct MirrorEntry {
     pub slot: FrameSlot,
     pub peer_name: String,
-    /// `Some` once the window thread has been spawned. Never cleared:
-    /// winit/Wayland panics on a second `EventLoop::build` per
-    /// process, so the thread stays alive across hide/show and the
-    /// viewport flips visibility via `slot.request_show()` instead.
-    window: StdMutex<Option<std::thread::JoinHandle<()>>>,
     /// `Some` while the peer is connected. `action_loop` reads this
     /// to open an outbound Input stream on ShowScreen. Cleared by
     /// `handle_connection` on disconnect.
     pub conn: StdMutex<Option<Arc<QuicConnection>>>,
-    /// Flipped to `true` by `video_stream_loop` on the first chunk
-    /// from the peer; cleared on stream close. ShowScreen consults
-    /// this to decide whether to push a `RequestScreenCapture` to the
-    /// companion — when the tile-driven path is already streaming we
-    /// must NOT re-ask the user for MediaProjection consent.
+    /// Flipped to `true` by `video_stream_loop` on first chunk; cleared
+    /// on stream close. ShowScreen consults this to decide whether to
+    /// push a `RequestScreenCapture` to the companion — when the
+    /// tile-driven path is already streaming we must NOT re-ask the
+    /// user for MediaProjection consent.
     pub video_inbound: std::sync::atomic::AtomicBool,
 }
 
@@ -542,7 +558,6 @@ impl MirrorRegistry {
                 Arc::new(MirrorEntry {
                     slot: new_slot(),
                     peer_name: name.to_string(),
-                    window: StdMutex::new(None),
                     conn: StdMutex::new(None),
                     video_inbound: std::sync::atomic::AtomicBool::new(false),
                 })
@@ -577,6 +592,7 @@ async fn action_loop(
     audios: Arc<AudioRegistry>,
     permissions: Arc<dyn ansync_permissions::PermissionsStore>,
     clipboard_sync: ClipboardSync,
+    deck: Arc<WindowDeck>,
 ) {
     while let Some(action) = rx.recv().await {
         match action {
@@ -657,9 +673,13 @@ async fn action_loop(
                     warn!(%device, "ShowScreen: no mirror entry (peer not connected?)");
                     continue;
                 };
-                // Always (re)install the outbound Input pipe on the
-                // slot — daemon-core spins one per ShowScreen because
-                // the underlying QUIC stream is per-connection.
+                let key = device.to_string();
+                // Idempotent: dropping the user back into an already
+                // open window just refreshes its input pipe and
+                // (optionally) re-asks the companion to start its
+                // capture pipe.
+                let already_open = deck.is_open(&key);
+
                 let conn = entry.conn.lock().expect("conn slot poisoned").clone();
                 let input_tx = if let Some(conn) = conn.clone() {
                     match conn.open(StreamKind::Input).await {
@@ -677,12 +697,6 @@ async fn action_loop(
                     warn!(%device, "ShowScreen: no live connection; window will be view-only");
                     None
                 };
-                entry.slot.set_input_tx(input_tx);
-                // Only push RequestScreenCapture when the companion
-                // isn't already streaming. The tile-driven path opens
-                // Video first; pushing RequestScreenCapture there would
-                // re-pop the MediaProjection picker even though capture
-                // is live.
                 if !entry.video_inbound.load(std::sync::atomic::Ordering::Relaxed) {
                     if let Some(conn) = conn {
                         if let Err(e) = send_request_capture(&conn).await {
@@ -690,33 +704,45 @@ async fn action_loop(
                         }
                     }
                 }
-                // Thread already alive (any prior ShowScreen on this
-                // process) → just flip the viewport back to visible
-                // and focus. winit/Wayland forbids re-creating the
-                // event loop, so we never spawn a second one.
-                let already_alive = entry.window.lock().expect("window slot poisoned").is_some();
-                if already_alive {
-                    entry.slot.request_show();
-                    info!(%device, "ShowScreen: existing window revealed");
+
+                // Build (or rebuild) the deck entry. The deck keeps
+                // any prior entry under the same key alive across
+                // hide/show cycles? Actually no — the user closing
+                // the window removes the entry, so each ShowScreen
+                // after a close gets a fresh `DeckEntry` (and a fresh
+                // `ViewportId` from the same key, since the prior
+                // viewport is gone by the time we reopen). On an
+                // already-open viewport we just swap in the latest
+                // input pipe + close notifier so the same window
+                // keeps working.
+                if already_open {
+                    if let Some(existing) = deck.get(&key) {
+                        existing.set_input_tx(input_tx);
+                        let (close_tx, mut close_rx) = unbounded_channel::<()>();
+                        existing.set_close_tx(Some(close_tx));
+                        let exit_tx = self_tx.clone();
+                        let exit_device = device.clone();
+                        tokio::spawn(async move {
+                            while close_rx.recv().await.is_some() {
+                                let _ = exit_tx.send(DaemonAction::HideScreen {
+                                    device: exit_device.clone(),
+                                });
+                            }
+                        });
+                    }
+                    info!(%device, "ShowScreen: existing viewport refreshed");
                     continue;
                 }
-                // First show this process: spawn the window thread.
-                // Install a close-notifier channel so the user's X-click
-                // becomes a HideScreen action (the thread itself never
-                // exits — the app cancels close + hides the viewport).
+
+                let new_entry = DeckEntry::new(
+                    key.clone(),
+                    format!("ansync — {}", entry.peer_name),
+                    entry.slot.clone(),
+                );
+                new_entry.set_input_tx(input_tx);
                 let (close_tx, mut close_rx) = unbounded_channel::<()>();
-                entry.slot.set_close_tx(Some(close_tx));
-                let slot = entry.slot.clone();
-                let title = format!("ansync — {}", entry.peer_name);
-                let handle = std::thread::Builder::new()
-                    .name(format!("ansync-mirror-{device}"))
-                    .spawn(move || {
-                        if let Err(e) = ansync_video::sink_egui::run(title, slot) {
-                            warn!(error = %e, "mirror window exited with error");
-                        }
-                    })
-                    .ok();
-                *entry.window.lock().expect("window slot poisoned") = handle;
+                new_entry.set_close_tx(Some(close_tx));
+                deck.open(new_entry);
                 let exit_tx = self_tx.clone();
                 let exit_device = device.clone();
                 tokio::spawn(async move {
@@ -726,23 +752,20 @@ async fn action_loop(
                         });
                     }
                 });
-                info!(%device, "ShowScreen: window spawned");
+                info!(%device, "ShowScreen: viewport opened");
             }
             DaemonAction::HideScreen { device } => {
-                let Some(entry) = mirrors.get(&device) else {
-                    continue;
-                };
-                // Leave `entry.window` populated so the next
-                // ShowScreen reuses the same winit event loop. Just
-                // tell the companion to drop encoder + projection so
-                // the device's foreground notification clears.
-                let conn = entry.conn.lock().expect("conn slot poisoned").clone();
-                if let Some(conn) = conn {
-                    if let Err(e) = send_stop_capture(&conn).await {
-                        warn!(%device, error = %e, "StopScreenCapture send failed");
+                let key = device.to_string();
+                deck.close(&key);
+                if let Some(entry) = mirrors.get(&device) {
+                    let conn = entry.conn.lock().expect("conn slot poisoned").clone();
+                    if let Some(conn) = conn {
+                        if let Err(e) = send_stop_capture(&conn).await {
+                            warn!(%device, error = %e, "StopScreenCapture send failed");
+                        }
                     }
                 }
-                info!(%device, "HideScreen: companion notified, window kept hidden");
+                info!(%device, "HideScreen: viewport closed, companion notified");
             }
         }
     }

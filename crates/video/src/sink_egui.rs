@@ -15,13 +15,28 @@
 //! shader. The CPU side never owns more than the 3 MB NV12 frame
 //! we just decoded, and the egui texture path is bypassed entirely.
 //!
-//! The eframe app **never** drives its own repaint cadence — there
-//! is no `request_repaint_after` poll. The producer (the QUIC video
+//! ## Multi-window model
+//!
+//! winit enforces a process-wide `EVENT_LOOP_CREATED` guard that
+//! makes `EventLoop::build` return `RecreationAttempt` on the second
+//! call. That means we can't pop a new `eframe::run_native` per
+//! `ShowScreen` to give each peer its own real window — but we can
+//! run one event loop forever and let egui's deferred-viewport API
+//! spawn / reap native sub-windows on demand. That's what
+//! [`WindowDeck`] + [`MirrorHostApp`] do: the daemon spawns one host
+//! thread at startup, and every `ShowScreen` registers a
+//! [`DeckEntry`]. The host's `update` reflects the registry into
+//! `Context::show_viewport_deferred` calls; removing the entry on
+//! close drops the viewport and lets the user reopen it later.
+//!
+//! The host app **never** drives its own repaint cadence — there is
+//! no `request_repaint_after` poll. The producer (the QUIC video
 //! stream loop) calls [`MirrorSlot::store`] each time a new frame
 //! lands, which wakes egui via the cached [`egui::Context`]. With no
 //! incoming frames the GUI stays idle, which is the difference
 //! between ~0 % CPU and ~25 % CPU per peer on the host.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -56,30 +71,9 @@ fn fire_once(flag: &AtomicBool) -> bool {
 /// wakes from idle without us having to poll on a timer.
 pub struct MirrorSlot {
     inner: Mutex<Option<DecodedFrame>>,
-    /// Filled in by `MirrorApp` on its first `update`. `Mutex` (not
-    /// `OnceLock`) so the slot can be cloned for a second window
-    /// later — overwriting the handle is fine, both contexts share
-    /// the same wgpu device.
+    /// Filled in by the viewport's first paint. Lets the producer
+    /// (video stream loop) wake egui after `store`.
     ctx: Mutex<Option<egui::Context>>,
-    /// Flipped by `request_show()` when the daemon wants the window
-    /// back on screen after a previous hide. Consumed in `update` by
-    /// firing `Visible(true)` + `Focus`. We don't reuse winit event
-    /// loops across `run` calls — winit/Wayland panics on a second
-    /// `EventLoop::build` per process — so the window thread stays
-    /// alive across hide/show and this atomic toggles the viewport
-    /// visibility instead.
-    show_request: AtomicBool,
-    /// Outbound input pipe. Daemon-core replaces this each ShowScreen
-    /// because the underlying QUIC stream is bound to the current
-    /// peer connection. `MirrorApp::update` pulls a fresh clone every
-    /// frame so input keeps flowing after a hide/show toggle.
-    input_tx: Mutex<Option<UnboundedSender<InputMessage>>>,
-    /// Daemon-core installs the sender each ShowScreen so the app can
-    /// notify it when the user clicks the window's X. The app does NOT
-    /// exit `eframe::run_native` — it cancels the close and hides the
-    /// viewport — so this is the only path for HideScreen to fire
-    /// without a D-Bus call.
-    close_tx: Mutex<Option<UnboundedSender<()>>>,
 }
 
 impl MirrorSlot {
@@ -87,52 +81,6 @@ impl MirrorSlot {
         Self {
             inner: Mutex::new(None),
             ctx: Mutex::new(None),
-            show_request: AtomicBool::new(false),
-            input_tx: Mutex::new(None),
-            close_tx: Mutex::new(None),
-        }
-    }
-
-    /// Ask the running window to reveal + focus on its next paint.
-    /// Wakes egui via the cached context so the request lands without
-    /// waiting for a frame from the producer.
-    pub fn request_show(&self) {
-        self.show_request.store(true, Ordering::Relaxed);
-        if let Ok(ctx) = self.ctx.lock() {
-            if let Some(ctx) = ctx.as_ref() {
-                ctx.request_repaint();
-            }
-        }
-    }
-
-    pub fn set_input_tx(&self, tx: Option<UnboundedSender<InputMessage>>) {
-        if let Ok(mut g) = self.input_tx.lock() {
-            *g = tx;
-        }
-    }
-
-    pub fn set_close_tx(&self, tx: Option<UnboundedSender<()>>) {
-        if let Ok(mut g) = self.close_tx.lock() {
-            *g = tx;
-        }
-    }
-
-    fn take_show_request(&self) -> bool {
-        self.show_request.swap(false, Ordering::Relaxed)
-    }
-
-    fn input_tx_clone(&self) -> Option<UnboundedSender<InputMessage>> {
-        self.input_tx
-            .lock()
-            .ok()
-            .and_then(|g| g.as_ref().cloned())
-    }
-
-    fn notify_close(&self) {
-        if let Ok(g) = self.close_tx.lock() {
-            if let Some(tx) = g.as_ref() {
-                let _ = tx.send(());
-            }
         }
     }
 
@@ -171,15 +119,199 @@ pub fn new_slot() -> FrameSlot {
     Arc::new(MirrorSlot::new())
 }
 
-/// Block the calling thread on `eframe::run_native`. Spawn this on a
-/// dedicated thread when the caller wants the daemon to keep running
-/// alongside the window — winit on Linux is happy on any thread.
-pub fn run(title: String, slot: FrameSlot) -> Result<(), Box<dyn std::error::Error>> {
-    // The mirror window is spawned from `daemon-core::action_loop` on
-    // a dedicated thread, which winit/eframe normally refuses on
-    // Linux (X11 + Wayland event loops insist on the main thread).
-    // Both backends ship an `any_thread` opt-in for embedders that
-    // genuinely want the per-window thread model — that's us.
+/// Multi-window registry shared between daemon-core (writer) and the
+/// host eframe thread (reader). Each peer's mirror window is one
+/// [`DeckEntry`]; the host's `update` reflects the map into deferred
+/// viewports and reaps them when the entry is removed.
+pub struct WindowDeck {
+    windows: Mutex<HashMap<String, Arc<DeckEntry>>>,
+    /// Cached so `open`/`close` can wake the root window's update loop
+    /// without waiting for an unrelated repaint trigger.
+    ctx: Mutex<Option<egui::Context>>,
+}
+
+impl WindowDeck {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            windows: Mutex::new(HashMap::new()),
+            ctx: Mutex::new(None),
+        })
+    }
+
+    /// Register a window. Idempotent on `entry.key` — a second call
+    /// overwrites the previous entry, which lets the daemon swap in
+    /// a fresh `input_tx` after a peer reconnect without first
+    /// closing the existing viewport.
+    pub fn open(&self, entry: Arc<DeckEntry>) {
+        if let Ok(mut g) = self.windows.lock() {
+            g.insert(entry.key.clone(), entry);
+        }
+        self.wake();
+    }
+
+    /// Tear the viewport down. The next root `update` will not call
+    /// `show_viewport_deferred` for `key`, so egui closes the native
+    /// window for us.
+    pub fn close(&self, key: &str) {
+        if let Ok(mut g) = self.windows.lock() {
+            g.remove(key);
+        }
+        self.wake();
+    }
+
+    pub fn get(&self, key: &str) -> Option<Arc<DeckEntry>> {
+        self.windows.lock().ok().and_then(|g| g.get(key).cloned())
+    }
+
+    pub fn is_open(&self, key: &str) -> bool {
+        self.windows
+            .lock()
+            .ok()
+            .map(|g| g.contains_key(key))
+            .unwrap_or(false)
+    }
+
+    fn snapshot(&self) -> Vec<Arc<DeckEntry>> {
+        self.windows
+            .lock()
+            .ok()
+            .map(|g| g.values().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    fn attach_ctx(&self, ctx: egui::Context) {
+        if let Ok(mut g) = self.ctx.lock() {
+            *g = Some(ctx);
+        }
+    }
+
+    fn wake(&self) {
+        if let Ok(ctx) = self.ctx.lock() {
+            if let Some(ctx) = ctx.as_ref() {
+                ctx.request_repaint();
+            }
+        }
+    }
+}
+
+/// One mirror window. Lives in the deck for as long as the window is
+/// open; daemon-core constructs it in `ShowScreen` and removes it on
+/// `HideScreen` (or in response to the user clicking X).
+pub struct DeckEntry {
+    /// Stable identifier (peer device id stringified) — also drives
+    /// the egui `ViewportId` hash so a removed-then-readded entry
+    /// gets a fresh native window instead of resurrecting the old one.
+    pub key: String,
+    pub title: String,
+    pub slot: FrameSlot,
+    /// Outbound input pipe for this window's pointer/keyboard/gamepad
+    /// events. `None` means the window paints frames but doesn't
+    /// forward input (peer not connected, or perms not granted).
+    pub input_tx: Mutex<Option<UnboundedSender<InputMessage>>>,
+    /// Signalled when the user closes the window. Daemon-core uses
+    /// this to fire its own `HideScreen` action (companion stop +
+    /// state cleanup) without a D-Bus round-trip.
+    pub close_tx: Mutex<Option<UnboundedSender<()>>>,
+    /// Mutable per-window paint state. Boxed in a `Mutex` because the
+    /// deferred-viewport closure is `Fn`, not `FnMut`.
+    state: Mutex<ViewportState>,
+}
+
+impl DeckEntry {
+    pub fn new(key: String, title: String, slot: FrameSlot) -> Arc<Self> {
+        Arc::new(Self {
+            key,
+            title,
+            slot,
+            input_tx: Mutex::new(None),
+            close_tx: Mutex::new(None),
+            state: Mutex::new(ViewportState::new()),
+        })
+    }
+
+    pub fn set_input_tx(&self, tx: Option<UnboundedSender<InputMessage>>) {
+        if let Ok(mut g) = self.input_tx.lock() {
+            *g = tx;
+        }
+    }
+
+    pub fn set_close_tx(&self, tx: Option<UnboundedSender<()>>) {
+        if let Ok(mut g) = self.close_tx.lock() {
+            *g = tx;
+        }
+    }
+
+    fn input_tx_clone(&self) -> Option<UnboundedSender<InputMessage>> {
+        self.input_tx
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().cloned())
+    }
+
+    fn notify_close(&self) {
+        if let Ok(g) = self.close_tx.lock() {
+            if let Some(tx) = g.as_ref() {
+                let _ = tx.send(());
+            }
+        }
+    }
+}
+
+/// Per-window mutable bag held inside [`DeckEntry::state`]. Pulled
+/// out under a `Mutex` because each deferred-viewport closure runs
+/// as a separate `Fn` invocation and we need a stable place to keep
+/// the last pointer position / gilrs handle across paints.
+struct ViewportState {
+    last_size: Option<(u32, u32)>,
+    last_format: Option<PixelFormat>,
+    last_pointer: Option<egui::Pos2>,
+    revealed: bool,
+    /// `Gilrs` reads /dev/input/event* under the hood; one handle per
+    /// window means each viewport gets its own controller view. `None`
+    /// when the daemon doesn't have permission to open the evdev
+    /// nodes — we degrade to "mirror works but gamepad doesn't"
+    /// instead of crashing the window.
+    gilrs: Option<gilrs::Gilrs>,
+    gamepad: GamepadState,
+    gamepad_dirty: bool,
+}
+
+impl ViewportState {
+    fn new() -> Self {
+        let gilrs = match gilrs::Gilrs::new() {
+            Ok(g) => Some(g),
+            Err(e) => {
+                warn!(error = %e, "gilrs init failed; gamepad forwarding disabled");
+                None
+            }
+        };
+        Self {
+            last_size: None,
+            last_format: None,
+            last_pointer: None,
+            revealed: false,
+            gilrs,
+            gamepad: GamepadState {
+                buttons: 0,
+                lx: 0,
+                ly: 0,
+                rx: 0,
+                ry: 0,
+                lt: 0,
+                rt: 0,
+            },
+            gamepad_dirty: false,
+        }
+    }
+}
+
+/// Block the calling thread on `eframe::run_native` and drive the
+/// multi-window deck. Spawn this on a dedicated thread at daemon
+/// startup — winit on Linux is happy on any thread thanks to the
+/// `any_thread` opt-in, and the resulting process-wide event loop is
+/// the only legal way to host multiple native windows (winit refuses
+/// a second `EventLoop::build`).
+pub fn run_deck(deck: Arc<WindowDeck>) -> Result<(), Box<dyn std::error::Error>> {
     let event_loop_builder: eframe::EventLoopBuilderHook =
         Box::new(|builder: &mut eframe::EventLoopBuilder<_>| {
             #[cfg(target_os = "linux")]
@@ -219,16 +351,13 @@ pub fn run(title: String, slot: FrameSlot) -> Result<(), Box<dyn std::error::Err
         warn!(error = ?err, "mirror surface error; recreating swapchain");
         eframe::egui_wgpu::SurfaceErrorAction::RecreateSurface
     });
+    // Root viewport stays invisible forever — it only exists to host
+    // the event loop. Real mirror windows live as deferred sub-viewports
+    // hung off the deck.
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([960.0, 540.0])
-            .with_title(title.clone())
-            // Hide the window until the first decoded frame lands.
-            // Otherwise the user sees a 1-2 second flash of the egui
-            // default theme + "waiting for first decoded frame…"
-            // placeholder before video catches up — and on slow
-            // networks the placeholder can linger long enough to
-            // make the daemon look broken.
+            .with_inner_size([1.0, 1.0])
+            .with_title("ansync")
             .with_visible(false),
         renderer: eframe::Renderer::Wgpu,
         wgpu_options,
@@ -236,19 +365,16 @@ pub fn run(title: String, slot: FrameSlot) -> Result<(), Box<dyn std::error::Err
         ..Default::default()
     };
     eframe::run_native(
-        &title,
+        "ansync",
         native_options,
         Box::new(move |cc| {
-            // Install the YUV→RGB pipeline + sampler into the
-            // wgpu renderer's callback-resources bag so paint
-            // callbacks can pull it back out without re-creating.
             let render_state = cc
                 .wgpu_render_state
                 .as_ref()
                 .ok_or_else(|| "wgpu render state missing".to_string())?;
             info!(
                 target_format = ?render_state.target_format,
-                "mirror: wgpu render state ready; building pipelines"
+                "mirror deck: wgpu render state ready; building pipelines"
             );
             let resources = MirrorResources::new(
                 &render_state.device,
@@ -259,33 +385,20 @@ pub fn run(title: String, slot: FrameSlot) -> Result<(), Box<dyn std::error::Err
                 .write()
                 .callback_resources
                 .insert(resources);
-            // Producer wakes egui via this handle; install it before
-            // returning so the very first frame doesn't get stranded
-            // waiting for an event-driven repaint.
-            slot.attach_ctx(cc.egui_ctx.clone());
-            Ok(Box::new(MirrorApp::new(slot)))
+            deck.attach_ctx(cc.egui_ctx.clone());
+            Ok(Box::new(MirrorHostApp::new(deck)))
         }),
     )
     .map_err(|e| format!("eframe: {e}").into())
 }
 
-pub struct MirrorApp {
-    slot: FrameSlot,
-    last_size: Option<(u32, u32)>,
-    last_format: Option<PixelFormat>,
-    last_pointer: Option<egui::Pos2>,
-    /// `Gilrs` reads /dev/input/event* under the hood, so we keep one
-    /// instance for the lifetime of the window and poll it each
-    /// `update`. `None` when the daemon doesn't have permission to
-    /// open the evdev nodes (no `input` group membership) — we
-    /// degrade to "mirror works but gamepad doesn't" instead of
-    /// crashing the window thread.
-    gilrs: Option<gilrs::Gilrs>,
-    /// Snapshot of the most recently-sent gamepad state. We diff
-    /// against this on every poll so a peer never receives a packet
-    /// for a frame where nothing changed.
-    gamepad: GamepadState,
-    gamepad_dirty: bool,
+/// Root eframe `App` that turns the deck into deferred viewports.
+/// Holds no per-window state of its own — every window's mutable bits
+/// (gilrs, last pointer, etc.) live inside the corresponding
+/// `DeckEntry::state` so the deferred-viewport closure can pull them
+/// out via a `Mutex` without needing `FnMut`.
+pub struct MirrorHostApp {
+    deck: Arc<WindowDeck>,
 }
 
 /// Evdev-style button index for each gamepad bit. The order has to
@@ -304,143 +417,112 @@ const GP_BIT_MODE: u32 = 1 << 8;
 const GP_BIT_THUMBL: u32 = 1 << 9;
 const GP_BIT_THUMBR: u32 = 1 << 10;
 
-impl MirrorApp {
-    pub fn new(slot: FrameSlot) -> Self {
-        let gilrs = match gilrs::Gilrs::new() {
-            Ok(g) => Some(g),
-            Err(e) => {
-                warn!(error = %e, "gilrs init failed; gamepad forwarding disabled");
-                None
-            }
-        };
-        Self {
-            slot,
-            last_size: None,
-            last_format: None,
-            last_pointer: None,
-            gilrs,
-            gamepad: GamepadState {
-                buttons: 0,
-                lx: 0,
-                ly: 0,
-                rx: 0,
-                ry: 0,
-                lt: 0,
-                rt: 0,
-            },
-            gamepad_dirty: false,
+impl MirrorHostApp {
+    pub fn new(deck: Arc<WindowDeck>) -> Self {
+        Self { deck }
+    }
+}
+
+fn poll_and_emit_gamepad(state: &mut ViewportState, tx: &UnboundedSender<InputMessage>) {
+    if state.gilrs.is_none() {
+        return;
+    }
+    let mut events: Vec<gilrs::EventType> = Vec::new();
+    {
+        let gilrs = state.gilrs.as_mut().expect("checked Some above");
+        while let Some(gilrs::Event { event, .. }) = gilrs.next_event() {
+            events.push(event);
         }
     }
-
-    fn poll_and_emit_gamepad(&mut self, tx: &UnboundedSender<InputMessage>) {
-        if self.gilrs.is_none() {
-            return;
-        }
-        // Drain every queued event into a buffer first so we can
-        // release the `&mut self.gilrs` borrow before mutating other
-        // fields via `apply_axis` / button bitmask updates.
-        let mut events: Vec<gilrs::EventType> = Vec::new();
-        {
-            let gilrs = self.gilrs.as_mut().expect("checked Some above");
-            while let Some(gilrs::Event { event, .. }) = gilrs.next_event() {
-                events.push(event);
+    for event in events {
+        match event {
+            gilrs::EventType::ButtonPressed(btn, _) => {
+                if let Some(mask) = map_gilrs_button(btn) {
+                    let new = state.gamepad.buttons | mask;
+                    if new != state.gamepad.buttons {
+                        state.gamepad.buttons = new;
+                        state.gamepad_dirty = true;
+                    }
+                }
             }
-        }
-        for event in events {
-            match event {
-                gilrs::EventType::ButtonPressed(btn, _) => {
-                    if let Some(mask) = map_gilrs_button(btn) {
-                        let new = self.gamepad.buttons | mask;
-                        if new != self.gamepad.buttons {
-                            self.gamepad.buttons = new;
-                            self.gamepad_dirty = true;
-                        }
+            gilrs::EventType::ButtonReleased(btn, _) => {
+                if let Some(mask) = map_gilrs_button(btn) {
+                    let new = state.gamepad.buttons & !mask;
+                    if new != state.gamepad.buttons {
+                        state.gamepad.buttons = new;
+                        state.gamepad_dirty = true;
                     }
                 }
-                gilrs::EventType::ButtonReleased(btn, _) => {
-                    if let Some(mask) = map_gilrs_button(btn) {
-                        let new = self.gamepad.buttons & !mask;
-                        if new != self.gamepad.buttons {
-                            self.gamepad.buttons = new;
-                            self.gamepad_dirty = true;
-                        }
-                    }
-                }
-                gilrs::EventType::AxisChanged(axis, value, _) => {
-                    self.apply_axis(axis, value);
-                }
-                gilrs::EventType::ButtonChanged(btn, value, _) => {
-                    // gilrs reports analog triggers as button changes
-                    // with `value` in [0, 1]; quantise to evdev's
-                    // u8 trigger range.
-                    match btn {
-                        gilrs::Button::LeftTrigger2 => {
-                            let v = (value.clamp(0.0, 1.0) * 255.0) as u8;
-                            if self.gamepad.lt != v {
-                                self.gamepad.lt = v;
-                                self.gamepad_dirty = true;
-                            }
-                        }
-                        gilrs::Button::RightTrigger2 => {
-                            let v = (value.clamp(0.0, 1.0) * 255.0) as u8;
-                            if self.gamepad.rt != v {
-                                self.gamepad.rt = v;
-                                self.gamepad_dirty = true;
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                _ => {}
             }
-        }
-        if self.gamepad_dirty {
-            let snapshot = GamepadState {
-                buttons: self.gamepad.buttons,
-                lx: self.gamepad.lx,
-                ly: self.gamepad.ly,
-                rx: self.gamepad.rx,
-                ry: self.gamepad.ry,
-                lt: self.gamepad.lt,
-                rt: self.gamepad.rt,
-            };
-            let _ = send_input(tx, InputMessage::Gamepad(snapshot));
-            self.gamepad_dirty = false;
+            gilrs::EventType::AxisChanged(axis, value, _) => {
+                apply_axis(state, axis, value);
+            }
+            gilrs::EventType::ButtonChanged(btn, value, _) => {
+                match btn {
+                    gilrs::Button::LeftTrigger2 => {
+                        let v = (value.clamp(0.0, 1.0) * 255.0) as u8;
+                        if state.gamepad.lt != v {
+                            state.gamepad.lt = v;
+                            state.gamepad_dirty = true;
+                        }
+                    }
+                    gilrs::Button::RightTrigger2 => {
+                        let v = (value.clamp(0.0, 1.0) * 255.0) as u8;
+                        if state.gamepad.rt != v {
+                            state.gamepad.rt = v;
+                            state.gamepad_dirty = true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
         }
     }
-
-    fn apply_axis(&mut self, axis: gilrs::Axis, value: f32) {
-        // f32 ∈ [-1, 1] → i16 ∈ [-32767, 32767]. Y axes are flipped
-        // so "stick up" reads as positive across drivers.
-        let q = (value.clamp(-1.0, 1.0) * 32767.0) as i16;
-        let updated = match axis {
-            gilrs::Axis::LeftStickX => set_axis(&mut self.gamepad.lx, q),
-            gilrs::Axis::LeftStickY => set_axis(&mut self.gamepad.ly, q),
-            gilrs::Axis::RightStickX => set_axis(&mut self.gamepad.rx, q),
-            gilrs::Axis::RightStickY => set_axis(&mut self.gamepad.ry, q),
-            gilrs::Axis::LeftZ => {
-                let v = ((value.clamp(0.0, 1.0)) * 255.0) as u8;
-                if self.gamepad.lt != v {
-                    self.gamepad.lt = v;
-                    true
-                } else {
-                    false
-                }
-            }
-            gilrs::Axis::RightZ => {
-                let v = ((value.clamp(0.0, 1.0)) * 255.0) as u8;
-                if self.gamepad.rt != v {
-                    self.gamepad.rt = v;
-                    true
-                } else {
-                    false
-                }
-            }
-            _ => false,
+    if state.gamepad_dirty {
+        let snapshot = GamepadState {
+            buttons: state.gamepad.buttons,
+            lx: state.gamepad.lx,
+            ly: state.gamepad.ly,
+            rx: state.gamepad.rx,
+            ry: state.gamepad.ry,
+            lt: state.gamepad.lt,
+            rt: state.gamepad.rt,
         };
-        if updated {
-            self.gamepad_dirty = true;
+        let _ = send_input(tx, InputMessage::Gamepad(snapshot));
+        state.gamepad_dirty = false;
+    }
+}
+
+fn apply_axis(state: &mut ViewportState, axis: gilrs::Axis, value: f32) {
+    let q = (value.clamp(-1.0, 1.0) * 32767.0) as i16;
+    let updated = match axis {
+        gilrs::Axis::LeftStickX => set_axis(&mut state.gamepad.lx, q),
+        gilrs::Axis::LeftStickY => set_axis(&mut state.gamepad.ly, q),
+        gilrs::Axis::RightStickX => set_axis(&mut state.gamepad.rx, q),
+        gilrs::Axis::RightStickY => set_axis(&mut state.gamepad.ry, q),
+        gilrs::Axis::LeftZ => {
+            let v = ((value.clamp(0.0, 1.0)) * 255.0) as u8;
+            if state.gamepad.lt != v {
+                state.gamepad.lt = v;
+                true
+            } else {
+                false
+            }
         }
+        gilrs::Axis::RightZ => {
+            let v = ((value.clamp(0.0, 1.0)) * 255.0) as u8;
+            if state.gamepad.rt != v {
+                state.gamepad.rt = v;
+                true
+            } else {
+                false
+            }
+        }
+        _ => false,
+    };
+    if updated {
+        state.gamepad_dirty = true;
     }
 }
 
@@ -471,140 +553,147 @@ fn map_gilrs_button(b: gilrs::Button) -> Option<u32> {
     })
 }
 
-impl eframe::App for MirrorApp {
+impl eframe::App for MirrorHostApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Honour a daemon-side re-show after the user previously closed.
-        // The window thread never actually exits — winit/Wayland forbids
-        // a second `EventLoop::build` per process — so reopening the
-        // mirror means flipping the viewport back to visible.
-        if self.slot.take_show_request() {
+        // Root viewport has no business being on screen. Re-asserting
+        // `Visible(false)` per frame is cheap and survives the
+        // automatic show that some compositors trigger on focus.
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        // Snapshot under the lock so the deferred closures don't fight
+        // with daemon-side `open`/`close` calls.
+        let entries = self.deck.snapshot();
+        for entry in entries {
+            let viewport_id = egui::ViewportId::from_hash_of(("ansync-mirror", &entry.key));
+            let builder = egui::ViewportBuilder::default()
+                .with_title(entry.title.clone())
+                .with_inner_size([960.0, 540.0]);
+            let entry_for_closure = entry.clone();
+            let deck = self.deck.clone();
+            ctx.show_viewport_deferred(viewport_id, builder, move |ctx, _class| {
+                render_mirror_viewport(ctx, &entry_for_closure, &deck);
+            });
+        }
+    }
+}
+
+fn render_mirror_viewport(ctx: &egui::Context, entry: &Arc<DeckEntry>, deck: &Arc<WindowDeck>) {
+    // The producer (decoder feed loop) needs a context to wake on
+    // `store`. Refresh the slot's cached handle each paint — viewports
+    // own their own egui context, distinct from the root's.
+    entry.slot.attach_ctx(ctx.clone());
+
+    // X-click handler. Remove the entry from the deck so the next root
+    // paint stops emitting the viewport (egui then drops the native
+    // window) and notify the daemon so it can stop the companion-side
+    // encoder + emit `HideScreen` over D-Bus.
+    let close_req = ctx.input(|i| i.viewport().close_requested());
+    if close_req {
+        deck.close(&entry.key);
+        entry.notify_close();
+        // Let the close finish naturally — don't CancelClose. egui
+        // tears the viewport down on the next root paint.
+        return;
+    }
+
+    let mut state = entry.state.lock().expect("viewport state poisoned");
+    let taken = entry.slot.take();
+    if let Some(f) = &taken {
+        let size = (f.width, f.height);
+        if state.last_size != Some(size) {
+            info!(
+                key = %entry.key,
+                width = size.0,
+                height = size.1,
+                format = ?f.format,
+                "first frame uploaded"
+            );
+            state.last_size = Some(size);
+        }
+        if state.last_format != Some(f.format) {
+            state.last_format = Some(f.format);
+        }
+        if !state.revealed {
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            state.revealed = true;
         }
-        // Intercept the user's X-click: don't let eframe tear the
-        // event loop down. Hide the viewport, notify the daemon so it
-        // can tell the companion to stop encoding, and short-circuit
-        // the rest of this paint (the panel is about to vanish anyway).
-        let close_req = ctx.input(|i| i.viewport().close_requested());
-        if close_req {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-            self.slot.notify_close();
-            return;
-        }
-        let taken = self.slot.take();
-        if let Some(f) = &taken {
-            let size = (f.width, f.height);
-            if self.last_size != Some(size) {
-                info!(width = size.0, height = size.1, format = ?f.format, "first frame uploaded");
-                self.last_size = Some(size);
-                // Reveal the window now that we have something to show.
-                // `Visible(true)` is idempotent, but we cache via
-                // `last_size` so it only fires on the first frame.
-                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                // Also pull focus on first show so input goes straight
-                // to the mirror without an extra alt-tab.
-                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-            }
-            if self.last_format != Some(f.format) {
-                self.last_format = Some(f.format);
-            }
-        }
-        let cur_dims = self.last_size;
+    }
+    let cur_dims = state.last_size;
 
-        let mut hit_rect: Option<egui::Rect> = None;
-        // No frame, no padding, no inner margin — the texture should
-        // fill the viewport. Background black so letterbox bars (when
-        // the window aspect doesn't match the source) read as
-        // "nothing here" instead of egui's default panel colour.
-        let panel_frame = egui::Frame {
-            inner_margin: egui::Margin::ZERO,
-            outer_margin: egui::Margin::ZERO,
-            fill: egui::Color32::BLACK,
-            stroke: egui::Stroke::NONE,
-            corner_radius: egui::CornerRadius::ZERO,
-            shadow: egui::epaint::Shadow::NONE,
-        };
-        egui::CentralPanel::default().frame(panel_frame).show(ctx, |ui| {
-            if let Some((fw, fh)) = cur_dims {
-                // egui_wgpu's renderer skips paint callbacks when the
-                // primitive's CLIP RECT (the painter's clip, not the
-                // callback rect) has zero pixel area. Our previous
-                // builds added the callback via `ui.painter()` —
-                // whose clip is the *panel* rect — but the resulting
-                // primitive ended up sharing a clip with a previous
-                // zero-sized text shape, which killed it. Using
-                // `painter_at(rect)` pins the clip exactly to the
-                // callback rect so the renderer always honors it.
-                let panel = ui.max_rect();
-                let aspect = fw as f32 / fh.max(1) as f32;
-                let (w, h) = if panel.width() / panel.height() > aspect {
-                    (panel.height() * aspect, panel.height())
-                } else {
-                    (panel.width(), panel.width() / aspect)
-                };
-                let rect = egui::Rect::from_center_size(panel.center(), egui::vec2(w, h));
-                if fire_once(&FIRST_LAYOUT_LOGGED) {
-                    info!(
-                        panel = ?panel,
-                        rect = ?rect,
-                        "mirror: first layout (rect goes to paint callback)"
-                    );
-                }
-                let cb = egui_wgpu::Callback::new_paint_callback(
-                    rect,
-                    MirrorCallback { frame: taken },
-                );
-                ui.painter_at(rect).add(cb);
-                let _ = ui.allocate_rect(rect, egui::Sense::click_and_drag());
-                hit_rect = Some(rect);
+    let mut hit_rect: Option<egui::Rect> = None;
+    let panel_frame = egui::Frame {
+        inner_margin: egui::Margin::ZERO,
+        outer_margin: egui::Margin::ZERO,
+        fill: egui::Color32::BLACK,
+        stroke: egui::Stroke::NONE,
+        corner_radius: egui::CornerRadius::ZERO,
+        shadow: egui::epaint::Shadow::NONE,
+    };
+    egui::CentralPanel::default().frame(panel_frame).show(ctx, |ui| {
+        if let Some((fw, fh)) = cur_dims {
+            let panel = ui.max_rect();
+            let aspect = fw as f32 / fh.max(1) as f32;
+            let (w, h) = if panel.width() / panel.height() > aspect {
+                (panel.height() * aspect, panel.height())
             } else {
-                ui.centered_and_justified(|ui| {
-                    ui.label("waiting for first decoded frame…");
-                });
+                (panel.width(), panel.width() / aspect)
+            };
+            let rect = egui::Rect::from_center_size(panel.center(), egui::vec2(w, h));
+            if fire_once(&FIRST_LAYOUT_LOGGED) {
+                info!(
+                    panel = ?panel,
+                    rect = ?rect,
+                    "mirror: first layout (rect goes to paint callback)"
+                );
             }
-        });
-        // Pull a fresh input handle each frame. Daemon-core replaces
-        // the slot's sender on every ShowScreen because the underlying
-        // QUIC stream is per-peer-connection, so a hide/show cycle
-        // through a reconnect lands a new sender here without the app
-        // ever caring.
-        let input_tx = self.slot.input_tx_clone();
-        if let (Some(rect), Some((fw, fh)), Some(tx)) =
-            (hit_rect, cur_dims, input_tx.as_ref())
+            let cb = egui_wgpu::Callback::new_paint_callback(
+                rect,
+                MirrorCallback {
+                    frame: taken,
+                    key: entry.key.clone(),
+                },
+            );
+            ui.painter_at(rect).add(cb);
+            let _ = ui.allocate_rect(rect, egui::Sense::click_and_drag());
+            hit_rect = Some(rect);
+        } else {
+            ui.centered_and_justified(|ui| {
+                ui.label("waiting for first decoded frame…");
+            });
+        }
+    });
+
+    let input_tx = entry.input_tx_clone();
+    if let (Some(rect), Some((fw, fh)), Some(tx)) =
+        (hit_rect, cur_dims, input_tx.as_ref())
+    {
+        emit_pointer_events(ctx, &mut state.last_pointer, rect, fw, fh, tx);
+    }
+    if let Some(tx) = input_tx.as_ref() {
+        emit_keyboard_events(ctx, tx);
+        poll_and_emit_gamepad(&mut state, tx);
+        // gilrs is poll-driven; nudge egui at controller cadence so
+        // axis deltas don't pile up during otherwise-idle frames.
+        if state
+            .gilrs
+            .as_ref()
+            .map(|g| g.gamepads().count() > 0)
+            .unwrap_or(false)
         {
-            emit_pointer_events(ctx, &mut self.last_pointer, rect, fw, fh, tx);
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
         }
-        if let Some(tx) = input_tx.as_ref() {
-            emit_keyboard_events(ctx, tx);
-            self.poll_and_emit_gamepad(tx);
-            // gilrs is poll-driven, not event-driven, so we need
-            // egui to wake periodically while a controller is
-            // attached even if the video stream pauses. 16 ms (~60
-            // Hz) matches typical input cadence and won't burn CPU
-            // when no gamepad is connected (`request_repaint_after`
-            // coalesces with any other repaint trigger).
-            if self
-                .gilrs
-                .as_ref()
-                .map(|g| g.gamepads().count() > 0)
-                .unwrap_or(false)
-            {
-                ctx.request_repaint_after(std::time::Duration::from_millis(16));
-            }
-        }
-        // No `request_repaint_after`: the producer wakes us via
-        // `MirrorSlot::store` → `ctx.request_repaint()` whenever a
-        // new frame is ready. Idle GUI = idle CPU.
     }
 }
 
 /// Per-frame wgpu paint callback. Carries the newly-decoded
 /// [`DecodedFrame`] (if any) into the GPU upload path; if `frame` is
-/// `None` the previous-frame textures are re-rendered without
-/// re-uploading.
+/// `None` the previous-frame textures for `key` are re-rendered
+/// without re-uploading. `key` selects the per-window texture set
+/// inside the shared [`MirrorResources`] bag so concurrent viewports
+/// don't clobber each other.
 struct MirrorCallback {
     frame: Option<DecodedFrame>,
+    key: String,
 }
 
 impl egui_wgpu::CallbackTrait for MirrorCallback {
@@ -627,13 +716,8 @@ impl egui_wgpu::CallbackTrait for MirrorCallback {
             self.frame.as_ref(),
             callback_resources.get_mut::<MirrorResources>(),
         ) {
-            (Some(frame), Some(res)) => res.upload(device, queue, frame),
+            (Some(frame), Some(res)) => res.upload(device, queue, frame, &self.key),
             (Some(_), None) => {
-                // Means the eframe creator never installed
-                // `MirrorResources` — likely because
-                // `cc.wgpu_render_state` was None (eframe fell back
-                // to glow or the surface init failed). Log once so the
-                // diagnosis is obvious.
                 if fire_once(&FIRST_UPLOAD_LOGGED) {
                     error!("mirror prepare: MirrorResources missing from callback_resources; eframe likely on glow backend");
                 }
@@ -650,10 +734,6 @@ impl egui_wgpu::CallbackTrait for MirrorCallback {
         callback_resources: &egui_wgpu::CallbackResources,
     ) {
         if fire_once(&FIRST_PAINT_LOGGED) {
-            // tracing has been mysteriously skipping this site even
-            // when prepare's analogous info!() fires. eprintln bypass
-            // the subscriber so we get ground truth on whether paint
-            // ever runs.
             eprintln!(
                 "MIRROR-PAINT: first paint callback (viewport={:?} clip={:?} has_res={})",
                 info.viewport,
@@ -668,7 +748,7 @@ impl egui_wgpu::CallbackTrait for MirrorCallback {
             );
         }
         if let Some(res) = callback_resources.get::<MirrorResources>() {
-            res.render(render_pass);
+            res.render(render_pass, &self.key);
         }
     }
 }
@@ -689,19 +769,25 @@ enum SurfaceKind {
     Bgra,
 }
 
-/// Pipelines + sampler + (lazily-allocated) textures used by the
-/// mirror window. Stored in egui_wgpu's `callback_resources` bag so
-/// every paint can re-use the same GPU objects. Both NV12 and packed
+/// Pipelines + sampler + per-window texture sets used by the mirror
+/// renderer. Stored in egui_wgpu's `callback_resources` bag so every
+/// paint can re-use the same GPU objects. Both NV12 and packed
 /// pipelines are built up-front so a mid-stream format change (rare
 /// but possible if the decoder backend swaps) doesn't require a
 /// device-level rebuild.
+///
+/// Textures are keyed by `DeckEntry::key` so concurrent viewports
+/// (one per peer) don't overwrite each other's frames. Entries are
+/// lazily inserted on first upload; we never reap them — `WindowDeck`
+/// removes the entry on close but the GPU texture stays parked until
+/// the same key reopens, which is cheap (a few MB per slot).
 struct MirrorResources {
     nv12_pipeline: wgpu::RenderPipeline,
     nv12_bgl: wgpu::BindGroupLayout,
     packed_pipeline: wgpu::RenderPipeline,
     packed_bgl: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
-    textures: Option<MirrorTextures>,
+    by_key: HashMap<String, MirrorTextures>,
 }
 
 struct MirrorTextures {
@@ -808,32 +894,37 @@ impl MirrorResources {
             packed_pipeline,
             packed_bgl,
             sampler,
-            textures: None,
+            by_key: HashMap::new(),
         }
     }
 
-    fn upload(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, frame: &DecodedFrame) {
+    fn upload(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        frame: &DecodedFrame,
+        key: &str,
+    ) {
         match frame.format {
-            PixelFormat::Nv12 => self.upload_nv12(device, queue, frame),
-            // Both packed-RGB formats go through the same Rgba8Unorm
-            // texture; the PACKED_SHADER assumes BGRA byte order on
-            // upload (matching ferricast's openh264 backend output)
-            // and rebuilds true RGB at sample time. If a future
-            // decoder emits real RGBA we'd need to split pipelines.
-            PixelFormat::Bgra8 => self.upload_packed(device, queue, frame, SurfaceKind::Bgra),
-            PixelFormat::Rgba8 => self.upload_packed(device, queue, frame, SurfaceKind::Rgba),
+            PixelFormat::Nv12 => self.upload_nv12(device, queue, frame, key),
+            PixelFormat::Bgra8 => self.upload_packed(device, queue, frame, SurfaceKind::Bgra, key),
+            PixelFormat::Rgba8 => self.upload_packed(device, queue, frame, SurfaceKind::Rgba, key),
             PixelFormat::I420 => {
-                // I420 → NV12 would need a CPU UV-interleave pass; no
-                // ferricast backend emits I420 today.
                 warn!("mirror sink: I420 frames unsupported; skipping");
             }
         }
     }
 
-    fn upload_nv12(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, frame: &DecodedFrame) {
+    fn upload_nv12(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        frame: &DecodedFrame,
+        key: &str,
+    ) {
         let w = frame.width;
         let h = frame.height;
-        let need_recreate = match &self.textures {
+        let need_recreate = match self.by_key.get(key) {
             Some(t) => t.kind != SurfaceKind::Nv12 || t.width != w || t.height != h,
             None => true,
         };
@@ -886,14 +977,17 @@ impl MirrorResources {
                     },
                 ],
             });
-            self.textures = Some(MirrorTextures {
-                kind: SurfaceKind::Nv12,
-                y_tex,
-                uv_tex: Some(uv_tex),
-                bind_group,
-                width: w,
-                height: h,
-            });
+            self.by_key.insert(
+                key.to_string(),
+                MirrorTextures {
+                    kind: SurfaceKind::Nv12,
+                    y_tex,
+                    uv_tex: Some(uv_tex),
+                    bind_group,
+                    width: w,
+                    height: h,
+                },
+            );
         }
         let stride = frame.stride.max(w);
         let y_len = (stride as usize) * (h as usize);
@@ -906,7 +1000,7 @@ impl MirrorResources {
             );
             return;
         }
-        let tex = self.textures.as_ref().expect("textures created above");
+        let tex = self.by_key.get(key).expect("textures created above");
         let uv = tex.uv_tex.as_ref().expect("nv12 path always sets uv_tex");
         queue.write_texture(
             wgpu::TexelCopyTextureInfo {
@@ -954,10 +1048,11 @@ impl MirrorResources {
         queue: &wgpu::Queue,
         frame: &DecodedFrame,
         kind: SurfaceKind,
+        key: &str,
     ) {
         let w = frame.width;
         let h = frame.height;
-        let need_recreate = match &self.textures {
+        let need_recreate = match self.by_key.get(key) {
             Some(t) => t.kind != kind || t.width != w || t.height != h,
             None => true,
         };
@@ -991,19 +1086,18 @@ impl MirrorResources {
                     },
                 ],
             });
-            self.textures = Some(MirrorTextures {
-                kind,
-                y_tex: rgba_tex,
-                uv_tex: None,
-                bind_group,
-                width: w,
-                height: h,
-            });
+            self.by_key.insert(
+                key.to_string(),
+                MirrorTextures {
+                    kind,
+                    y_tex: rgba_tex,
+                    uv_tex: None,
+                    bind_group,
+                    width: w,
+                    height: h,
+                },
+            );
         }
-        // Packed formats: one plane, 4 bytes/pixel. ferricast's
-        // openh264 path emits BGRA with `stride == width * 4`. We
-        // upload directly. The B-vs-R order is resolved in the
-        // fragment shader (PACKED_SHADER swaps for Bgra).
         let stride = frame.stride.max(w * 4);
         let needed = (stride as usize) * (h as usize);
         if frame.data.len() < needed {
@@ -1015,7 +1109,7 @@ impl MirrorResources {
             );
             return;
         }
-        let tex = self.textures.as_ref().expect("textures created above");
+        let tex = self.by_key.get(key).expect("textures created above");
         queue.write_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: &tex.y_tex,
@@ -1037,8 +1131,8 @@ impl MirrorResources {
         );
     }
 
-    fn render(&self, rpass: &mut wgpu::RenderPass<'static>) {
-        if let Some(t) = &self.textures {
+    fn render(&self, rpass: &mut wgpu::RenderPass<'static>, key: &str) {
+        if let Some(t) = self.by_key.get(key) {
             let pipeline = match t.kind {
                 SurfaceKind::Nv12 => &self.nv12_pipeline,
                 SurfaceKind::Bgra | SurfaceKind::Rgba => &self.packed_pipeline,
