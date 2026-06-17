@@ -54,6 +54,7 @@ class AnsyncCompanionService : Service() {
     private var clipboard: ClipboardBridge? = null
     private var dialer: HostDialer? = null
     private var wifiPair: WifiPairManager? = null
+    @Volatile private var hostStatus: HostStatus = HostStatus.NotPaired
     private var capturePollThread: HandlerThread? = null
     private var capturePollHandler: Handler? = null
     @Volatile private var capturePollRunning = false
@@ -82,7 +83,13 @@ class AnsyncCompanionService : Service() {
         startCameraControlPoller()
         startAudioControlPoller()
         clipboard = ClipboardBridge(this).also { it.start() }
-        dialer = HostDialer(this).also { it.start() }
+        dialer = HostDialer(this).also {
+            it.setListener { status ->
+                hostStatus = status
+                Handler(mainLooper).post { refreshNotification() }
+            }
+            it.start()
+        }
         wifiPair = WifiPairManager(this).also { it.start() }
         startCaptureControlPoller()
         startFileControlPoller()
@@ -806,13 +813,23 @@ class AnsyncCompanionService : Service() {
                 val pi = PendingIntent.getService(ctx, 13, stop, flags)
                 builder.addAction(android.R.drawable.ic_media_pause, "Stop camera", pi)
             }
-            val text = if (active.isEmpty()) {
+            val streamLine = if (active.isEmpty()) {
                 "Idle — paired host can request streams"
             } else {
                 "Active: " + active.joinToString(", ")
             }
+            val statusLine = when (val s = svc.hostStatus) {
+                is HostStatus.NotPaired -> "Not paired"
+                is HostStatus.NoNetwork -> "Waiting for Wi-Fi"
+                is HostStatus.Searching -> "Looking for ${s.hostName.ifBlank { "host" }}…"
+                is HostStatus.Connected -> "Connected to ${s.hostName.ifBlank { "host" }}"
+            }
             builder.setContentTitle("ansync companion")
-                .setContentText(text)
+                .setContentText(statusLine)
+                .setStyle(
+                    NotificationCompat.BigTextStyle()
+                        .bigText("$statusLine\n$streamLine"),
+                )
             return builder.build()
         }
     }

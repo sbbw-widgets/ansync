@@ -21,6 +21,29 @@ import android.util.Log
  * work without the user opening anything. The class is owned by
  * [AnsyncCompanionService]; tear-down happens in `onDestroy`.
  */
+/**
+ * Coarse-grained status the dialer publishes to listeners. Drives the
+ * persistent notification's content line (`Connected to X` / `Looking
+ * for X` / `Waiting for Wi-Fi` / `No paired host`).
+ *
+ * The dialer cannot tell when the QUIC session drops post-connect on
+ * its own (the peer might disappear without the kernel surfacing a
+ * link drop). [Connected] is therefore best-effort — it's correct when
+ * we transition through one of the events the dialer sees (network
+ * up, dial result), and stale otherwise. The notification copy is
+ * deliberately worded so a stale [Connected] still reads naturally.
+ */
+sealed interface HostStatus {
+    /** No pubkey in SharedPreferences — pair hasn't happened. */
+    data object NotPaired : HostStatus
+    /** No Wi-Fi / Ethernet up — dialer is parked. */
+    data object NoNetwork : HostStatus
+    /** Network is up, dialer is browsing mDNS or retrying. */
+    data class Searching(val hostName: String) : HostStatus
+    /** Dial succeeded; QUIC session opened against [hostName]. */
+    data class Connected(val hostName: String) : HostStatus
+}
+
 class HostDialer(private val ctx: Context) {
 
     private val cm = ctx.getSystemService(ConnectivityManager::class.java)
@@ -28,12 +51,23 @@ class HostDialer(private val ctx: Context) {
     private val handler = Handler(handlerThread.looper)
     private var discovery: HostDiscovery? = null
     private var callback: ConnectivityManager.NetworkCallback? = null
+    @Volatile private var listener: ((HostStatus) -> Unit)? = null
+    @Volatile private var lastStatus: HostStatus = HostStatus.NotPaired
 
     @Volatile private var connected = false
     @Volatile private var backoffMs = INITIAL_BACKOFF_MS
 
+    /** Register a status listener. Most recent value is delivered
+     *  immediately so the caller doesn't have to wait for the next
+     *  transition. Set to `null` to unregister. */
+    fun setListener(cb: ((HostStatus) -> Unit)?) {
+        listener = cb
+        cb?.invoke(lastStatus)
+    }
+
     fun start() {
         if (callback != null) return
+        emitInitialStatus()
         val req = NetworkRequest.Builder()
             .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
             .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
@@ -44,11 +78,13 @@ class HostDialer(private val ctx: Context) {
                 Log.i(TAG, "network up: $network — kicking dialer")
                 connected = false
                 backoffMs = INITIAL_BACKOFF_MS
+                publishSearchingIfPaired()
                 handler.post(::dialOnce)
             }
             override fun onLost(network: Network) {
                 Log.i(TAG, "network lost: $network — pausing dialer")
                 connected = false
+                publish(HostStatus.NoNetwork)
             }
         }
         callback = cb
@@ -66,12 +102,54 @@ class HostDialer(private val ctx: Context) {
         discovery = null
         handler.removeCallbacksAndMessages(null)
         handlerThread.quitSafely()
+        listener = null
     }
+
+    private fun emitInitialStatus() {
+        val initial = if (storedHostHex().isNullOrBlank()) {
+            HostStatus.NotPaired
+        } else {
+            HostStatus.Searching(storedHostName())
+        }
+        publish(initial)
+    }
+
+    private fun publishSearchingIfPaired() {
+        val hex = storedHostHex()
+        if (hex.isNullOrBlank()) {
+            publish(HostStatus.NotPaired)
+        } else {
+            publish(HostStatus.Searching(storedHostName()))
+        }
+    }
+
+    private fun publish(status: HostStatus) {
+        if (status == lastStatus) return
+        lastStatus = status
+        try {
+            listener?.invoke(status)
+        } catch (e: Throwable) {
+            Log.w(TAG, "status listener threw", e)
+        }
+    }
+
+    private fun storedHostHex(): String? =
+        ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .getString(PairingReceiver.PREF_HOST_PUBKEY_HEX, null)
+
+    private fun storedHostName(): String =
+        ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .getString(PairingReceiver.PREF_HOST_NAME, null)
+            .orEmpty()
+            .ifBlank { "ansync host" }
 
     private fun dialOnce() {
         if (connected) return
-        val prefs = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-        val hex = prefs.getString(PairingReceiver.PREF_HOST_PUBKEY_HEX, null) ?: return
+        val hex = storedHostHex() ?: run {
+            publish(HostStatus.NotPaired)
+            return
+        }
+        publishSearchingIfPaired()
         // Start (or re-start) discovery; the callback fires the dial
         // once the paired host's mDNS record is seen.
         if (discovery == null) {
@@ -133,9 +211,11 @@ class HostDialer(private val ctx: Context) {
             connected = true
             backoffMs = INITIAL_BACKOFF_MS
             Log.i(TAG, "$kind dial ok ($ip:$port)")
+            publish(HostStatus.Connected(storedHostName()))
             true
         } else {
             Log.w(TAG, "$kind dial failed; will retry in ${backoffMs}ms")
+            publishSearchingIfPaired()
             handler.postDelayed(::dialOnce, backoffMs)
             backoffMs = (backoffMs * 2).coerceAtMost(MAX_BACKOFF_MS)
             false
