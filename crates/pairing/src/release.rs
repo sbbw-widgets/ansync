@@ -37,6 +37,28 @@ const ASSET_NAME_PREFIX: &str = "companion";
 const ASSET_NAME_SUFFIX: &str = ".apk";
 const USER_AGENT: &str = concat!("ansync/", env!("CARGO_PKG_VERSION"));
 
+/// Version string the running binary considers "current" — used to
+/// match the installed companion APK against the daemon / CLI build.
+///
+/// CI pins this to the published git tag (`ANSYNC_RELEASE_VERSION`)
+/// so a release build asks for the exact companion that ships in the
+/// same tag, without forcing every crate's `Cargo.toml` to bump
+/// (which would invalidate the build cache).
+///
+/// Local builds fall back to `CARGO_PKG_VERSION`, which keeps dev
+/// pair runs working without env plumbing.
+pub fn expected_version() -> &'static str {
+    option_env!("ANSYNC_RELEASE_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"))
+}
+
+/// `expected_version()` stripped of a leading `v` so it lines up with
+/// Android's `versionName` (which is `0.2.1`, never `v0.2.1`). Use
+/// this for equality checks against `dumpsys package … versionName=`.
+pub fn expected_version_bare() -> &'static str {
+    let v = expected_version();
+    v.strip_prefix('v').unwrap_or(v)
+}
+
 #[derive(Debug, Deserialize)]
 struct ReleaseResponse {
     tag_name: String,
@@ -63,30 +85,30 @@ pub struct FetchedApk {
     pub tag: String,
 }
 
-/// Get a path to a usable companion APK, fetching the latest release
-/// if the cache doesn't already have it. Skips the network entirely
-/// when the cache is hot.
+/// Get a path to a usable companion APK. Defaults to whatever tag
+/// `expected_version()` resolves to — the companion that ships with
+/// the running binary — so installs and version checks always align.
+///
+/// Kept as the entry point most call sites use; for explicit pinning
+/// (tests, debugging) prefer [`fetch_companion`].
 pub async fn fetch_latest_companion() -> Result<FetchedApk, PairingError> {
+    fetch_companion(expected_version()).await
+}
+
+/// Pull the companion APK for a specific release tag. Mirrors
+/// [`fetch_latest_companion`] except it hits
+/// `/releases/tags/{tag}` so the asset matches the host build
+/// byte-for-byte. `tag` is accepted with or without a leading `v` —
+/// GitHub stores tags as `v0.2.1` so the lookup retries the prefixed
+/// form on a 404.
+pub async fn fetch_companion(tag: &str) -> Result<FetchedApk, PairingError> {
     let cache_root = cache_dir()?;
     fs::create_dir_all(&cache_root)
         .await
         .map_err(|e| PairingError::Protocol(format!("create cache dir: {e}")))?;
-
-    let api_url = format!(
-        "https://api.github.com/repos/{DEFAULT_OWNER}/{DEFAULT_REPO}/releases/latest"
-    );
     let client = build_client()?;
-    let release: ReleaseResponse = client
-        .get(&api_url)
-        .header("Accept", "application/vnd.github+json")
-        .send()
-        .await
-        .map_err(|e| PairingError::Protocol(format!("GET {api_url}: {e}")))?
-        .error_for_status()
-        .map_err(|e| PairingError::Protocol(format!("release API: {e}")))?
-        .json()
-        .await
-        .map_err(|e| PairingError::Protocol(format!("release JSON: {e}")))?;
+
+    let release = lookup_release(&client, tag).await?;
 
     let asset = release
         .assets
@@ -122,6 +144,48 @@ pub async fn fetch_latest_companion() -> Result<FetchedApk, PairingError> {
         path: dest,
         tag: release.tag_name,
     })
+}
+
+async fn lookup_release(
+    client: &reqwest::Client,
+    tag: &str,
+) -> Result<ReleaseResponse, PairingError> {
+    // Try the tag verbatim first. GitHub stores release tags as the
+    // exact string the maintainer pushed; some projects use `v0.2.1`,
+    // others bare `0.2.1`. Cover both so callers don't have to care.
+    let candidates: [String; 2] = if tag.starts_with('v') {
+        [tag.to_string(), tag.trim_start_matches('v').to_string()]
+    } else {
+        [format!("v{tag}"), tag.to_string()]
+    };
+    let mut last_err: Option<PairingError> = None;
+    for candidate in &candidates {
+        let api_url = format!(
+            "https://api.github.com/repos/{DEFAULT_OWNER}/{DEFAULT_REPO}/releases/tags/{candidate}"
+        );
+        let resp = client
+            .get(&api_url)
+            .header("Accept", "application/vnd.github+json")
+            .send()
+            .await
+            .map_err(|e| PairingError::Protocol(format!("GET {api_url}: {e}")))?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            last_err = Some(PairingError::Protocol(format!(
+                "release tag {candidate} not found upstream"
+            )));
+            continue;
+        }
+        let release: ReleaseResponse = resp
+            .error_for_status()
+            .map_err(|e| PairingError::Protocol(format!("release API: {e}")))?
+            .json()
+            .await
+            .map_err(|e| PairingError::Protocol(format!("release JSON: {e}")))?;
+        return Ok(release);
+    }
+    Err(last_err.unwrap_or_else(|| {
+        PairingError::Protocol(format!("release lookup failed for {tag}"))
+    }))
 }
 
 /// `pm dump <pkg>` returns a `versionName=...` line. Used by the

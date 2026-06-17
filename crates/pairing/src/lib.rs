@@ -19,7 +19,10 @@ pub use cable::{AdbDevice, bootstrap_companion, bootstrap_host, COMPANION_PACKAG
 #[cfg(feature = "host")]
 pub use cable::{companion_installed, install_companion_apk, list_adb_devices, pair_host_via_adb};
 #[cfg(feature = "host")]
-pub use release::{fetch_latest_companion, query_installed_version, FetchedApk};
+pub use release::{
+    expected_version, expected_version_bare, fetch_companion, fetch_latest_companion,
+    query_installed_version, FetchedApk,
+};
 pub use store::{PeerStore, PeerStoreError, StoredPeer};
 pub use wifi::{
     bootstrap_companion_wifi, bootstrap_host_wifi, read_pair_hello, respond_pair_pin,

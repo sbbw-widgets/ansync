@@ -302,20 +302,56 @@ async fn pair(
             candidate.exists().then_some(candidate)
         });
 
-    // Step 17 + R1: resolve the APK to install when:
-    //   - companion is missing (install latest release), or
-    //   - companion is present but a newer release is available and
-    //     the user opts in (prompt by default, `--auto-upgrade` skips).
-    // `--skip-upgrade-check` bypasses the net call entirely for
-    // offline pairing.
-    let installed = ansync_pairing::companion_installed(&serial).await?;
+    // Companion version policy: the host always expects the APK
+    // matching its own `ansync_pairing::expected_version()` (CI feeds
+    // the git tag via `ANSYNC_RELEASE_VERSION`; dev falls back to
+    // `CARGO_PKG_VERSION`). Three cases:
+    //   - explicit --apk / env / /usr/share override → use as-is.
+    //   - installed `versionName` already matches → skip install
+    //     entirely; the pair broadcast re-wakes the service either
+    //     way, which is the closest thing to a restart we need.
+    //   - missing / mismatched → fetch the matching tag and install.
+    //
+    // `--skip-upgrade-check` still bypasses the net call (offline
+    // pair). `--auto-upgrade` is a no-op now — kept for backwards CLI
+    // compat but matched-version logic supersedes the old prompt.
+    let _ = auto_upgrade;
+    let expected = ansync_pairing::expected_version_bare();
+    let installed_version = ansync_pairing::query_installed_version(
+        &serial,
+        ansync_pairing::COMPANION_PACKAGE,
+    )
+    .await
+    .unwrap_or(None);
+    let version_matches = installed_version
+        .as_deref()
+        .map(|v| v.trim().eq_ignore_ascii_case(expected))
+        .unwrap_or(false);
+
     let resolved_apk = if apk_path.is_some() {
         apk_path
-    } else if !installed {
-        match ansync_pairing::fetch_latest_companion().await {
+    } else if version_matches {
+        println!("companion {expected} already installed; restarting service via pair broadcast");
+        None
+    } else if skip_upgrade_check {
+        if installed_version.is_some() {
+            println!(
+                "companion {} installed (expected {expected}); --skip-upgrade-check honoured, keeping it",
+                installed_version.as_deref().unwrap_or("?")
+            );
+            None
+        } else {
+            return Err(format!(
+                "companion not installed on {serial} and --skip-upgrade-check forbids fetching {expected}"
+            )
+            .into());
+        }
+    } else {
+        match ansync_pairing::fetch_companion(expected).await {
             Ok(fetched) => {
+                let old = installed_version.as_deref().unwrap_or("<not installed>");
                 println!(
-                    "fetched companion APK {} → {}",
+                    "installing companion {} (was {old}) → {}",
                     fetched.tag,
                     fetched.path.display()
                 );
@@ -323,41 +359,8 @@ async fn pair(
             }
             Err(e) => {
                 eprintln!(
-                    "warning: auto-fetch failed ({e}); install will fail unless --apk is supplied"
+                    "warning: APK fetch for {expected} failed ({e}); install will fail unless --apk is supplied"
                 );
-                None
-            }
-        }
-    } else if skip_upgrade_check {
-        None
-    } else {
-        match ansync_pairing::fetch_latest_companion().await {
-            Ok(fetched) => {
-                let installed_version =
-                    ansync_pairing::query_installed_version(&serial, ansync_pairing::COMPANION_PACKAGE)
-                        .await
-                        .unwrap_or(None);
-                if needs_upgrade(installed_version.as_deref(), &fetched.tag) {
-                    let old = installed_version
-                        .as_deref()
-                        .unwrap_or("<unknown>");
-                    if auto_upgrade || prompt_upgrade(old, &fetched.tag)? {
-                        println!(
-                            "upgrading companion {old} → {} ({})",
-                            fetched.tag,
-                            fetched.path.display()
-                        );
-                        Some(fetched.path)
-                    } else {
-                        println!("keeping installed companion {old}");
-                        None
-                    }
-                } else {
-                    None
-                }
-            }
-            Err(e) => {
-                eprintln!("warning: upgrade check failed ({e}); continuing with installed companion");
                 None
             }
         }
@@ -443,18 +446,6 @@ async fn post_setup_notification(
     Ok(())
 }
 
-/// Tag from GitHub looks like `v0.2.1`; Android `versionName` looks
-/// like `0.2.1`. Strip a leading `v` from the tag and compare for
-/// exact equality. Anything that doesn't match is treated as
-/// upgradeable — semver dance isn't worth it here, the goal is just
-/// "device should run the latest release".
-fn needs_upgrade(installed: Option<&str>, tag: &str) -> bool {
-    let Some(installed) = installed else {
-        return true;
-    };
-    let tag = tag.trim_start_matches(['v', 'V']);
-    installed.trim() != tag
-}
 
 /// Top-level pair dispatch. Resolves the channel (cable vs WiFi) from
 /// flags + environment with this priority:
@@ -717,16 +708,6 @@ fn hex_short(bytes: &[u8; 32]) -> String {
         let _ = write!(&mut s, "{b:02x}");
     }
     s
-}
-
-fn prompt_upgrade(old: &str, new: &str) -> Result<bool, Box<dyn std::error::Error>> {
-    use std::io::{BufRead, Write};
-    print!("upgrade companion {old} → {new}? (y/N) ");
-    std::io::stdout().flush()?;
-    let stdin = std::io::stdin();
-    let mut line = String::new();
-    stdin.lock().read_line(&mut line)?;
-    Ok(matches!(line.trim(), "y" | "Y" | "yes" | "YES"))
 }
 
 /// Ask the running daemon for its LAN endpoints so we can embed them
