@@ -357,6 +357,93 @@ Gaps identificados al cerrar el roadmap. Ordenados por severidad. Cada uno es bo
   - `_permissions: Arc<dyn PermissionsStore>` es noise. O lo usa (R2) o sale del signature.
   - Resuelto automáticamente cuando R2 cierra.
 
+## Estabilización (sesión 2026-06-17/18)
+
+Surfaceado mientras se probaba el pair WiFi + mirror lifecycle real con DMS. Cada item commit single-line, todos mergeados. Bloque dejado acá para no contaminar el roadmap principal con bugfix detail.
+
+### Cerrado
+
+- [x] **S1 — Clipboard MIME priority** (`5322502`)
+  - `wayland::read` antes pedía `PasteMime::Text` → Firefox/Krita devolvía `text/html` con `<img>` base64 cuando había imagen → Android leía HTML en vez de bitmap.
+  - Nuevo `pick_best_mime`: enumerate `get_mime_types`, prioriza `image/png|jpeg|webp|gif|bmp|tiff`, después cualquier `image/*`, después `text/plain` (variantes UTF-8), por último cualquier otro. 4 tests.
+
+- [x] **S2 — Mirror window: subprocess per ventana** (`07875a1` → `82a3012` → `e64e0b7` → `0169db2` → `c0d647e`)
+  - Iteramos varias arquitecturas. Final: `ansyncd mirror-renderer` subcommand spawnea proceso hijo por ShowScreen. Cada child = su propio winit EventLoop → resuelve la limitación `EVENT_LOOP_CREATED` que prohíbe rebuilds in-process. IPC stdin/stdout pipes (drop Unix socket: sin filesystem, cleanup automático). `ansync_video::ipc` postcard length-prefixed (`HostMsg::{Config, EncodedChunk, Shutdown}` + `RendererMsg::Input`).
+  - Daemon: video_stream_loop ya no decoda, solo fan-out de chunks a `entry.video_tx` (None = drop silencioso).
+  - Lifecycle limpio: D-Bus ShowScreen spawn child, close X → child exit → on_exit limpia slots + emit HideScreen → companion StopScreenCapture. Daemon arranca sin ventana. Sin auto-spawn desde `StreamKind::Video` (solo D-Bus puede abrir).
+
+- [x] **S3 — Pair WiFi: filter unreachable mDNS candidates** (`9fa2675`)
+  - `browse_pair_candidates` antes pickaba `info.get_addresses().iter().next()` (HashSet order indeterminado). A veces fe80::link-local sin scope id → `connect` EINVAL.
+  - Fix: filtra fe80::/10 + 169.254/16 + loopback. Rankea IPv4 > IPv6. Dedupe por pubkey: nuevo entry solo overrides si rank mejor.
+
+- [x] **S4 — Version pinning + skip-install** (`9ad1aa5`)
+  - `expected_version()` lee `option_env!("ANSYNC_RELEASE_VERSION")` con fallback `CARGO_PKG_VERSION`. CI exporta el git tag → todos los crates concuerdan sin tocar Cargo.toml (cache intact).
+  - `fetch_companion(tag)` GET `/releases/tags/{tag}`. `fetch_latest_companion` delega a `fetch_companion(expected_version())`. Tolera tag con y sin `v` prefix.
+  - `ansyncctl pair`: query installed `versionName`, si matchea `expected_version_bare()` → skip install + skip fetch. Si distinto → fetch matching tag + install. `--auto-upgrade` ahora no-op (compat). `--skip-upgrade-check` mantiene escape offline.
+
+- [x] **S5 — Pair broadcast delivery** (`b7edcaa`)
+  - Companion headless (post-U4a) nunca se lanza por user → Android lo deja en "stopped state" post-install → broadcasts dropped silently sin `FLAG_INCLUDE_STOPPED_PACKAGES`.
+  - Fix: `am broadcast --include-stopped-packages …` + idempotente `pm grant POST_NOTIFICATIONS` post-install y pre-broadcast (cubre skip-install-on-version-match path).
+
+- [x] **S6 — Raw adbd protocol para reverse** (`e1ed6c9`)
+  - User: "no shellear adb CLI, usar crate". `adb_client::ADBServerDevice::reverse()` lee solo el primer OKAY; `reverse:forward` requiere DOS (server ack + adbd ack post-bind). Sin el segundo → host cierra TCP antes que adbd termine de instalar el listener → companion `connect` ETIMEDOUT.
+  - Fix: hablamos directo a `127.0.0.1:5037` por TCP. `open_adbd / adb_send_cmd / adb_read_status` helpers. Cero `Command::new("adb")` en el proyecto.
+
+- [x] **S7 — Auto-reconnect via livenessProbe** (`db3c818` + `9209600`)
+  - `HostDialer.connected` antes solo flippeaba a false en eventos de red. Daemon restart sin link drop → companion ciego → no redial.
+  - Native: `static CONNECTED: AtomicBool` set true post-handshake, `Drop` guard en `streams_accept_loop` la apaga. Nuevo JNI `nativeIsConnected`.
+  - Kotlin: `livenessProbe` Runnable re-post cada 3s. Si `connected && !native.isConnected` → flip + dialOnce. `try/catch Throwable` por si APK viejo no tiene el símbolo (evita crash del service).
+  - Daemon `handle_connection` dedupe: al entrar, `.close()` cualquier conn previo para el mismo peer (Arc::ptr_eq). Al salir, solo emite Disconnected si `mirror_entry.conn` SIGUE siendo el nuestro — evita que un conn evicted flap el estado del nuevo.
+
+- [x] **S8 — Companion keep-alive (doze + OOM)** (`9631338`)
+  - `KeepAlive.kt`: `WifiManager.WifiLock` mode `WIFI_MODE_FULL_LOW_LATENCY` (API 29+, fallback `FULL_HIGH_PERF`). Acquired in `Service.onCreate`, released in `onDestroy`. Mantiene Wi-Fi radio en full-power → keep-alive QUIC sobrevive screen-off.
+  - Nuevo `SetupStep.BatteryWhitelist`: lanza `ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS` con `Uri.fromParts("package", …)`. Fallback a `ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS`. `KeepAlive.isBatteryWhitelisted(ctx)` para `isDone`.
+  - Manifest: nueva perm `REQUEST_IGNORE_BATTERY_OPTIMIZATIONS`.
+
+- [x] **S9 — DMS plugin: toggle buttons + auto-detect pair**
+  - Cambios en `~/.config/DankMaterialShell/plugins/Ansync/` (no es repo git, sin commit).
+  - `AnsyncService.qml`: `streams: { id: {mirror, mic, camera, audio} }` cache local + helpers `isStreamOn / toggleScreen / toggleMic / toggleCamera / toggleAudio`. Reset cache on device-offline. Nuevas funciones `browseAvailable / startWifiPair / submitPin / cancelPair` para el flujo D-Bus de PairingSession. Signals `wifiCandidatesFound / wifiPairStarted / wifiPairAwaitingPin / wifiPairCompleted / wifiPairFailed`. `_busMonitor` ahora parsea PairingSession `PropertiesChanged` + `Completed` + `Failed`.
+  - `AnsyncWidget.qml`: per-device action grid colapsada de start/stop pairs → toggle único cada uno (mirror, mic, camera, audio) que flippea icon + label + color según `isStreamOn`. Header pair antes era dos botones (USB / WiFi); ahora UNO que dispatchea: `listAdbDevices()` → serials > 0 → state=pair, else → state=wifiPair + browse. PIN modal con `DankTextField` + Submit (valida 6 dígitos antes de habilitar).
+  - Buttons mirror/mic/camera/audio ya no usan `enabled: device.live` — daemon es idempotente y el grey-out confundía al user ("did you remove them?").
+
+### Pendiente para próxima sesión
+
+- [ ] **N1 — DMS plugin polish**
+  - Verificar que click en "tune" (Permissions) realmente expande el grid + que las DankToggle actualicen perms.
+  - Probable falla: `Repeater.model` array literal se re-evalúa al cambiar `svc.isStreamOn`, lo que tear-down + rebuild de inner items y puede tragarse el click.
+  - Diagnóstico: console.log en `onClicked` para confirmar dispatch.
+
+- [ ] **N2 — OEM-specific autostart hints**
+  - `SetupStep.MiuiAutostart` ya cubre Xiaomi. Sumar:
+    - Samsung "Device care → Battery → Sleeping apps" (Settings.ACTION_BATTERY_SAVER_SETTINGS).
+    - OnePlus "Battery → Battery optimization plus" (`com.oneplus.battery.action.AppBatteryOptimization`).
+    - Huawei "Protected apps" (`com.huawei.systemmanager.optimize.process.ProtectActivity`).
+    - Vivo / Oppo similar.
+  - Cada uno gated por `Build.MANUFACTURER` match. Pattern: replicar `launchMiuiAutostart`, persistir el "dismissed" flag en SharedPreferences.
+
+- [ ] **N3 — WakeLock partial opcional para sessions activas**
+  - WifiLock cubre radio; CPU también puede entrar en deep sleep durante streams largos.
+  - `PowerManager.PARTIAL_WAKE_LOCK` acquired cuando `CaptureSession / AudioRouter / CameraSession` está activo, released cuando todos paran.
+  - Battery cost real (~5%/h), gateado por SharedPreferences flag user-toggleable.
+
+- [ ] **N4 — Sensors stream (R10)**
+  - Bajo prioridad confirmado. Útil para gamepad gyro aim. Wire propuesto en R10.
+
+- [ ] **N5 — MediaSession widget activo durante mirror**
+  - R7 ya cubre audio. Sumar widget similar para "mirror activo" — corte directo desde lock screen sin abrir notif shade.
+
+- [ ] **N6 — D-Bus signal para stream state changes**
+  - DMS cache de streams es optimista local. Cuando companion mata el stream solo (tile off, accessibility revoke, MediaCodec crash) → DMS muestra "on" stale hasta próximo click.
+  - Add `Device.StreamActiveChanged(kind, active)` signal en `ansync_dbus`. Daemon emite al spawn/exit del subprocess mirror, al StartCamera/StopCamera, etc. DMS suscribe + flippea cache.
+
+- [ ] **N7 — Cable pair: verificar APK install grant flags**
+  - `adb_client::install` no acepta `-g` (auto-grant runtime perms). Companion termina con perms sin granted → SetupNotif walkthrough mandatorio.
+  - Investigar si `adb_client` ya soporta o si necesitamos PR upstream / fallback a `pm install -r -g` via shell_command.
+
+- [ ] **N8 — Multi-host companion**
+  - Companion guarda UN solo `PREF_HOST_PUBKEY_HEX` + `PREF_HOST_NAME`. User explícitamente deferreó ("nah, estamos bien por ahora").
+  - Cuando esto se requiera: refactor a `Set<HostEntry>` en SharedPreferences (JSON). HostDialer itera todos. UI para gestionar (revocar host, switch primary).
+
 ### Notas para retomar
 
 - Empezar por R1, R2, R4, R9 (bloqueantes). Cada uno cierra en <1h.
