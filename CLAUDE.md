@@ -21,6 +21,8 @@ nix/         módulos NixOS / home-manager y derivaciones de build
 - **Sin OpenSSL**. `rustls` con `default-features = false`, root store vacío, custom verifier que pinea al pubkey Ed25519 del peer.
 - **Sin `#[allow(unused_*)]`**. Si algo no se usa, eliminarlo. Si la visibilidad rompe la signature pública, ajustar `pub(crate)` del módulo, no re-exportar para silenciar.
 - **`tracing` → `tracing-journald`** en el daemon. Sin `println!` salvo en el CLI.
+- **ADB siempre via `adb_client` crate** (protocolo TCP a `adbd` 127.0.0.1:5037). NUNCA `Command::new("adb")` ni shell-out al binario CLI. `device.shell_command(["pm", ...])` es la API del crate (Rust puro), no un shell-out — sigue siendo el camino correcto para correr `pm grant` / `am broadcast` / `dumpsys`.
+- **Companion runtime perms**: cuando agregues un permiso "dangerous" nuevo a `android/app/src/main/AndroidManifest.xml`, sumá su nombre fully-qualified al array `COMPANION_RUNTIME_PERMS` en `crates/pairing/src/cable.rs`. Es lo que el host auto-grant-ea vía `pm grant` durante el pair (cable). Normal install-time perms (`INTERNET`, `WAKE_LOCK`, etc.) NO van — `pm grant` les devuelve error. AppOps perms (`SYSTEM_ALERT_WINDOW`, `USE_FULL_SCREEN_INTENT`, `REQUEST_IGNORE_BATTERY_OPTIMIZATIONS`) tampoco — esos los maneja el `SetupNotif` flow del companion.
 - **Commits single-line**. Conventional (`feat:`, `fix:`, `chore:`, `refactor:`, `docs:`, `build:`, `ci:`). Sin Co-Authored-By, sin body salvo pedido explícito.
 
 ## Estilo Rust

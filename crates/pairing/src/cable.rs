@@ -55,9 +55,53 @@ pub struct AdbDevice {
 /// before triggering the pairing broadcast.
 pub const COMPANION_PACKAGE: &str = "org.gameros.ansync";
 
+/// Runtime ("dangerous") permissions declared by the companion that
+/// the host grants automatically post-install via `pm grant`, so the
+/// user never has to walk through individual runtime prompts. Each
+/// entry corresponds to a `<uses-permission android:name="..."/>` in
+/// `android/app/src/main/AndroidManifest.xml`.
+///
+/// **Maintenance rule** — every time the companion manifest gains a
+/// new `dangerous` (a.k.a. runtime) permission, add the fully
+/// qualified name to this array. Normal install-time permissions
+/// (`INTERNET`, `WAKE_LOCK`, `FOREGROUND_SERVICE_*`, etc.) must NOT
+/// be listed: `pm grant` returns a non-zero status on them and
+/// pollutes the pair log. Special "appop" permissions
+/// (`SYSTEM_ALERT_WINDOW`, `USE_FULL_SCREEN_INTENT`,
+/// `REQUEST_IGNORE_BATTERY_OPTIMIZATIONS`) also don't belong here —
+/// they need `appops set ... allow` or an explicit user dialog and
+/// are surfaced through `SetupNotif` steps on the device.
+pub const COMPANION_RUNTIME_PERMS: &[&str] = &[
+    "android.permission.POST_NOTIFICATIONS",
+    "android.permission.CAMERA",
+    "android.permission.RECORD_AUDIO",
+];
+
 #[cfg(feature = "host")]
 fn server() -> ADBServer {
     ADBServer::default()
+}
+
+/// Iterate [`COMPANION_RUNTIME_PERMS`] and run `pm grant` over the
+/// adb_client crate (no shell-out to the `adb` CLI binary). Each
+/// failure is logged at `warn!` but never aborts the pair flow —
+/// the companion falls back to its in-app `SetupNotif` walkthrough
+/// for whatever didn't get granted. Idempotent.
+#[cfg(feature = "host")]
+fn grant_runtime_perms(device: &mut ADBServerDevice) {
+    let mut buf = Vec::with_capacity(64);
+    for perm in COMPANION_RUNTIME_PERMS {
+        buf.clear();
+        if let Err(e) =
+            device.shell_command(&["pm", "grant", COMPANION_PACKAGE, perm], &mut buf)
+        {
+            tracing::warn!(
+                error = %e,
+                perm = perm,
+                "pm grant failed; SetupNotif will surface the unmet grant"
+            );
+        }
+    }
 }
 
 #[cfg(feature = "host")]
@@ -281,28 +325,7 @@ pub async fn install_companion_apk(
         device
             .install(&apk)
             .map_err(|e| pairing_err("adb install", e))?;
-        // Grant the runtime perm `PairingReceiver` needs to surface
-        // its heads-up notif. Without it the broadcast fires, the
-        // receiver runs, `mgr.notify` returns success — but Android
-        // suppresses the notification because the perm is denied,
-        // and the user has no UI affordance to finish the pair.
-        // `--include-stopped-packages` covers the receiver delivery
-        // side; this covers the visibility side.
-        let mut buf = Vec::with_capacity(64);
-        if let Err(e) = device.shell_command(
-            &[
-                "pm",
-                "grant",
-                COMPANION_PACKAGE,
-                "android.permission.POST_NOTIFICATIONS",
-            ],
-            &mut buf,
-        ) {
-            tracing::warn!(
-                error = %e,
-                "pm grant POST_NOTIFICATIONS failed; pair notif may not appear"
-            );
-        }
+        grant_runtime_perms(&mut device);
         Ok(())
     })
     .await
@@ -364,19 +387,10 @@ async fn trigger_companion_pair(
     tokio::task::spawn_blocking(move || {
         let mut device = get_device(&serial)?;
         let mut buf = Vec::with_capacity(256);
-        // Idempotent re-grant in case the user revoked POST_NOTIFICATIONS
-        // (or this is the skip-install-on-version-match path so the
-        // grant from `install_companion_apk` never ran).
-        let _ = device.shell_command(
-            &[
-                "pm",
-                "grant",
-                COMPANION_PACKAGE,
-                "android.permission.POST_NOTIFICATIONS",
-            ],
-            &mut buf,
-        );
-        buf.clear();
+        // Idempotent re-grant: covers (a) the user revoked a perm
+        // mid-session and (b) the skip-install-on-version-match path
+        // where `install_companion_apk` never ran.
+        grant_runtime_perms(&mut device);
         device
             .shell_command(
                 &[

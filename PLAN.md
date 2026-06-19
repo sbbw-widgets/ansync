@@ -419,9 +419,10 @@ Surfaceado mientras se probaba el pair WiFi + mirror lifecycle real con DMS. Cad
   - `AudioEntry` gana `inbound_tile_kind: StdMutex<Option<&'static str>>`. `handle_start_audio` recibe el tile name ("mic" para StartMicrophone, "audio" para StartAudioRoute) y lo persiste cuando `need_in`. `handle_stop_audio` lo clearea.
   - Video stream loop ya tenía `InboundGuard` que disparaba `HideScreen` action → emit "screen=false" cubierto desde antes.
 
-- [ ] **N7 — Cable pair: verificar APK install grant flags**
-  - `adb_client::install` no acepta `-g` (auto-grant runtime perms). Companion termina con perms sin granted → SetupNotif walkthrough mandatorio.
-  - Investigar si `adb_client` ya soporta o si necesitamos PR upstream / fallback a `pm install -r -g` via shell_command.
+- [x] **N7 — Cable pair runtime perm auto-grant** (cerrado 2026-06-19)
+  - `adb_client::install` no expone `-g`. Workaround sin PR upstream + sin shell-out al binario `adb`: loop sobre array estático `COMPANION_RUNTIME_PERMS` corriendo `device.shell_command(["pm", "grant", pkg, perm])` por cada permiso "dangerous" declarado en el manifest. Idempotente (re-grant si el user revoca mid-session, cubre tanto install path como skip-install-on-version-match path).
+  - Array hoy: `POST_NOTIFICATIONS`, `CAMERA`, `RECORD_AUDIO`. Normal install-time perms (INTERNET, WAKE_LOCK, FOREGROUND_SERVICE_*) NO se incluyen — `pm grant` les devuelve error. AppOps perms (SYSTEM_ALERT_WINDOW, USE_FULL_SCREEN_INTENT, REQUEST_IGNORE_BATTERY_OPTIMIZATIONS) tampoco — los maneja el `SetupNotif` walkthrough del companion.
+  - Maintenance rule en `CLAUDE.md` § Reglas duras: cada vez que el manifest gane un runtime perm nuevo, sumar el nombre al array. Lock-in del check.
 
 - [ ] **N8 — Multi-host companion**
   - Companion guarda UN solo `PREF_HOST_PUBKEY_HEX` + `PREF_HOST_NAME`. User explícitamente deferreó ("nah, estamos bien por ahora").
