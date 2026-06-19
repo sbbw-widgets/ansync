@@ -63,6 +63,11 @@ class AnsyncCompanionService : Service() {
     @Volatile private var capturePollRunning = false
     private var screenReceiver: BroadcastReceiver? = null
     private var keepAlive: KeepAlive? = null
+    /** Names of currently-held streams (`"capture"`, `"camera"`, `"audio"`).
+     *  Drives [KeepAlive] refcount so the CPU wake-lock only stays up
+     *  while at least one media path is alive. */
+    private val activeStreams = mutableSetOf<String>()
+    private var cpuWakePrefReceiver: BroadcastReceiver? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -100,6 +105,7 @@ class AnsyncCompanionService : Service() {
         startCaptureControlPoller()
         startHostNamePoller()
         registerScreenWakeReceiver()
+        registerCpuWakePrefReceiver()
     }
 
     /** Pull the latest host name learned from the inbound Hello frame
@@ -195,6 +201,42 @@ class AnsyncCompanionService : Service() {
         Log.i(TAG, "screen wake receiver registered")
     }
 
+    /** Track a long-running media stream and forward the start/stop
+     *  edges to [KeepAlive] so the optional `PARTIAL_WAKE_LOCK` stays
+     *  scoped to actual activity. Idempotent — duplicate starts/stops
+     *  for the same `key` are no-ops. */
+    private fun markStream(key: String, active: Boolean) {
+        val changed = if (active) activeStreams.add(key) else activeStreams.remove(key)
+        if (!changed) return
+        if (active) keepAlive?.streamStarted() else keepAlive?.streamStopped()
+    }
+
+    /** Receiver for `org.gameros.ansync.action.SET_CPU_WAKE_LOCK` with
+     *  boolean extra `enabled`. Lets the user (via `adb shell am
+     *  broadcast`, host D-Bus bridge, or a future settings UI) flip
+     *  the CPU wake-lock policy without restarting the service. */
+    private fun registerCpuWakePrefReceiver() {
+        if (cpuWakePrefReceiver != null) return
+        val r = object : BroadcastReceiver() {
+            override fun onReceive(context: Context?, intent: Intent?) {
+                val enabled = intent?.getBooleanExtra(EXTRA_CPU_WAKE_LOCK_ENABLED, false) ?: return
+                getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                    .edit()
+                    .putBoolean(PREF_CPU_WAKE_LOCK, enabled)
+                    .apply()
+                keepAlive?.refreshCpuLockPolicy()
+                Log.i(TAG, "cpu wake lock pref set to $enabled")
+            }
+        }
+        val filter = IntentFilter(ACTION_SET_CPU_WAKE_LOCK)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            registerReceiver(r, filter, Context.RECEIVER_EXPORTED)
+        } else {
+            registerReceiver(r, filter)
+        }
+        cpuWakePrefReceiver = r
+    }
+
     /** Watches the host's Control stream for
      *  `RequestScreenCapture` / `StopScreenCapture`. On `request` we
      *  pop the grant notif (`requestCaptureFromUser`); on `stop` we
@@ -272,6 +314,7 @@ class AnsyncCompanionService : Service() {
             )
         }
         audio = AudioRouter(msg.direction).also { it.start() }
+        markStream("audio", true)
         val ms = mediaSession ?: AudioMediaSession(this).also { mediaSession = it }
         ms.start(msg.direction)
         Log.i(TAG, "audio route started ${msg.direction}")
@@ -281,6 +324,7 @@ class AnsyncCompanionService : Service() {
     private fun handleStopAudio() {
         audio?.stop()
         audio = null
+        markStream("audio", false)
         mediaSession?.release()
         mediaSession = null
         Log.i(TAG, "audio route stopped")
@@ -322,6 +366,7 @@ class AnsyncCompanionService : Service() {
                 or ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA
         )
         camera = CameraSession(this, cfg).also { it.start() }
+        markStream("camera", true)
         Log.i(TAG, "camera session started for ${cfg.cameraId} (${cfg.width}x${cfg.height}@${cfg.fps})")
         refreshNotification()
     }
@@ -329,6 +374,7 @@ class AnsyncCompanionService : Service() {
     private fun handleStopCamera() {
         camera?.stop()
         camera = null
+        markStream("camera", false)
         Log.i(TAG, "camera session stopped")
         refreshNotification()
     }
@@ -447,6 +493,7 @@ class AnsyncCompanionService : Service() {
                     Handler(mainLooper).post {
                         projection = proj
                         capture = session
+                        markStream("capture", true)
                         setTileState(PREF_MIRROR_ACTIVE, true)
                         getSystemService(NotificationManager::class.java)
                             ?.cancel(GRANT_NOTIFICATION_ID)
@@ -466,6 +513,7 @@ class AnsyncCompanionService : Service() {
         // concurrent call sees nothing to do.
         val captureLocal = capture
         capture = null
+        markStream("capture", false)
         val projectionLocal = projection
         projection = null
         try {
@@ -507,6 +555,7 @@ class AnsyncCompanionService : Service() {
             audio = AudioRouter(direction).also { it.start() }
             effective = direction
         }
+        markStream("audio", true)
         val ms = mediaSession ?: AudioMediaSession(this).also { mediaSession = it }
         ms.start(effective)
         refreshNotification()
@@ -538,6 +587,7 @@ class AnsyncCompanionService : Service() {
         val remaining = removeDirection(existing.direction, direction)
         existing.stop()
         audio = remaining?.let { AudioRouter(it).also { r -> r.start() } }
+        if (audio == null) markStream("audio", false)
         if (remaining == null) {
             mediaSession?.release()
             mediaSession = null
@@ -651,6 +701,13 @@ class AnsyncCompanionService : Service() {
             }
         }
         screenReceiver = null
+        cpuWakePrefReceiver?.let {
+            try { unregisterReceiver(it) } catch (e: IllegalArgumentException) {
+                Log.w(TAG, "unregisterReceiver cpu wake pref threw", e)
+            }
+        }
+        cpuWakePrefReceiver = null
+        activeStreams.clear()
         keepAlive?.release()
         keepAlive = null
         NativeBridge.nativeClose()
@@ -690,6 +747,12 @@ class AnsyncCompanionService : Service() {
 
         /** Camera lifecycle stop (notification action button). */
         const val ACTION_STOP_CAMERA = "org.gameros.ansync.action.STOP_CAMERA"
+
+        /** Flip [PREF_CPU_WAKE_LOCK] at runtime.
+         *  `adb shell am broadcast -a org.gameros.ansync.action.SET_CPU_WAKE_LOCK --ez enabled true`
+         *  toggles the optional `PARTIAL_WAKE_LOCK` policy. */
+        const val ACTION_SET_CPU_WAKE_LOCK = "org.gameros.ansync.action.SET_CPU_WAKE_LOCK"
+        const val EXTRA_CPU_WAKE_LOCK_ENABLED = "enabled"
 
         /**
          * Start the foreground companion service idempotently. Used by

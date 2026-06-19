@@ -16,3 +16,12 @@ const val PREF_MIRROR_ACTIVE = "tile_mirror_active"
 const val PREF_TOUCHPAD_ACTIVE = "tile_touchpad_active"
 const val PREF_MIC_ACTIVE = "tile_mic_active"
 const val PREF_AUDIO_OUT_ACTIVE = "tile_audio_out_active"
+
+/**
+ * Opt-in: hold a `PARTIAL_WAKE_LOCK` while at least one stream
+ * (mirror, camera, audio in/out) is active. Off by default; battery
+ * cost ~5%/h on the device. Flip via the
+ * `org.gameros.ansync.action.SET_CPU_WAKE_LOCK` broadcast with
+ * boolean extra `enabled`.
+ */
+const val PREF_CPU_WAKE_LOCK = "cpu_wake_lock"

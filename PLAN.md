@@ -400,10 +400,11 @@ Surfaceado mientras se probaba el pair WiFi + mirror lifecycle real con DMS. Cad
 
 - [x] **N2 — OEM-specific autostart hints** (cerrado sesión 2026-06-19)
 
-- [ ] **N3 — WakeLock partial opcional para sessions activas**
-  - WifiLock cubre radio; CPU también puede entrar en deep sleep durante streams largos.
-  - `PowerManager.PARTIAL_WAKE_LOCK` acquired cuando `CaptureSession / AudioRouter / CameraSession` está activo, released cuando todos paran.
-  - Battery cost real (~5%/h), gateado por SharedPreferences flag user-toggleable.
+- [x] **N3 — WakeLock partial opcional para sessions activas** (cerrado 2026-06-19)
+  - `KeepAlive` ahora wrappea `PowerManager.PARTIAL_WAKE_LOCK` además del `WifiLock`. Refcounted: `streamStarted()` / `streamStopped()` lo acquire/release cuando el counter cruza 0→1 / 1→0. `refreshCpuLockPolicy()` cubre flips mid-session (acquire si user opt-in con streams ya activos, release si revoca).
+  - Gate `PREF_CPU_WAKE_LOCK` (default off). Flippable via `adb shell am broadcast -a org.gameros.ansync.action.SET_CPU_WAKE_LOCK --ez enabled true` — el receiver persiste el bool + dispara `refreshCpuLockPolicy()`. DMS plugin / futura settings activity / tile pueden dispatchear el mismo broadcast.
+  - `AnsyncCompanionService` mantiene set `activeStreams: Set<String>` (`"capture"`, `"camera"`, `"audio"`) + helper `markStream(key, active)` idempotente. Wireado en handleStartCapture/stopCapture, handleStartCamera/handleStopCamera, handleStartAudio/handleStopAudio, startAudioFromTile/stopAudioFromTile.
+  - Battery cost real ~5%/h cuando on. Sin pref off → comportamiento idéntico al anterior.
 
 - [ ] **N5 — MediaSession widget activo durante mirror**
   - R7 ya cubre audio. Sumar widget similar para "mirror activo" — corte directo desde lock screen sin abrir notif shade.
