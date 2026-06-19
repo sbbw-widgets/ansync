@@ -21,13 +21,13 @@ use ansync_core::{Capabilities, DeviceId, DeviceName, Permission};
 use ansync_crypto::IdentityKeypair;
 use ansync_dbus::{ConnState, DaemonAction, DaemonState, Device, serve};
 use ansync_discovery::{Discovery, MdnsDiscovery};
-use ansync_files::{AutoAcceptPolicy, receive_file};
+use ansync_files::{AutoAcceptPolicy, receive_file, send_file};
 use ansync_input::{InputDeviceFactory, InputSession, UinputFactory};
 use ansync_pairing::PeerStore;
 use ansync_permissions::FilePermissionsStore;
 use ansync_proto::{
     AudioDirection, AudioStreamInit, CameraConfig, ClipboardMessage, ControlMessage, Envelope,
-    Hello, InputMessage, Message, NotificationMessage, PROTOCOL_VERSION,
+    Hello, InputMessage, Message, NotificationMessage, PROTOCOL_VERSION, UrlMessage,
     VideoCodec as ProtoVideoCodec,
 };
 use ansync_transport::pinning::TrustedPeers;
@@ -129,7 +129,8 @@ impl DaemonConfig {
                 | Capabilities::AUDIO_IN
                 | Capabilities::AUDIO_OUT
                 | Capabilities::MIC
-                | Capabilities::CLIPBOARD,
+                | Capabilities::CLIPBOARD
+                | Capabilities::SHARE,
             input_backend: InputBackend::Uinput,
         }
     }
@@ -649,6 +650,12 @@ async fn action_loop(
                     warn!(%device, error = %e, "SyncClipboard failed");
                 }
             }
+            DaemonAction::SendFiles { device, paths } => {
+                handle_send_files(&mirrors, &permissions, &device, paths).await;
+            }
+            DaemonAction::SendUrl { device, url } => {
+                handle_send_url(&mirrors, &device, url).await;
+            }
             DaemonAction::StartCamera { device, config } => {
                 match handle_start_camera(&mirrors, &cameras, &permissions, &device, config).await
                 {
@@ -967,10 +974,19 @@ async fn handle_connection(
             StreamKind::Files => {
                 let perms = permissions.clone();
                 let peer_id_inbound = peer_id.clone();
+                let peer_name_inbound = peer.name.0.clone();
+                let dbus = dbus_conn.clone();
                 let policy = Arc::new(AutoAcceptPolicy {
                     root: download_dir.clone(),
                 });
-                tokio::spawn(files_stream_loop(stream, peer_id_inbound, perms, policy));
+                tokio::spawn(files_stream_loop(
+                    stream,
+                    peer_id_inbound,
+                    peer_name_inbound,
+                    perms,
+                    policy,
+                    dbus,
+                ));
             }
             StreamKind::Video => {
                 let entry = mirror_entry.clone();
@@ -1017,6 +1033,12 @@ async fn handle_connection(
                 let pid = peer_id.clone();
                 let store = peers.clone();
                 tokio::spawn(hello_inbound_loop(stream, pid, store));
+            }
+            StreamKind::Url => {
+                let pid = peer_id.clone();
+                let pname = peer.name.0.clone();
+                let perms = permissions.clone();
+                tokio::spawn(url_inbound_loop(stream, pid, pname, perms));
             }
             other => {
                 warn!(kind = ?other, "stream kind accepted but not wired yet — dropping");
@@ -2117,13 +2139,177 @@ async fn video_stream_loop(
 async fn files_stream_loop(
     mut stream: QuicStream,
     peer_id: DeviceId,
+    peer_name: String,
     permissions: Arc<dyn ansync_permissions::PermissionsStore>,
     policy: Arc<AutoAcceptPolicy>,
+    dbus_conn: Arc<zbus::Connection>,
 ) {
     match receive_file(&peer_id, permissions.as_ref(), &mut stream, policy.as_ref()).await {
-        Ok(path) => info!(%peer_id, dest = %path.display(), "inbound transfer ok"),
+        Ok(path) => {
+            info!(%peer_id, dest = %path.display(), "inbound transfer ok");
+            let path_str = path.display().to_string();
+            if let Err(e) =
+                ansync_dbus::Device::emit_file_received(&dbus_conn, &peer_id, &path_str).await
+            {
+                debug!(%peer_id, error = %e, "emit FileReceived failed");
+            }
+            spawn_share_notif(&peer_name, "File received", &format!("{}", path.display()));
+        }
         Err(e) => warn!(%peer_id, error = %e, "inbound transfer failed"),
     }
+}
+
+async fn url_inbound_loop(
+    mut stream: QuicStream,
+    peer_id: DeviceId,
+    peer_name: String,
+    permissions: Arc<dyn ansync_permissions::PermissionsStore>,
+) {
+    let bytes = match stream.recv().await {
+        Ok(b) => b,
+        Err(e) => {
+            warn!(%peer_id, error = %e, "url stream recv failed");
+            return;
+        }
+    };
+    let env: Envelope = match postcard::from_bytes(&bytes) {
+        Ok(e) => e,
+        Err(e) => {
+            warn!(%peer_id, error = %e, "url postcard decode failed");
+            return;
+        }
+    };
+    let Message::Url(UrlMessage { url }) = env.message else {
+        warn!(%peer_id, "url stream carried unexpected message kind");
+        return;
+    };
+    match permissions.check(&peer_id, Permission::ShareReceive).await {
+        Ok(true) => {}
+        Ok(false) => {
+            debug!(%peer_id, "share_receive off; dropping url");
+            return;
+        }
+        Err(e) => {
+            warn!(%peer_id, error = %e, "share_receive check failed; dropping url");
+            return;
+        }
+    }
+    // Linux side opens directly — paired peers are trusted at the
+    // same level as the local clipboard. Android does the prompt
+    // dance on its side. `xdg-open` is shelled out so we don't drag
+    // in a portal client; users without `xdg-open` can install
+    // `xdg-utils` (every desktop distro ships it).
+    let url_for_open = url.clone();
+    let peer_name_for_notif = peer_name.clone();
+    let url_for_notif = url.clone();
+    std::thread::spawn(move || {
+        match std::process::Command::new("xdg-open").arg(&url_for_open).status() {
+            Ok(status) if status.success() => {}
+            Ok(status) => warn!(%status, "xdg-open returned non-zero status"),
+            Err(e) => warn!(error = %e, "xdg-open invoke failed"),
+        }
+    });
+    spawn_share_notif(&peer_name_for_notif, "Opened URL", &url_for_notif);
+    info!(%peer_id, url, "inbound url opened");
+}
+
+async fn handle_send_files(
+    mirrors: &MirrorRegistry,
+    permissions: &Arc<dyn ansync_permissions::PermissionsStore>,
+    device: &DeviceId,
+    paths: Vec<PathBuf>,
+) {
+    let Some(entry) = mirrors.get(device) else {
+        warn!(%device, "SendFiles: no live mirror entry");
+        return;
+    };
+    let conn = entry.conn.lock().expect("conn slot poisoned").clone();
+    let Some(conn) = conn else {
+        warn!(%device, "SendFiles: peer not connected");
+        return;
+    };
+    for path in paths {
+        let mut stream = match conn.open(StreamKind::Files).await {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(%device, error = %e, "open Files stream failed");
+                continue;
+            }
+        };
+        let tid = next_transfer_id();
+        match send_file(device, permissions.as_ref(), &mut stream, &path, tid).await {
+            Ok(_) => info!(%device, path = %path.display(), "outbound file sent"),
+            Err(e) => warn!(%device, error = %e, path = %path.display(), "outbound file failed"),
+        }
+    }
+}
+
+async fn handle_send_url(
+    mirrors: &MirrorRegistry,
+    device: &DeviceId,
+    url: String,
+) {
+    let Some(entry) = mirrors.get(device) else {
+        warn!(%device, "SendUrl: no live mirror entry");
+        return;
+    };
+    let conn = entry.conn.lock().expect("conn slot poisoned").clone();
+    let Some(conn) = conn else {
+        warn!(%device, "SendUrl: peer not connected");
+        return;
+    };
+    let mut stream = match conn.open(StreamKind::Url).await {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(%device, error = %e, "open Url stream failed");
+            return;
+        }
+    };
+    let env = Envelope {
+        version: PROTOCOL_VERSION,
+        message: Message::Url(UrlMessage { url: url.clone() }),
+    };
+    let bytes = match postcard::to_allocvec(&env) {
+        Ok(b) => b,
+        Err(e) => {
+            warn!(%device, error = %e, "encode UrlMessage failed");
+            return;
+        }
+    };
+    if let Err(e) = stream.send(bytes::Bytes::from(bytes)).await {
+        warn!(%device, error = %e, "url stream send failed");
+        return;
+    }
+    info!(%device, url, "outbound url sent");
+}
+
+/// Monotonically increasing transfer id seed used for outbound
+/// `Device.SendFile` calls. The wire protocol carries the id so the
+/// receiver can match `Offer` ↔ `Accept` ↔ chunks across one stream.
+fn next_transfer_id() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEED: AtomicU64 = AtomicU64::new(1);
+    SEED.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Fire-and-forget desktop notification via `notify-send`. We shell
+/// out instead of taking a `libnotify` Rust binding to keep the
+/// daemon's runtime deps small — `notify-send` ships with every
+/// desktop libnotify install we care about.
+fn spawn_share_notif(peer_name: &str, summary: &str, body: &str) {
+    let summary = format!("ansync · {peer_name}: {summary}");
+    let body = body.to_string();
+    std::thread::spawn(move || {
+        if let Err(e) = std::process::Command::new("notify-send")
+            .arg("--app-name=ansync")
+            .arg("--icon=document-send")
+            .arg(summary)
+            .arg(body)
+            .status()
+        {
+            debug!(error = %e, "notify-send invoke failed");
+        }
+    });
 }
 
 async fn input_stream_loop(mut stream: QuicStream, session: Arc<Mutex<InputSession>>) {

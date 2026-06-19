@@ -14,4 +14,6 @@
     <string name="tile_mic_label">Share mic</string>
     <string name="tile_audio_label">PC audio out</string>
     <string name="tile_gamepad_label">Gamepad → PC</string>
+    <string name="tile_share_label">Send to PC</string>
+    <string name="share_label">Send via ansync</string>
 </resources>

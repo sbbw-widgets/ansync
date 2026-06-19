@@ -5,10 +5,7 @@ use std::time::Duration;
 
 use ansync_crypto::IdentityKeypair;
 use ansync_discovery::{Discovery, MdnsDiscovery};
-use ansync_files::send_file;
 use ansync_pairing::{PeerStore, list_adb_devices, pair_host_via_adb};
-use ansync_permissions::FilePermissionsStore;
-use ansync_transport::{Connection as _, QuicTransport, StreamKind};
 use clap::{Parser, Subcommand};
 use directories::BaseDirs;
 use futures::StreamExt;
@@ -81,22 +78,20 @@ enum Command {
     Forget { id: String },
     /// Open the mirror screen for a device.
     Show { id: String },
-    /// Push a file to a device (direct QUIC dial — bypasses daemon
-    /// D-Bus and discovers the peer's address via mDNS).
+    /// Push one or more files to a paired device. Routes through the
+    /// daemon's D-Bus `Device.SendFiles` — the daemon owns the
+    /// outbound transfer (mirror window, accounting, signals).
     Push {
         id: String,
-        path: PathBuf,
-        /// Skip mDNS browse and connect to `host:port` directly.
-        #[arg(long)]
-        addr: Option<String>,
-        /// mDNS browse timeout if `--addr` is not supplied.
-        #[arg(long, default_value_t = 5)]
-        seconds: u64,
+        /// One or more files. Paths are interpreted relative to the
+        /// CWD of `ansyncctl`, then made absolute before the D-Bus
+        /// call so the daemon sees the same bytes.
+        #[arg(required = true, num_args = 1..)]
+        paths: Vec<PathBuf>,
     },
-    /// Mount the remote filesystem.
-    Mount { id: String, mountpoint: String },
-    /// Unmount the remote filesystem.
-    Unmount { id: String },
+    /// Ask a paired device to open `url`. Linux peers shell out to
+    /// `xdg-open`; Android peers prompt before firing `ACTION_VIEW`.
+    Url { id: String, url: String },
     /// Get or set a per-device permission flag.
     Perm {
         id: String,
@@ -153,9 +148,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Command::Forget { id } => println!("(skeleton) forget {id}"),
         Command::Show { id } => println!("(skeleton) show {id}"),
-        Command::Push { id, path, addr, seconds } => push(id, path, addr, seconds).await?,
-        Command::Mount { id, mountpoint } => println!("(skeleton) mount {id} at {mountpoint}"),
-        Command::Unmount { id } => println!("(skeleton) unmount {id}"),
+        Command::Push { id, paths } => push(id, paths).await?,
+        Command::Url { id, url } => send_url(id, url).await?,
         Command::Perm { id, flag, value } => println!("(skeleton) perm {id} {flag} {value:?}"),
     }
 
@@ -745,71 +739,42 @@ async fn notify_daemon_refresh() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn push(
-    id_hex: String,
-    path: PathBuf,
-    addr_override: Option<String>,
-    discover_seconds: u64,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let store = PeerStore::open(default_peers_dir()?)?;
-    let peer = store
-        .list()?
+async fn push(id_hex: String, paths: Vec<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
+    // Resolve each path to absolute so the daemon (running in its
+    // own CWD / under a systemd user unit) reads the right bytes.
+    let abs: Vec<String> = paths
         .into_iter()
-        .find(|p| p.id.to_string() == id_hex)
-        .ok_or_else(|| format!("no paired peer with id={id_hex}"))?;
-
-    let addr: std::net::SocketAddr = match addr_override {
-        Some(s) => s.parse()?,
-        None => {
-            println!("browsing mDNS for {seconds}s …", seconds = discover_seconds);
-            let identity = load_identity()?;
-            let mdns = MdnsDiscovery::new(identity.public().as_bytes())?;
-            let mut stream = mdns.browse()?;
-            let deadline = Duration::from_secs(discover_seconds);
-            let mut found = None;
-            let _ = timeout(deadline, async {
-                while let Some(dev) = stream.next().await {
-                    if dev.id.to_string() == id_hex {
-                        found = Some(dev);
-                        break;
-                    }
-                }
-            })
-            .await;
-            let dev = found.ok_or_else(|| {
-                format!("peer {id_hex} not found via mDNS within {discover_seconds}s")
-            })?;
-            dev.addr
-        }
-    };
-    println!("connecting to {addr} …");
-
-    let identity = load_identity()?;
-    let transport = QuicTransport::new(identity);
-    let conn = transport.connect(addr, peer.pubkey).await?;
-    let mut stream = conn.open(StreamKind::Files).await?;
-
-    let permissions = FilePermissionsStore::open(default_permissions_dir()?)?;
-    let transfer_id = rand_u64();
-    let final_id = send_file(&peer.id, &permissions, &mut stream, &path, transfer_id).await?;
-    println!("transfer {final_id} sent ok");
+        .map(|p| -> Result<String, Box<dyn std::error::Error>> {
+            let absolute = if p.is_absolute() { p } else { std::env::current_dir()?.join(p) };
+            Ok(absolute.display().to_string())
+        })
+        .collect::<Result<_, _>>()?;
+    let proxy = device_proxy(&id_hex).await?;
+    let count: u32 = proxy.call("SendFiles", &(&abs,)).await?;
+    println!("daemon queued {count} files for {id_hex}");
     Ok(())
 }
 
-fn default_permissions_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let base = BaseDirs::new().ok_or("$HOME not set; cannot resolve XDG paths")?;
-    Ok(base.config_dir().join("ansync").join("devices"))
+async fn send_url(id_hex: String, url: String) -> Result<(), Box<dyn std::error::Error>> {
+    let proxy = device_proxy(&id_hex).await?;
+    proxy.call::<_, _, ()>("SendUrl", &(&url,)).await?;
+    println!("daemon dispatched URL to {id_hex}");
+    Ok(())
 }
 
-fn rand_u64() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    // CLI-side transfer ids do not need cryptographic randomness; a
-    // monotonic-ish stamp avoids collisions between back-to-back
-    // pushes from the same shell.
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
+async fn device_proxy(
+    id_hex: &str,
+) -> Result<zbus::Proxy<'static>, Box<dyn std::error::Error>> {
+    let conn = zbus::Connection::session().await?;
+    let path = format!("/org/gameros/Ansync1/Device/{id_hex}");
+    let proxy = zbus::Proxy::new(
+        &conn,
+        "org.gameros.Ansync1",
+        zbus::zvariant::ObjectPath::try_from(path)?.into_owned(),
+        "org.gameros.Ansync1.Device",
+    )
+    .await?;
+    Ok(proxy)
 }
 
 fn hostname() -> Option<String> {

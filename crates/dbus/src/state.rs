@@ -3,6 +3,7 @@
 //! need to depend on `daemon-core` (which would be a cycle).
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
 
 use ansync_core::DeviceId;
@@ -81,6 +82,17 @@ pub enum DaemonAction {
     /// over a fresh `StreamKind::Clipboard`. Gated by
     /// `Permission::ClipboardOut`.
     SyncClipboard { device: DeviceId },
+    /// Push one or more files to `device` over fresh
+    /// `StreamKind::Files` streams (one stream per path). Reuses
+    /// `ansync_files::send_file`. The companion's `AutoAcceptPolicy`
+    /// drops the bytes under `incoming/{peer}/`; on Linux the action
+    /// loop lands them in `download_dir`.
+    SendFiles { device: DeviceId, paths: Vec<PathBuf> },
+    /// Open `url` on `device`. One-shot `StreamKind::Url` stream
+    /// carrying a postcard `Message::Url(UrlMessage)`. Receiver
+    /// behaviour is per-platform (Linux opens directly, Android
+    /// prompts) — see `ansync_proto::UrlMessage`.
+    SendUrl { device: DeviceId, url: String },
 }
 
 pub struct DaemonState {

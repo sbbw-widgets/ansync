@@ -103,6 +103,7 @@ pub fn permission_value(perms: &DevicePermissions, permission: Permission) -> bo
         Permission::InputFromDevice => perms.input_from_device,
         Permission::InputToDevice => perms.input_to_device,
         Permission::Notifications => perms.notifications,
+        Permission::ShareReceive => perms.share_receive,
     }
 }
 
@@ -129,6 +130,7 @@ pub fn apply_permission(perms: &mut DevicePermissions, permission: Permission, v
         Permission::InputFromDevice => perms.input_from_device = value,
         Permission::InputToDevice => perms.input_to_device = value,
         Permission::Notifications => perms.notifications = value,
+        Permission::ShareReceive => perms.share_receive = value,
     }
 }
 
@@ -148,6 +150,7 @@ pub fn parse_permission(name: &str) -> Option<Permission> {
         "input_from_device" => Permission::InputFromDevice,
         "input_to_device" => Permission::InputToDevice,
         "notifications" => Permission::Notifications,
+        "share_receive" => Permission::ShareReceive,
         _ => return None,
     })
 }
@@ -167,6 +170,7 @@ pub fn permission_name(permission: Permission) -> &'static str {
         Permission::InputFromDevice => "input_from_device",
         Permission::InputToDevice => "input_to_device",
         Permission::Notifications => "notifications",
+        Permission::ShareReceive => "share_receive",
     }
 }
 

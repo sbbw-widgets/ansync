@@ -141,6 +141,8 @@ El `flake.nix` pinea `nixpkgs` a `549bd84d6279f9852cae6225e372cc67fb91a4c1` para
   - **Pendientes** (deliberately skipped): R3 (botón push clipboard host), R7 (MediaSession widget audio).
   - **R8 cerrado (sesión 2026-06-18)** — v4l2loopback per-peer card_label vía `V4L2LOOPBACK_CTL_ADD` ioctl sobre `/dev/v4l2loopback`. Nuevo `ansync_camera::dyn_ctl` (libc::ioctl directo, struct layout pinned a v4l2loopback 0.15.x + static_assert size 72, version gate >= 0.15 antes de ADD). `V4l2LoopbackSink::register` ahora dyn-add con label `"<peer_name> (Ansync)"` (UTF-8 truncado a 31 bytes en char boundary), fallback a static scan si control device missing. `unregister` REMOVE owned node (drop fd antes para evitar EBUSY). `nix/v4l2loopback.nix` reescrito a modo dinámico: `devices=0`, udev rule para control device, catch-all rule para video nodes. Browsers / OBS / Discord ahora muestran "Pixel 9 (Ansync)" / "Galaxy S24 (Ansync)" en el picker.
 
+- **Share (Quick Share-style) cerrado (2026-06-19)** — reemplaza FUSE como mecanismo de file-sharing. `StreamKind::Url` (0x0b) + `Message::Url(UrlMessage)` + `Permission::ShareReceive` + `Capabilities::SHARE`. D-Bus `Device.SendFiles` / `Device.SendUrl` / signal `FileReceived`. Daemon `url_inbound_loop` xdg-open + `notify-send`. Companion JNI `nativeSendFile/nativeSendUrl/nativePollIncomingUrl/nativePollReceivedFile`. Kotlin `ShareActivity` (intent-filter `ACTION_SEND` + `ACTION_SEND_MULTIPLE`) + `ShareTile` QSTile + receive workers (URL prompt notif + file received notif + MediaScanner). `ansyncctl push <id> <paths...>` y `ansyncctl url <id> <url>` ahora SIEMPRE D-Bus (sin direct QUIC). Multi-host picker queda gated por N8.
+
 Ver `PLAN.md` § Roadmap para la lista completa.
 
 ## Convenciones de continuidad

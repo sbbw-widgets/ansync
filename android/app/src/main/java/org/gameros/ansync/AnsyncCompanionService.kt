@@ -61,6 +61,10 @@ class AnsyncCompanionService : Service() {
     private var capturePollThread: HandlerThread? = null
     private var capturePollHandler: Handler? = null
     @Volatile private var capturePollRunning = false
+    private var urlPollThread: HandlerThread? = null
+    @Volatile private var urlPollRunning = false
+    private var receivedFilePollThread: HandlerThread? = null
+    @Volatile private var receivedFilePollRunning = false
     private var screenReceiver: BroadcastReceiver? = null
     private var keepAlive: KeepAlive? = null
     /** Names of currently-held streams (`"capture"`, `"camera"`, `"audio"`).
@@ -104,6 +108,8 @@ class AnsyncCompanionService : Service() {
         wifiPair = WifiPairManager(this).also { it.start() }
         startCaptureControlPoller()
         startHostNamePoller()
+        startUrlPoller()
+        startReceivedFilePoller()
         registerScreenWakeReceiver()
         registerCpuWakePrefReceiver()
     }
@@ -241,6 +247,115 @@ class AnsyncCompanionService : Service() {
      *  `RequestScreenCapture` / `StopScreenCapture`. On `request` we
      *  pop the grant notif (`requestCaptureFromUser`); on `stop` we
      *  tear the running session down. */
+    /**
+     * Drain inbound URL pushes from the native side and pop a
+     * "tap to open" consent notification per URL. The user must
+     * confirm before the device actually fires `ACTION_VIEW` — the
+     * peer is trusted but a compromised peer would otherwise be able
+     * to open arbitrary intents (Linux side opens via `xdg-open`
+     * directly per the threat model).
+     */
+    private fun startUrlPoller() {
+        if (urlPollThread != null) return
+        val ht = HandlerThread("ansync-url-in").also { it.start() }
+        urlPollThread = ht
+        urlPollRunning = true
+        Handler(ht.looper).post(object : Runnable {
+            override fun run() {
+                while (urlPollRunning) {
+                    val url = NativeBridge.nativePollIncomingUrl()
+                    if (url == null) {
+                        try { Thread.sleep(500) } catch (_: InterruptedException) {}
+                        continue
+                    }
+                    Handler(mainLooper).post { postUrlConsentNotif(url) }
+                }
+            }
+        })
+    }
+
+    /**
+     * Drain inbound file completions and post a "tap to open" notif
+     * pointing at the saved file via [FileProvider]. Also runs a
+     * `MediaScannerConnection.scanFile` so the file appears under
+     * Files / gallery without a manual rescan.
+     */
+    private fun startReceivedFilePoller() {
+        if (receivedFilePollThread != null) return
+        val ht = HandlerThread("ansync-files-in").also { it.start() }
+        receivedFilePollThread = ht
+        receivedFilePollRunning = true
+        Handler(ht.looper).post(object : Runnable {
+            override fun run() {
+                while (receivedFilePollRunning) {
+                    val path = NativeBridge.nativePollReceivedFile()
+                    if (path == null) {
+                        try { Thread.sleep(500) } catch (_: InterruptedException) {}
+                        continue
+                    }
+                    Handler(mainLooper).post { postReceivedFileNotif(path) }
+                }
+            }
+        })
+    }
+
+    private fun postUrlConsentNotif(url: String) {
+        val openIntent = Intent(Intent.ACTION_VIEW, Uri.parse(url))
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        } else {
+            PendingIntent.FLAG_UPDATE_CURRENT
+        }
+        val pi = PendingIntent.getActivity(this, url.hashCode(), openIntent, flags)
+        val n = NotificationCompat.Builder(this, GRANT_CHANNEL_ID)
+            .setContentTitle("Open link from host?")
+            .setContentText(url)
+            .setSmallIcon(android.R.drawable.ic_menu_share)
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setContentIntent(pi)
+            .setAutoCancel(true)
+            .build()
+        getSystemService(NotificationManager::class.java)
+            ?.notify(URL_NOTIF_ID_BASE + (url.hashCode() and 0x7fff), n)
+    }
+
+    private fun postReceivedFileNotif(path: String) {
+        val file = java.io.File(path)
+        // FileProvider would be the production-grade path; for MVP
+        // tap-to-open just points the system at the file URI. Most
+        // file managers + galleries handle it. We register with the
+        // media scanner regardless so the file shows up everywhere.
+        try {
+            android.media.MediaScannerConnection.scanFile(
+                this,
+                arrayOf(path),
+                null,
+                null,
+            )
+        } catch (t: Throwable) {
+            Log.w(TAG, "MediaScanner scan threw", t)
+        }
+        val viewIntent = Intent(Intent.ACTION_VIEW)
+            .setData(Uri.fromFile(file))
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        } else {
+            PendingIntent.FLAG_UPDATE_CURRENT
+        }
+        val pi = PendingIntent.getActivity(this, path.hashCode(), viewIntent, flags)
+        val n = NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle("File received")
+            .setContentText(file.name)
+            .setSmallIcon(android.R.drawable.stat_sys_download_done)
+            .setContentIntent(pi)
+            .setAutoCancel(true)
+            .build()
+        getSystemService(NotificationManager::class.java)
+            ?.notify(FILE_NOTIF_ID_BASE + (path.hashCode() and 0x7fff), n)
+    }
+
     private fun startCaptureControlPoller() {
         if (capturePollThread != null) return
         val ht = HandlerThread("ansync-cap-ctrl").also { it.start() }
@@ -690,6 +805,12 @@ class AnsyncCompanionService : Service() {
         capturePollThread?.quitSafely()
         capturePollThread = null
         capturePollHandler = null
+        urlPollRunning = false
+        urlPollThread?.quitSafely()
+        urlPollThread = null
+        receivedFilePollRunning = false
+        receivedFilePollThread?.quitSafely()
+        receivedFilePollThread = null
         hostNamePollRunning = false
         hostNamePoller?.quitSafely()
         hostNamePoller = null
@@ -724,6 +845,13 @@ class AnsyncCompanionService : Service() {
         /** High-importance channel used only for "host wants X, tap to grant" prompts. */
         const val GRANT_CHANNEL_ID = "ansync.grant"
         const val GRANT_NOTIFICATION_ID = 2
+        /** Base id for inbound URL prompts ("Open link from host?"). The
+         *  full id mixes in the URL hash so concurrent links don't
+         *  overwrite each other. */
+        const val URL_NOTIF_ID_BASE = 10_000
+        /** Base id for inbound file completions. Mixed with the path
+         *  hash for the same reason as URLs. */
+        const val FILE_NOTIF_ID_BASE = 20_000
 
         /** MediaProjection result delivered by [GrantScreenCaptureActivity]. */
         const val ACTION_START_CAPTURE = "org.gameros.ansync.action.START_CAPTURE"

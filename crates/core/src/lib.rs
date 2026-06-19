@@ -82,6 +82,7 @@ bitflags::bitflags! {
         const NOTIFICATIONS    = 1 << 11;
         const STYLUS           = 1 << 13;
         const HEVC             = 1 << 14;
+        const SHARE            = 1 << 15;
     }
 }
 
@@ -103,6 +104,13 @@ pub struct DevicePermissions {
     pub input_from_device: bool,
     pub input_to_device: bool,
     pub notifications: bool,
+    /// Accept inbound Share payloads: ad-hoc file pushes from the
+    /// peer (`Device.SendFile`) and one-shot URL opens
+    /// (`Device.SendUrl` / Android share-sheet). Default on — once
+    /// devices are paired they are explicitly trusted to send. The
+    /// receive UX still surfaces a notification per payload so
+    /// nothing happens fully invisibly.
+    pub share_receive: bool,
 }
 
 impl Default for DevicePermissions {
@@ -133,6 +141,7 @@ impl Default for DevicePermissions {
             input_from_device: false,
             input_to_device: false,
             notifications: true,
+            share_receive: true,
         }
     }
 }
@@ -160,4 +169,5 @@ pub enum Permission {
     InputFromDevice,
     InputToDevice,
     Notifications,
+    ShareReceive,
 }

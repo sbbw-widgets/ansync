@@ -30,13 +30,13 @@ fn mark_connected(state: bool) {
 
 use ansync_core::{Capabilities, DeviceId, DeviceName, DevicePermissions, Permission};
 use ansync_crypto::IdentityKeypair;
-use ansync_files::{AutoAcceptPolicy, receive_file};
+use ansync_files::{AutoAcceptPolicy, receive_file, send_file};
 use ansync_pairing::cable::bootstrap_companion;
 use ansync_pairing::wifi::{read_pair_hello, respond_pair_pin, CompanionWifiOutcome};
 use ansync_permissions::{PermissionsError, PermissionsStore};
 use ansync_proto::{
     ClipboardMessage, ControlMessage, Envelope, GamepadState, Hello, InputMessage, Message,
-    NotificationMessage, PROTOCOL_VERSION,
+    NotificationMessage, PROTOCOL_VERSION, UrlMessage,
 };
 use ansync_transport::{
     Connection, QuicConnection, QuicStream, QuicTransport, Stream as _, StreamKind,
@@ -227,6 +227,17 @@ struct ActiveSession {
     /// `nativePollClipboardBlob` which returns a flat
     /// `[mime_len u32 LE | mime utf8 | data]` encoding.
     clipboard_in_blob_rx: Arc<AsyncMutex<UnboundedReceiver<(String, Vec<u8>)>>>,
+    /// Inbound "open this URL" requests forwarded by the host. Kotlin
+    /// pops via `nativePollIncomingUrl` and posts the consent
+    /// notification — see `WireUrlMessage` design notes.
+    url_in_rx: Arc<AsyncMutex<UnboundedReceiver<String>>>,
+    /// Absolute paths of inbound files that finished downloading.
+    /// Kotlin pops via `nativePollReceivedFile` to fire the "tap to
+    /// open" notification + run a `MediaScannerConnection.scanFile`.
+    received_files_rx: Arc<AsyncMutex<UnboundedReceiver<String>>>,
+    /// Host's stable device id derived from its Ed25519 pubkey. Used
+    /// as the `peer_id` argument to `send_file` for outbound shares.
+    host_id: DeviceId,
 }
 
 #[unsafe(no_mangle)]
@@ -485,6 +496,12 @@ pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativeOpenConnection
     let (clip_blob_tx, clip_blob_rx) = unbounded_channel::<(String, Vec<u8>)>();
     let clip_blob_tx = Arc::new(clip_blob_tx);
 
+    let (url_in_tx, url_in_rx) = unbounded_channel::<String>();
+    let url_in_tx = Arc::new(url_in_tx);
+
+    let (received_file_tx, received_file_rx) = unbounded_channel::<String>();
+    let received_file_tx = Arc::new(received_file_tx);
+
     let conn_arc = Arc::new(conn);
     let download_dir = {
         let slot = state_slot().lock().expect("state mutex poisoned");
@@ -502,7 +519,7 @@ pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativeOpenConnection
     };
     runtime().spawn(streams_accept_loop(
         conn_arc.clone(),
-        host_device_id,
+        host_device_id.clone(),
         download_dir,
         input_tx_arc.clone(),
         camera_ctrl_tx.clone(),
@@ -512,6 +529,8 @@ pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativeOpenConnection
         clip_blob_tx.clone(),
         host_name_slot,
         capture_ctrl_tx.clone(),
+        url_in_tx.clone(),
+        received_file_tx.clone(),
     ));
 
     let session = ActiveSession {
@@ -527,6 +546,9 @@ pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativeOpenConnection
         clipboard_in_rx: Arc::new(AsyncMutex::new(clip_in_rx)),
         clipboard_in_blob_rx: Arc::new(AsyncMutex::new(clip_blob_rx)),
         capture_ctrl_rx: Arc::new(AsyncMutex::new(capture_ctrl_rx)),
+        url_in_rx: Arc::new(AsyncMutex::new(url_in_rx)),
+        received_files_rx: Arc::new(AsyncMutex::new(received_file_rx)),
+        host_id: host_device_id,
     };
     let mut slot = state_slot().lock().expect("state mutex poisoned");
     if let Some(s) = slot.as_mut() {
@@ -563,6 +585,8 @@ async fn streams_accept_loop(
     clip_blob_tx: Arc<UnboundedSender<(String, Vec<u8>)>>,
     host_name_slot: Arc<Mutex<Option<String>>>,
     capture_ctrl_tx: Arc<UnboundedSender<Vec<u8>>>,
+    url_in_tx: Arc<UnboundedSender<String>>,
+    received_file_tx: Arc<UnboundedSender<String>>,
 ) {
     let permissions: Arc<dyn PermissionsStore> = Arc::new(PermissivePermissions);
     // Helper struct so any early return out of the accept loop —
@@ -603,10 +627,14 @@ async fn streams_accept_loop(
                 });
                 let host_id = host_id.clone();
                 let perms = permissions.clone();
+                let received_tx = received_file_tx.clone();
                 tokio::spawn(async move {
                     match receive_file(&host_id, perms.as_ref(), &mut stream, policy.as_ref()).await
                     {
-                        Ok(p) => info!("inbound file -> {}", p.display()),
+                        Ok(p) => {
+                            info!("inbound file -> {}", p.display());
+                            let _ = received_tx.send(p.display().to_string());
+                        }
                         Err(e) => warn!("inbound file failed: {e}"),
                     }
                 });
@@ -635,11 +663,42 @@ async fn streams_accept_loop(
                 let slot = host_name_slot.clone();
                 tokio::spawn(hello_in_loop(stream, slot));
             }
+            StreamKind::Url => {
+                let tx = url_in_tx.clone();
+                tokio::spawn(url_in_loop(stream, (*tx).clone()));
+            }
             other => {
                 warn!("streams_accept_loop: dropping unexpected stream {other:?}");
                 drop(stream);
             }
         }
+    }
+}
+
+async fn url_in_loop(mut stream: QuicStream, tx: UnboundedSender<String>) {
+    let bytes = match stream.recv().await {
+        Ok(b) => b,
+        Err(e) => {
+            warn!("url_in_loop: recv failed: {e}");
+            return;
+        }
+    };
+    let env: ansync_proto::Envelope = match postcard::from_bytes(&bytes) {
+        Ok(e) => e,
+        Err(e) => {
+            warn!("url_in_loop: decode failed: {e}");
+            return;
+        }
+    };
+    let url = match env.message {
+        Message::Url(u) => u.url,
+        other => {
+            warn!("url_in_loop: unexpected message {other:?}");
+            return;
+        }
+    };
+    if tx.send(url).is_err() {
+        info!("url_in_loop: receiver dropped");
     }
 }
 
@@ -872,7 +931,8 @@ async fn send_hello(
                 | Capabilities::MIC
                 | Capabilities::FILES
                 | Capabilities::CLIPBOARD
-                | Capabilities::NOTIFICATIONS,
+                | Capabilities::NOTIFICATIONS
+                | Capabilities::SHARE,
         }),
     };
     let bytes = postcard::to_allocvec(&env).map_err(|e| {
@@ -1754,6 +1814,189 @@ fn send_notification(msg: NotificationMessage) -> jboolean {
             jni::sys::JNI_FALSE
         }
     }
+}
+
+/// Push one file at `path` over a fresh `StreamKind::Files` to the
+/// paired host. Returns `true` once the chunks + final ack flush.
+/// Blocking on the JNI thread for the full transfer is intentional:
+/// callers (`ShareActivity`) already run on a worker pool, and
+/// surfacing per-call success / failure keeps the Kotlin UX
+/// straightforward.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativeSendFile<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    path: JString<'local>,
+) -> jboolean {
+    let path_str: String = match env.get_string(&path) {
+        Ok(s) => s.into(),
+        Err(e) => {
+            error!("nativeSendFile: get_string path: {e}");
+            return jni::sys::JNI_FALSE;
+        }
+    };
+    let (conn, host_id) = {
+        let slot = state_slot().lock().expect("state mutex poisoned");
+        match slot.as_ref().and_then(|s| s.session.as_ref()) {
+            Some(sess) => (sess.conn.clone(), sess.host_id.clone()),
+            None => {
+                warn!("nativeSendFile: no active session");
+                return jni::sys::JNI_FALSE;
+            }
+        }
+    };
+    let permissions: Arc<dyn PermissionsStore> = Arc::new(PermissivePermissions);
+    let ok = runtime().block_on(async move {
+        let mut stream = match conn.open(StreamKind::Files).await {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("nativeSendFile: open Files stream failed: {e}");
+                return false;
+            }
+        };
+        let tid = next_transfer_id();
+        match send_file(
+            &host_id,
+            permissions.as_ref(),
+            &mut stream,
+            std::path::Path::new(&path_str),
+            tid,
+        )
+        .await
+        {
+            Ok(_) => true,
+            Err(e) => {
+                warn!("nativeSendFile: send_file failed: {e}");
+                false
+            }
+        }
+    });
+    if ok { jni::sys::JNI_TRUE } else { jni::sys::JNI_FALSE }
+}
+
+/// Open a `StreamKind::Url` to the host, send a single postcard
+/// `Envelope { Message::Url(UrlMessage) }` frame, drop the stream.
+/// `xdg-open <url>` fires on the Linux side automatically; this is
+/// the "share link to PC" path.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativeSendUrl<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    url: JString<'local>,
+) -> jboolean {
+    let url_str: String = match env.get_string(&url) {
+        Ok(s) => s.into(),
+        Err(e) => {
+            error!("nativeSendUrl: get_string url: {e}");
+            return jni::sys::JNI_FALSE;
+        }
+    };
+    let conn = {
+        let slot = state_slot().lock().expect("state mutex poisoned");
+        match slot.as_ref().and_then(|s| s.session.as_ref()) {
+            Some(sess) => sess.conn.clone(),
+            None => {
+                warn!("nativeSendUrl: no active session");
+                return jni::sys::JNI_FALSE;
+            }
+        }
+    };
+    let ok = runtime().block_on(async move {
+        let mut stream = match conn.open(StreamKind::Url).await {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("nativeSendUrl: open Url stream failed: {e}");
+                return false;
+            }
+        };
+        let env_msg = Envelope {
+            version: PROTOCOL_VERSION,
+            message: Message::Url(UrlMessage { url: url_str }),
+        };
+        let bytes = match postcard::to_allocvec(&env_msg) {
+            Ok(b) => b,
+            Err(e) => {
+                warn!("nativeSendUrl: encode UrlMessage: {e}");
+                return false;
+            }
+        };
+        if let Err(e) = stream.send(Bytes::from(bytes)).await {
+            warn!("nativeSendUrl: stream send: {e}");
+            return false;
+        }
+        true
+    });
+    if ok { jni::sys::JNI_TRUE } else { jni::sys::JNI_FALSE }
+}
+
+/// Block until the host pushes the next inbound URL. Kotlin polls
+/// this from a worker, posts the consent notification, opens via
+/// `Intent.ACTION_VIEW` once the user taps "Open".
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativePollIncomingUrl<'local>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+) -> jni::sys::jstring {
+    let url_in_rx = {
+        let slot = state_slot().lock().expect("state mutex poisoned");
+        match slot.as_ref().and_then(|s| s.session.as_ref()) {
+            Some(sess) => sess.url_in_rx.clone(),
+            None => return std::ptr::null_mut(),
+        }
+    };
+    let url = runtime().block_on(async move {
+        let mut guard = url_in_rx.lock().await;
+        guard.recv().await
+    });
+    match url {
+        Some(u) => match env.new_string(u) {
+            Ok(j) => j.into_raw(),
+            Err(e) => {
+                error!("nativePollIncomingUrl: new_string: {e}");
+                std::ptr::null_mut()
+            }
+        },
+        None => std::ptr::null_mut(),
+    }
+}
+
+/// Block until the next inbound file finishes downloading. Returns
+/// the absolute path under `incoming/{host}/`. Kotlin uses it to
+/// register the file with `MediaScannerConnection` + post a
+/// "tap to open" notification.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativePollReceivedFile<'local>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+) -> jni::sys::jstring {
+    let rx = {
+        let slot = state_slot().lock().expect("state mutex poisoned");
+        match slot.as_ref().and_then(|s| s.session.as_ref()) {
+            Some(sess) => sess.received_files_rx.clone(),
+            None => return std::ptr::null_mut(),
+        }
+    };
+    let path = runtime().block_on(async move {
+        let mut guard = rx.lock().await;
+        guard.recv().await
+    });
+    match path {
+        Some(p) => match env.new_string(p) {
+            Ok(j) => j.into_raw(),
+            Err(e) => {
+                error!("nativePollReceivedFile: new_string: {e}");
+                std::ptr::null_mut()
+            }
+        },
+        None => std::ptr::null_mut(),
+    }
+}
+
+/// Monotonic transfer id for outbound `nativeSendFile` calls.
+fn next_transfer_id() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEED: AtomicU64 = AtomicU64::new(1);
+    SEED.fetch_add(1, Ordering::Relaxed)
 }
 
 #[unsafe(no_mangle)]

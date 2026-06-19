@@ -32,7 +32,27 @@ pub enum Message {
     Clipboard(ClipboardMessage),
     Input(InputMessage),
     Notification(NotificationMessage),
+    Url(UrlMessage),
     Goodbye { reason: String },
+}
+
+/// One-shot "open this URL on the peer" envelope. Carried by a
+/// dedicated `StreamKind::Url` stream: opener writes one
+/// `Message::Url(UrlMessage)` postcard frame, drops the stream.
+///
+/// Receiver behaviour is asymmetric on purpose:
+///   - Linux host: `xdg-open` the URL directly (the peer is paired
+///     hardware the user trusts as much as their own clipboard).
+///   - Android companion: post a high-priority notification asking
+///     the user whether to open — anything from a compromised peer
+///     reaching `ACTION_VIEW` without consent would otherwise let the
+///     attacker pop arbitrary intents on the device.
+///
+/// `Permission::ShareReceive` gates both directions; off → silently
+/// drop the message after logging at debug.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct UrlMessage {
+    pub url: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

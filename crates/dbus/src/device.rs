@@ -28,6 +28,7 @@ const CAP_TABLE: &[(Capabilities, &str)] = &[
     (Capabilities::NOTIFICATIONS, "notifications"),
     (Capabilities::STYLUS, "stylus"),
     (Capabilities::HEVC, "hevc"),
+    (Capabilities::SHARE, "share"),
 ];
 
 fn capability_names(caps: Capabilities) -> Vec<String> {
@@ -38,10 +39,6 @@ fn capability_names(caps: Capabilities) -> Vec<String> {
         }
     }
     out
-}
-
-fn not_yet(name: &str) -> zbus::fdo::Error {
-    zbus::fdo::Error::NotSupported(format!("{name} not implemented yet"))
 }
 
 #[interface(name = "org.gameros.Ansync1.Device")]
@@ -237,9 +234,53 @@ impl Device {
         Ok(())
     }
 
-    async fn send_file(&self, _path: String) -> zbus::fdo::Result<String> {
-        Err(not_yet("SendFile"))
+    /// Queue one or more files for delivery to the peer. Paths are
+    /// host-side absolute paths the daemon process can read. The
+    /// peer's `AutoAcceptPolicy` drops them under its own incoming
+    /// directory and surfaces a `FileReceived` signal on its side.
+    /// Returns the number of paths the daemon accepted into the
+    /// send queue (zero if the peer is offline or the action channel
+    /// is wedged).
+    async fn send_files(&self, paths: Vec<String>) -> zbus::fdo::Result<u32> {
+        let tx = self.state.actions.as_ref().ok_or_else(|| {
+            zbus::fdo::Error::Failed("daemon action channel not wired".into())
+        })?;
+        let paths: Vec<std::path::PathBuf> = paths.into_iter().map(Into::into).collect();
+        let count = paths.len() as u32;
+        tx.send(crate::state::DaemonAction::SendFiles {
+            device: self.id.clone(),
+            paths,
+        })
+        .map_err(|e| zbus::fdo::Error::Failed(format!("send action: {e}")))?;
+        Ok(count)
     }
+
+    /// Ask the peer to open a URL. Linux peers `xdg-open` it
+    /// directly; Android peers post a high-priority notification so
+    /// the user confirms before `Intent.ACTION_VIEW` fires.
+    async fn send_url(&self, url: String) -> zbus::fdo::Result<()> {
+        let tx = self.state.actions.as_ref().ok_or_else(|| {
+            zbus::fdo::Error::Failed("daemon action channel not wired".into())
+        })?;
+        tx.send(crate::state::DaemonAction::SendUrl {
+            device: self.id.clone(),
+            url,
+        })
+        .map_err(|e| zbus::fdo::Error::Failed(format!("send action: {e}")))?;
+        Ok(())
+    }
+
+    /// Fired once for every inbound file the daemon finished
+    /// receiving from this peer. `path` is the absolute host path
+    /// of the stored file (typically under
+    /// `$XDG_DATA_HOME/ansync/incoming/{peer}/`). Desktop shells +
+    /// `ansyncctl` listen here to surface a "received from <peer>"
+    /// notification.
+    #[zbus(signal)]
+    pub async fn file_received(
+        ctxt: &zbus::object_server::SignalEmitter<'_>,
+        path: &str,
+    ) -> zbus::Result<()>;
 
     /// Fired once for every `NotificationListenerService.onNotificationPosted`
     /// the companion forwards. Subscribers (e.g. a desktop notification
@@ -339,5 +380,27 @@ impl Device {
             return Ok(());
         };
         Device::stream_state_changed(iface.signal_emitter(), kind, active).await
+    }
+
+    /// Emit `FileReceived(path)` on `Device` for a peer. Called by
+    /// `daemon-core` after an inbound `Files` stream completes
+    /// successfully. No-op when the per-device interface isn't
+    /// registered yet (signal would have no subscribers anyway).
+    pub async fn emit_file_received(
+        conn: &zbus::Connection,
+        device: &DeviceId,
+        path: &str,
+    ) -> zbus::Result<()> {
+        let dev_path = crate::path_device(device);
+        let object_path = zbus::zvariant::ObjectPath::try_from(dev_path.as_str())
+            .map_err(|e| zbus::Error::Failure(format!("bad path {dev_path}: {e}")))?;
+        let Ok(iface) = conn
+            .object_server()
+            .interface::<_, Device>(object_path)
+            .await
+        else {
+            return Ok(());
+        };
+        Device::file_received(iface.signal_emitter(), path).await
     }
 }

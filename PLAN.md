@@ -421,7 +421,23 @@ Surfaceado mientras se probaba el pair WiFi + mirror lifecycle real con DMS. Cad
 
 - [ ] **N8 — Multi-host companion**
   - Companion guarda UN solo `PREF_HOST_PUBKEY_HEX` + `PREF_HOST_NAME`. User explícitamente deferreó ("nah, estamos bien por ahora").
-  - Cuando esto se requiera: refactor a `Set<HostEntry>` en SharedPreferences (JSON). HostDialer itera todos. UI para gestionar (revocar host, switch primary).
+  - Cuando esto se requiera: refactor a `Set<HostEntry>` en SharedPreferences (JSON). HostDialer itera todos. UI para gestionar (revocar host, switch primary). ShareActivity gana picker.
+
+- [x] **Share (Quick Share-style) — files + URLs bidi** (cerrado 2026-06-19)
+  - Proto: `Message::Url(UrlMessage { url })`, `StreamKind::Url` (tag 0x0b), `Permission::ShareReceive` (default on), `Capabilities::SHARE`.
+  - Host (Linux):
+    - D-Bus: `Device.SendFiles(paths: as) -> u`, `Device.SendUrl(url: s)`, signal `Device.FileReceived(path: s)`.
+    - daemon-core: `DaemonAction::{SendFiles,SendUrl}`. `handle_send_files` itera paths + abre `StreamKind::Files` por archivo + reusa `send_file`. `handle_send_url` postcard one-shot. `url_inbound_loop` gated por `Permission::ShareReceive`, ejecuta `xdg-open` sync (paired = trusted; threat model documentado en proto). `files_stream_loop` post-receive emite `FileReceived` + `notify-send` (shell out, sin libnotify dep).
+    - ansyncctl: `push <id> <paths...>` (variadic) y `url <id> <url>` ahora pasan SIEMPRE por D-Bus. QUIC dial directo + `MdnsDiscovery` runtime para `push` eliminados.
+  - Companion (Android):
+    - JNI: `nativeSendFile(path)`, `nativeSendUrl(url)`, `nativePollIncomingUrl()`, `nativePollReceivedFile()`. `streams_accept_loop` acepta `StreamKind::Url` → `url_in_loop` → mpsc → Kotlin worker. Files inbound stream loop pushea `path` post-completion al `received_files_rx`.
+    - Kotlin: `ShareActivity` (translucent) registra intent-filters `ACTION_SEND text/plain + */*` + `ACTION_SEND_MULTIPLE`. URL detect via `Patterns.WEB_URL`; arbitrary files copiados a `cacheDir/share/` (Rust side toma path filesystem). Multi-file via worker thread + per-file ok counter. `ShareTile` QSTile lanza `ShareActivity` empty → `ACTION_GET_CONTENT` picker. Receive workers en `AnsyncCompanionService` polean URL → notif "Open link from host?" + tap → `ACTION_VIEW`. File received → `MediaScannerConnection.scanFile` + notif "tap to open" via `Uri.fromFile`.
+  - Capabilities default-on en host + companion. Tile + intent-filters + receive notifs todos shipping. Multi-host picker queda gated por N8.
+
+- [ ] **N9 — Nautilus / file-manager "Send to" extension**
+  - PC side: Python extension (`Nautilus.MenuProvider`) que lista paired+online devices vía D-Bus `Manager.ListDevices` filtrado por `Device.State == Active`. Tap → `Device.SendFiles([selection])`. KDE Dolphin servicemenu equivalente (`*.desktop` en `~/.local/share/kio/servicemenus/`).
+  - Empaquetado: instalado vía `nix/package.nix` postInstall a `$out/share/nautilus-python/extensions/`. Opt-in con `services.ansync.installFileManagerExtensions = true`.
+  - No bloqueante para v1 — share funciona end-to-end vía `ansyncctl push` + Android share-sheet. Sumar cuando primer usuario lo pida.
 
 ### Notas para retomar
 

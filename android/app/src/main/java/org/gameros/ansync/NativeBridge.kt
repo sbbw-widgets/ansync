@@ -184,6 +184,35 @@ object NativeBridge {
      */
     external fun nativeSendNotificationRemoved(id: Long): Boolean
 
+    /**
+     * Push the file at `path` to the host over a fresh
+     * `StreamKind::Files` stream. Returns `true` once the transfer
+     * completes (sha256 verified + final ack). Blocking — call from a
+     * worker thread.
+     */
+    external fun nativeSendFile(path: String): Boolean
+
+    /**
+     * Push `url` to the host over a one-shot `StreamKind::Url`
+     * stream. The host's daemon shells out to `xdg-open` directly.
+     */
+    external fun nativeSendUrl(url: String): Boolean
+
+    /**
+     * Block until the next host-pushed URL arrives. Returns `null` on
+     * session teardown. Companion service surfaces a consent
+     * notification with "Open" / "Dismiss" actions per returned URL.
+     */
+    external fun nativePollIncomingUrl(): String?
+
+    /**
+     * Block until the next inbound file finishes downloading.
+     * Returns the absolute host path (under `incoming/{host}/`) or
+     * `null` on teardown. Used for "tap to open" notifications +
+     * `MediaScannerConnection.scanFile`.
+     */
+    external fun nativePollReceivedFile(): String?
+
     /** Tear the active session down. Safe to call when no session is open. */
     external fun nativeClose()
 

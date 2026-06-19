@@ -135,6 +135,34 @@
             android:exported="false"
             android:configChanges="orientation|screenSize|keyboardHidden|navigation" />
 
+        <!--
+            Share entry point: registers under the system Share sheet
+            (`ACTION_SEND` / `ACTION_SEND_MULTIPLE` for both
+            `text/plain` and arbitrary streams). The QSTile launches
+            it with no extras so it can pop ACTION_GET_CONTENT.
+            Translucent so the share-sheet flow feels native to the
+            sender app.
+        -->
+        <activity
+            android:name=".ShareActivity"
+            android:label="@string/share_label"
+            android:exported="true"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar"
+            android:excludeFromRecents="true"
+            android:noHistory="true">
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="text/plain" />
+                <data android:mimeType="*/*" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.SEND_MULTIPLE" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="*/*" />
+            </intent-filter>
+        </activity>
+
         <!-- Foreground service hosting the QUIC client, MediaProjection
              capture surface, and the audio route. Brought up by the
              user after granting MediaProjection. Step 7d wires the
@@ -246,6 +274,17 @@
             android:name=".tile.GamepadTile"
             android:label="@string/tile_gamepad_label"
             android:icon="@android:drawable/ic_menu_send"
+            android:exported="true"
+            android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
+            <intent-filter>
+                <action android:name="android.service.quicksettings.action.QS_TILE" />
+            </intent-filter>
+        </service>
+
+        <service
+            android:name=".tile.ShareTile"
+            android:label="@string/tile_share_label"
+            android:icon="@android:drawable/ic_menu_share"
             android:exported="true"
             android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
             <intent-filter>

@@ -52,6 +52,11 @@ pub enum StreamKind {
     /// each session without relying on whatever was stamped during
     /// pairing.
     Hello,
+    /// One-shot "open this URL" stream. Opener writes a single
+    /// postcard `Envelope { Message::Url(UrlMessage) }` frame and
+    /// drops the stream. Receiver decides (per platform) whether to
+    /// open silently or prompt — see `ansync_proto::UrlMessage`.
+    Url,
 }
 
 #[async_trait]

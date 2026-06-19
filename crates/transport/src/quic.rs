@@ -37,6 +37,7 @@ fn stream_kind_tag(kind: StreamKind) -> u8 {
         StreamKind::Clipboard => 0x08,
         StreamKind::Notifications => 0x09,
         StreamKind::Hello => 0x0a,
+        StreamKind::Url => 0x0b,
     }
 }
 
@@ -51,6 +52,7 @@ fn stream_kind_from_tag(tag: u8) -> Result<StreamKind, TransportError> {
         0x08 => Ok(StreamKind::Clipboard),
         0x09 => Ok(StreamKind::Notifications),
         0x0a => Ok(StreamKind::Hello),
+        0x0b => Ok(StreamKind::Url),
         _ => Err(TransportError::Handshake(format!("unknown stream tag {tag:#x}"))),
     }
 }

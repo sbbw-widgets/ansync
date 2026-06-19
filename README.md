@@ -28,6 +28,7 @@ Pre-alpha. Funcional end-to-end para los flujos principales. Roadmap completo en
   - PC → Android: pointer/keyboard via Accessibility (`dispatchGesture`).
   - Android → PC: keyboard / mouse / touchscreen MT-B / stylus / gamepad XInput-like via uinput.
 - **Transferencia de archivos** con sha256 verify + chunks de 256 KiB.
+- **Share bidi** estilo Quick Share: Android comparte via system share-sheet + QSTile "Send to PC"; PC envía via `ansyncctl push <id> <paths...>` o D-Bus `Device.SendFiles`. Links cruzan en ambas direcciones (`ansyncctl url`, Android share-sheet con URL): el peer Linux abre con `xdg-open`, el peer Android prompt antes de `ACTION_VIEW`. Inbound files emiten `Device.FileReceived` + `notify-send`.
 - **Cámara virtual** v4l2loopback con frames de Camera2 + MediaCodec H.264/H.265. Per-peer naming: cada Android paireado aparece en el picker (Chromium / Firefox / OBS / Discord) como `"<modelo> (Ansync)"` — el daemon hace ADD/REMOVE dinámico sobre `/dev/v4l2loopback` por sesión, sin pre-cargar nodes estáticos.
 - **Audio bidireccional**: cpal (Linux PipeWire/ALSA) ↔ AudioRecord/AudioTrack. 48 kHz stereo S16LE.
 - **Clipboard sync** Wayland ↔ Android ClipboardManager, con gates por device.
@@ -206,7 +207,7 @@ Flags en `$XDG_CONFIG_HOME/ansync/devices/{id}.toml`:
 screen_mirror     camera_video      camera_audio      mic
 audio_in          audio_out         files_send        files_receive
 clipboard_in      clipboard_out     input_from_device input_to_device
-notifications
+notifications     share_receive
 ```
 
 Cada acción del daemon chequea el flag antes de proceder. Defaults al pairing: `screen_mirror`, `files_send`, `files_receive`, `notifications` **on**; `clipboard_*` **prompt**; resto **off**.
