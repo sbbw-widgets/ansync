@@ -406,7 +406,11 @@ Surfaceado mientras se probaba el pair WiFi + mirror lifecycle real con DMS. Cad
   - `AnsyncCompanionService` mantiene set `activeStreams: Set<String>` (`"capture"`, `"camera"`, `"audio"`) + helper `markStream(key, active)` idempotente. Wireado en handleStartCapture/stopCapture, handleStartCamera/handleStopCamera, handleStartAudio/handleStopAudio, startAudioFromTile/stopAudioFromTile.
   - Battery cost real ~5%/h cuando on. Sin pref off → comportamiento idéntico al anterior.
 
-- [ ] **N5 — MediaSession widget activo durante mirror**
+- [x] **N5 — MediaSession widget activo durante mirror** (cerrado 2026-06-19)
+  - Nuevo `MirrorMediaSession.kt`: `MediaSession` con `FLAG_HANDLES_MEDIA_BUTTONS | FLAG_HANDLES_TRANSPORT_CONTROLS`, `PlaybackState.STATE_PLAYING`, action única "Stop" que funnels via `ACTION_STOP_CAPTURE` (mismo path que QSTile / persistent notif). Headset pause key collapsed a stop (MediaProjection sin primitive pause).
+  - Channel `ansync.media.mirror` LOW importance separado del audio channel. `NOTIFICATION_ID 6`. Title = "Mirroring to <hostLabel>" (host name desde `PREF_HOST_NAME`).
+  - `AnsyncCompanionService`: nuevo field `mirrorMediaSession`. `startMirrorMediaSession()` idempotente, llamado en post-capture-start handler. `stopCapture()` y `onDestroy` lo release/null. MediaProjection.Callback.onStop ya pasa por `stopCapture` → no doble teardown.
+  - Aditivo a persistent notif principal (R7 audio + mirror = dos MediaSessions concurrent; lock screen muestra ambas swipeable).
   - R7 ya cubre audio. Sumar widget similar para "mirror activo" — corte directo desde lock screen sin abrir notif shade.
 
 - [x] **N6 — D-Bus signal para stream state changes** (cerrado 2026-06-19)

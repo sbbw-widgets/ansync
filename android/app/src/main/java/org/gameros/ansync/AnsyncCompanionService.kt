@@ -54,6 +54,7 @@ class AnsyncCompanionService : Service() {
     private var dialer: HostDialer? = null
     private var wifiPair: WifiPairManager? = null
     private var mediaSession: AudioMediaSession? = null
+    private var mirrorMediaSession: MirrorMediaSession? = null
     private var hostNamePoller: HandlerThread? = null
     private var hostNameHandler: Handler? = null
     @Volatile private var hostNamePollRunning = false
@@ -610,6 +611,7 @@ class AnsyncCompanionService : Service() {
                         capture = session
                         markStream("capture", true)
                         setTileState(PREF_MIRROR_ACTIVE, true)
+                        startMirrorMediaSession()
                         getSystemService(NotificationManager::class.java)
                             ?.cancel(GRANT_NOTIFICATION_ID)
                         Log.i(TAG, "capture started")
@@ -629,6 +631,8 @@ class AnsyncCompanionService : Service() {
         val captureLocal = capture
         capture = null
         markStream("capture", false)
+        mirrorMediaSession?.release()
+        mirrorMediaSession = null
         val projectionLocal = projection
         projection = null
         try {
@@ -647,6 +651,16 @@ class AnsyncCompanionService : Service() {
         } catch (e: Exception) {
             Log.w(TAG, "refreshNotification threw during stop", e)
         }
+    }
+
+    /** Bring up [MirrorMediaSession] tied to the current capture
+     *  session. Title is rendered against the last host name we
+     *  learned (Hello frame → SharedPreferences). Idempotent. */
+    private fun startMirrorMediaSession() {
+        if (mirrorMediaSession != null) return
+        val host = getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .getString(PairingReceiver.PREF_HOST_NAME, null) ?: "PC"
+        mirrorMediaSession = MirrorMediaSession(this, host).also { it.start() }
     }
 
     /** QSTile-driven audio start. Re-uses [AudioRouter] but skips the
@@ -792,6 +806,8 @@ class AnsyncCompanionService : Service() {
         audio = null
         mediaSession?.release()
         mediaSession = null
+        mirrorMediaSession?.release()
+        mirrorMediaSession = null
         audioPollThread?.quitSafely()
         audioPollThread = null
         audioPollHandler = null
