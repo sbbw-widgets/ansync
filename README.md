@@ -1,70 +1,43 @@
 # ansync
 
-Integración fluida Android ↔ Linux. Pantalla, archivos, cámara, micrófono, audio, inputs, clipboard — todo sobre LAN, sin cable.
+**Your Android phone, fully connected to your Linux desktop.**
 
-## Estado
+Mirror the screen. Send files in either direction. Use the phone's camera as
+a webcam in Zoom, OBS, or Discord. Type with your PC keyboard on the phone.
+Copy from one, paste on the other. Open a link on one, watch it open on the
+other. All over Wi-Fi, no cables once paired.
 
-Pre-alpha. Funcional end-to-end para los flujos principales. Roadmap completo en [`PLAN.md`](./PLAN.md).
+It's what scrcpy could be if it grew up.
 
-| Step | Tema | Estado |
-|------|------|--------|
-| 1–6  | Skeleton + transport + crypto + discovery + video decode | ✅ |
-| 7    | Input virtual host (uinput) + companion Accessibility | ✅ |
-| 8    | File transfer push/pull | ✅ |
-| 9.5  | Integration glue (eframe window + cable pairing + D-Bus) | ✅ |
-| 10   | Camera v4l2loopback + Camera2/MediaCodec | ✅ |
-| 11   | Audio bidireccional (cpal/PipeWire ↔ AudioRecord/AudioTrack) | ✅ |
-| 12   | Clipboard sync con perm gates | ✅ |
-| 13   | BT-HID secundario via bluer | scaffold |
-| 14   | Nix module + crane derivation | ✅ |
-| 15   | Docs + README | ✅ |
-| 16   | Pure-Rust ADB (`adb_client`) | ✅ |
-| 17   | APK auto-fetch desde GitHub releases | ✅ |
+---
 
-## Features
+## What you can do with it
 
-- **Mirror** de pantalla Android → Linux con decode HW (NVENC → VAAPI → openh264 SW fallback).
-- **Control bidireccional**:
-  - PC → Android: pointer/keyboard via Accessibility (`dispatchGesture`).
-  - Android → PC: keyboard / mouse / touchscreen MT-B / stylus / gamepad XInput-like via uinput.
-- **Transferencia de archivos** con sha256 verify + chunks de 256 KiB.
-- **Share bidi** estilo Quick Share: Android comparte via system share-sheet + QSTile "Send to PC"; PC envía via `ansyncctl push <id> <paths...>` o D-Bus `Device.SendFiles`. Links cruzan en ambas direcciones (`ansyncctl url`, Android share-sheet con URL): el peer Linux abre con `xdg-open`, el peer Android prompt antes de `ACTION_VIEW`. Inbound files emiten `Device.FileReceived` + `notify-send`.
-- **Cámara virtual** v4l2loopback con frames de Camera2 + MediaCodec H.264/H.265. Per-peer naming: cada Android paireado aparece en el picker (Chromium / Firefox / OBS / Discord) como `"<modelo> (Ansync)"` — el daemon hace ADD/REMOVE dinámico sobre `/dev/v4l2loopback` por sesión, sin pre-cargar nodes estáticos.
-- **Audio bidireccional**: cpal (Linux PipeWire/ALSA) ↔ AudioRecord/AudioTrack. 48 kHz stereo S16LE.
-- **Clipboard sync** Wayland ↔ Android ClipboardManager, con gates por device.
-- **Descubrimiento** automático mDNS (`_ansync._udp.local.`).
-- **Pairing** cable ADB one-shot → llave Ed25519 long-term persistida. Sin PIN: el cable es la garantía de seguridad.
-- **Crypto E2E**: QUIC (`quinn`) + `rustls` con pinning Ed25519. Cero OpenSSL, cero ffmpeg.
+- **Mirror your phone screen** to a window on your desktop.
+- **Click, type, and drag** on that window — the phone responds.
+- **Use the phone's camera as a webcam** in any Linux app that picks a v4l2
+  camera (Chromium-based browsers, Firefox, OBS Studio, Discord, Zoom, Google
+  Meet, ...). The phone shows up by its actual model name in the camera picker.
+- **Use the phone's microphone** as a Linux audio source.
+- **Hear PC audio on the phone** (and vice versa) over the same Wi-Fi link.
+- **Send a file from anywhere on Linux** to the phone (`ansyncctl push file.pdf`)
+  or via a desktop file-manager menu.
+- **Share files from the phone to the PC** using Android's built-in share
+  sheet — pick "Send via ansync".
+- **Share a link in either direction**: it opens automatically on the other
+  side (the phone asks first, the PC opens it straight away).
+- **Sync the clipboard** both ways: copy on the phone, paste on the PC.
+- **See phone notifications** on the desktop, mirrored in real time.
 
-## Arquitectura
+Everything is end-to-end encrypted between your phone and your computer.
+No cloud, no Anthropic account, no Google account — once paired, the two
+devices find each other on your home Wi-Fi and talk directly.
 
-```
-┌──────────────────────────────────────────────────────────┐
-│  ansyncd  (daemon + GUI eframe)                          │
-│  ├── QUIC server (rustls + Ed25519 pinning)              │
-│  ├── mDNS announcer                                       │
-│  ├── D-Bus surface (org.gameros.Ansync1)                  │
-│  ├── MirrorRegistry / CameraRegistry / AudioRegistry      │
-│  └── Per-peer: input session (uinput) / sinks             │
-└──────────────────────────────────────────────────────────┘
-                          │ QUIC streams (multiplexed)
-┌──────────────────────────────────────────────────────────┐
-│  companion (Kotlin + Rust cdylib via JNI)                │
-│  ├── MediaProjection capture → H.264                     │
-│  ├── Camera2 → H.264 / H.265                             │
-│  ├── AudioRecord / AudioTrack                            │
-│  ├── ClipboardManager bridge                             │
-│  └── AccessibilityService (gesture replay)               │
-└──────────────────────────────────────────────────────────┘
-```
+---
 
-Stream kinds: `Control`, `Video`, `Audio`, `Files`, `Fs`, `Input`, `Camera`, `Clipboard`. Cada uno es una QUIC bidi stream con un byte de tag al inicio. Opener escribe, accepter lee.
+## Install
 
-Todos los backends (audio, cámara, input, transporte, descubrimiento, FS, clipboard) están detrás de traits para sumar implementaciones (ALSA, JACK, PipeWire-camera, BT-HID, relay NAT) sin tocar el resto.
-
-Codecs vía [ferricast](../../ferricast) — NVENC, VAAPI, openh264 SW fallback. **Cero ffmpeg, cero OpenSSL.**
-
-## Install (NixOS)
+### NixOS (recommended)
 
 ```nix
 {
@@ -77,7 +50,7 @@ Codecs vía [ferricast](../../ferricast) — NVENC, VAAPI, openh264 SW fallback.
         {
           services.ansync = {
             enable = true;
-            user = "alice";
+            user = "alice";          # whichever user runs the desktop
           };
         }
       ];
@@ -86,152 +59,275 @@ Codecs vía [ferricast](../../ferricast) — NVENC, VAAPI, openh264 SW fallback.
 }
 ```
 
-El módulo carga uinput + v4l2loopback, agrega `alice` a los grupos `input`/`video`, abre los puertos firewall que el daemon necesita (UDP `47215` QUIC + UDP `5353` mDNS), e instala el systemd user unit (`systemctl --user enable ansyncd`). El puerto QUIC se override con `services.ansync.quicPort = N;` y el firewall se puede desactivar con `services.ansync.openFirewall = false;` si lo gestionás vos en otro módulo.
+Rebuild your system, log out and back in. The daemon (`ansyncd`) starts
+automatically with your desktop session.
 
-home-manager (sin NixOS):
+Home Manager (non-NixOS distros that already use Home Manager):
 
 ```nix
 home.imports = [ ansync.homeManagerModules.default ];
 programs.ansync.enable = true;
 ```
 
-## Install (manual)
+### Other Linux distros
 
-Requisitos: PipeWire (o ALSA), v4l2loopback, BlueZ, D-Bus, wl-clipboard.
+The daemon ships as a single binary. You'll need a few things from your
+package manager first:
+
+- PipeWire (or ALSA)
+- `v4l2loopback` kernel module
+- `wl-clipboard` (Wayland) or `xclip` (X11)
+- `xdg-utils` (so links open via `xdg-open`)
+
+Then:
 
 ```sh
-nix develop
+nix develop           # or set up Rust 1.85+ and pkg-config / libclang manually
 cargo build --release
 sudo install -Dm755 target/release/ansyncd /usr/local/bin/ansyncd
 sudo install -Dm755 target/release/ansyncctl /usr/local/bin/ansyncctl
 sudo install -Dm644 bins/ansyncd/contrib/60-ansync-uinput.rules /etc/udev/rules.d/
 sudo udevadm control --reload-rules && sudo udevadm trigger
 sudo modprobe v4l2loopback devices=0
-sudo chgrp video /dev/v4l2loopback && sudo chmod 0660 /dev/v4l2loopback
-sudo usermod -aG input,video $USER
+sudo usermod -aG input,video $USER     # log out / log back in
 ```
 
-### Firewall
-
-El companion descubre el daemon por mDNS y dialea por QUIC sobre UDP. Si el firewall del host bloquea esos paquetes, el device aparece para siempre como `Disconnected` aunque mDNS/announce funcione (la conexión QUIC inbound nunca completa el handshake).
-
-Puertos a abrir en el host:
-
-| Proto | Puerto | Para qué |
-|-------|--------|----------|
-| UDP   | `47215` | QUIC server del daemon (companion → host). Override con `services.ansync.quicPort` o flag `--listen 0.0.0.0:<port>` al daemon. |
-| UDP   | `5353`  | mDNS (anuncio + browse). Compartido con cualquier otro stack zeroconf en el host (Avahi, etc.). |
-
-Con el módulo NixOS de arriba ambos se abren automático (`services.ansync.openFirewall = true` por default). Manual con firewall de NixOS:
-
-```nix
-networking.firewall.allowedUDPPorts = [ 5353 47215 ];
-```
-
-`firewalld` / `ufw` / `iptables` raw:
+Make sure your firewall lets UDP `5353` (mDNS) and UDP `47215` (the daemon's
+encrypted port) through:
 
 ```sh
+# firewalld
 sudo firewall-cmd --add-port=47215/udp --permanent && sudo firewall-cmd --reload
-# o
+# ufw
 sudo ufw allow 47215/udp
-# o (run-time, no persiste)
-sudo iptables -I INPUT -p udp --dport 47215 -j ACCEPT
 ```
 
-## Pair
+If you used the NixOS module, the firewall is already open.
 
-Conectá el Android vía USB con depuración habilitada. Una sola sesión:
+### Android companion app
+
+You install the companion app **once, from your PC**, the first time you
+pair. There is no need to download an APK by hand — see the next section.
+
+---
+
+## First pair (one-time setup)
+
+1. On the phone: enable **Developer Options** (tap the build number 7 times
+   in Settings) and turn on **USB Debugging**.
+2. Plug the phone into the PC with a USB cable.
+3. On the PC, run:
+
+   ```sh
+   ansyncctl pair
+   ```
+
+That's it. Behind the scenes, ansync downloads the latest companion app, installs it, exchanges encryption keys, grants the required permissions, and registers the phone with the daemon. The whole thing takes about 15 seconds.
+
+After this, **unplug the cable**. The two devices find each other on your
+Wi-Fi from now on.
+
+You'll see a setup notification on the phone walking you through one-time
+grants (screen capture access, accessibility for remote input,
+notification access). Tap through them once and they're remembered.
+
+---
+
+## How to use it
+
+Once the phone is paired and on the same Wi-Fi:
+
+### Mirror the phone's screen
+
+From your PC:
 
 ```sh
-ansyncctl pair
-```
+# Find the device id (32 hex characters)
+ansyncctl devices
 
-Lo que pasa:
-1. `ansyncctl` descubre el device via `adb_client` (sin shell-out al binario `adb`).
-2. Chequea si `org.gameros.ansync` está instalado. Si falta, fetcha el APK más reciente desde `github.com/SergioRibera/ansync/releases/latest` (cache en `$XDG_CACHE_HOME/ansync/`) y lo instala con `-r -g`.
-3. Configura `adb reverse tcp:N tcp:N`, manda un broadcast `org.gameros.ansync.action.PAIR` para despertar al companion sin abrir la app.
-4. Bootstrap Ed25519 sobre el cable, persistido en `$XDG_DATA_HOME/ansync/peers/{device_id}.toml`.
-5. Si el daemon está corriendo, le pega un `Manager.RefreshPeers` D-Bus para que registre el nuevo Device sin restart.
-
-Después del pair, en el companion aparece "Connect to {hostname} ({IP})" cuando el daemon está visible vía mDNS.
-
-## D-Bus surface
-
-```
-Service: org.gameros.Ansync1
-
-/org/gameros/Ansync1/Manager
-  ListDevices() → a(s)
-  ForgetDevice(id: s)
-  RefreshPeers()
-  → Signals: DeviceAdded(id) / DeviceRemoved(id)
-
-/org/gameros/Ansync1/Device/{id}
-  Props (RO): Id, Name, State, Capabilities, BatteryLevel, Address
-  ShowScreen() / HideScreen()
-  StartCamera(camera_id, w, h, fps, bitrate_kbps, codec, aspect, stabilization)
-  StopCamera()
-  StartMicrophone() / StopMicrophone()
-  StartAudioRoute(direction) / StopAudioRoute()
-  SyncClipboard()
-  SendFile(path) / Mount(path) / Unmount()
-
-/org/gameros/Ansync1/Permissions/{id}
-  Get(flag) / Set(flag, value) / Reset()
-  → Signal: PermissionChanged(flag, value)
-```
-
-Ejemplo: levantar mirror window y empujar la cámara trasera del peer al device virtual `/dev/video10`:
-
-```sh
-DEV_ID=$(gdbus call --session \
-  --dest org.gameros.Ansync1 \
-  --object-path /org/gameros/Ansync1/Manager \
-  --method org.gameros.Ansync1.Manager.ListDevices | grep -oE '[0-9a-f]{32}' | head -1)
-
+# Open the mirror window
 gdbus call --session --dest org.gameros.Ansync1 \
-  --object-path /org/gameros/Ansync1/Device/$DEV_ID \
+  --object-path /org/gameros/Ansync1/Device/<ID> \
   --method org.gameros.Ansync1.Device.ShowScreen
+```
 
+A window pops up with the phone's screen. Click, drag, type — the phone
+responds in real time. Close the window to stop.
+
+(A friendly GUI / system-tray launcher is planned — for now, the GNOME
+extension and KDE plasmoid in the works are the easy path; the
+`gdbus` invocation is the underlying mechanism.)
+
+### Use the phone as a webcam
+
+```sh
 gdbus call --session --dest org.gameros.Ansync1 \
-  --object-path /org/gameros/Ansync1/Device/$DEV_ID \
+  --object-path /org/gameros/Ansync1/Device/<ID> \
   --method org.gameros.Ansync1.Device.StartCamera \
-  "0" 1280 720 30 4000 "h264" "letterbox" false
+  "0" 1920 1080 30 6000 "h264" "letterbox" false
 ```
 
-## Permisos por device
+Now open Chromium, Firefox, OBS, Discord, Meet, ... and pick the camera
+**`<Your Phone> (Ansync)`** in the device list. Done.
 
-Flags en `$XDG_CONFIG_HOME/ansync/devices/{id}.toml`:
+Lens id `"0"` is the rear camera on most phones; `"1"` is the front. The
+five numbers are `width height fps bitrate-kbps`, then codec
+(`h264` or `h265`), aspect (`crop` / `letterbox` / `stretch`), and whether
+to enable image stabilisation (`true` / `false`).
 
+Stop with `StopCamera`.
+
+### Use the phone's microphone
+
+```sh
+gdbus call --session --dest org.gameros.Ansync1 \
+  --object-path /org/gameros/Ansync1/Device/<ID> \
+  --method org.gameros.Ansync1.Device.StartMicrophone
 ```
-screen_mirror     camera_video      camera_audio      mic
-audio_in          audio_out         files_send        files_receive
-clipboard_in      clipboard_out     input_from_device input_to_device
-notifications     share_receive
+
+A new PipeWire source appears: pick it in your audio settings. Stop with
+`StopMicrophone`.
+
+### Send files PC → phone
+
+```sh
+ansyncctl push <device-id> ~/Documents/notes.pdf ~/Pictures/cat.png
 ```
 
-Cada acción del daemon chequea el flag antes de proceder. Defaults al pairing: `screen_mirror`, `files_send`, `files_receive`, `notifications` **on**; `clipboard_*` **prompt**; resto **off**.
+The phone gets a notification you can tap to open the file.
 
-Toggle vía `ansyncctl perm <id> <flag> on|off` o D-Bus `Permissions.Set`.
+### Send files phone → PC
+
+On the phone, open any file (a photo, a PDF, anything), tap the
+**Share** button, and choose **Send via ansync** from the share sheet.
+A desktop notification appears on the PC when it arrives.
+
+You can also tap the **Send to PC** Quick Settings tile on the phone to
+pick any file without opening a specific app.
+
+### Send a link in either direction
+
+PC → phone:
+
+```sh
+ansyncctl url <device-id> "https://example.com"
+```
+
+The phone shows a "Open this link from your PC?" notification — tap and
+the link opens.
+
+Phone → PC: just share the link from any app via **Send via ansync**. It
+opens immediately on your desktop (the phone is already trusted).
+
+### Clipboard, notifications
+
+Both sync automatically once you're paired. You can tighten or loosen what
+gets shared per-device under **Permissions** (see below).
+
+---
+
+## Permissions
+
+Every feature is gated per device. The first time you pair, the safe
+defaults are on: screen mirror, file transfer, notifications, clipboard.
+Things that grant access to hardware (camera, microphone, virtual
+keyboard / mouse) start **off** — flip them on explicitly.
+
+```sh
+ansyncctl perm <device-id> camera_video on
+ansyncctl perm <device-id> mic on
+```
+
+Or edit `~/.config/ansync/devices/<device-id>.toml` directly.
+
+Available switches:
+
+| Switch              | What it controls |
+|---------------------|------------------|
+| `screen_mirror`     | Mirror the phone's screen on the PC |
+| `camera_video`      | Use the phone's camera as a webcam |
+| `camera_audio`      | Audio track from the phone's camera (with video) |
+| `mic`               | Use the phone's microphone on the PC |
+| `audio_in`          | Phone → PC audio (e.g. play phone audio on PC) |
+| `audio_out`         | PC → phone audio (e.g. play music on phone) |
+| `files_send`        | PC sends files to phone |
+| `files_receive`     | PC receives files from phone |
+| `clipboard_in`      | Phone clipboard appears on PC |
+| `clipboard_out`     | PC clipboard appears on phone |
+| `input_from_device` | Phone can control the PC's keyboard / mouse |
+| `input_to_device`   | PC can control the phone (mirror clicks) |
+| `notifications`     | Phone notifications appear on PC |
+| `share_receive`     | Accept shared files / links from the phone |
+
+---
 
 ## Troubleshooting
 
-- `ansyncd` se queja de `BackendUnavailable` para camera → `v4l2loopback` no cargado, o el daemon no puede abrir `/dev/v4l2loopback`. `lsmod | grep v4l2loopback`, `ls -l /dev/v4l2loopback` (debe ser group `video` y el user del daemon en ese grupo). Si el módulo está en modo estático legacy (`devices=N video_nr=...`) el daemon usa scan + reusa el node pre-creado, pero pierde el per-peer label — recargar con `devices=0` para activar el modo dinámico.
-- Mirror window vacía → companion no abrió `StreamKind::Video` aún. Botón "Start screen capture" en el app, grant MediaProjection.
-- Pair falla con "companion did not connect in time" → el broadcast `am broadcast PAIR` no llegó al `PairingReceiver`. `adb shell pm list packages org.gameros.ansync` para verificar install. El log del companion sale en `adb logcat -s ansync*`.
-- Audio mudo → `pactl list short sinks` debería mostrar la default donde cpal escribe. Para route inverso, el RECORD_AUDIO runtime perm tiene que estar grant-ed en el companion.
-- Device pegado en `Disconnected` aunque el daemon log muestre `companion reachable on LAN` → firewall del host está dropeando el QUIC inbound. Verificá que UDP `47215` esté abierto (ver § Firewall). Con NixOS módulo, asegurate de tener `services.ansync.openFirewall = true` (default). Con firewall externo (router / AP isolation / corporate VLAN) el companion mDNS-resuelve pero los paquetes UDP nunca llegan al daemon.
+**The phone never connects** ("Disconnected" forever, even after pair).
+Make sure UDP `47215` is open on your PC's firewall. On NixOS with the
+module enabled this is automatic.
 
-## Logs
+**Camera picker doesn't show "(Ansync)"**. Check `lsmod | grep v4l2loopback`.
+If you see the module loaded with `devices=N video_nr=...`, reload it with
+`devices=0`: `sudo modprobe -r v4l2loopback && sudo modprobe v4l2loopback devices=0`.
+The dynamic mode gives every paired phone its own named entry.
+
+**Microphone silent or no sound coming through**. Open Settings → Sound on
+the phone, confirm RECORD_AUDIO is granted to the ansync companion. On the
+PC, `pactl list short sinks` should list the ansync sink.
+
+**Mirror window opens but is blank**. On the phone, tap the "Mirroring to
+PC" tile in Quick Settings (or pull down the shade and grant screen capture
+from the heads-up notification).
+
+**Pair fails with "companion did not connect in time"**. Make sure USB
+debugging is enabled and the cable is data-capable. Some charge-only
+cables look fine but don't carry data.
+
+**Logs**
 
 ```sh
-# host
-journalctl --user -u ansyncd -f
-
-# companion
-adb logcat -s ansync ansync.svc ansync.camera ansync.audio ansync.capture ansync.clip
+journalctl --user -u ansyncd -f                                 # PC daemon
+adb logcat -s ansync ansync.svc ansync.camera ansync.audio       # phone
 ```
 
-## Licencia
+---
+
+## How it works (one-paragraph version)
+
+The PC runs a small daemon (`ansyncd`) that listens for the phone on the
+local network. The phone runs a background service that finds the daemon
+over mDNS and connects with QUIC (the same encrypted transport HTTP/3
+uses). The keys exchanged when you paired are pinned on both ends, so
+nothing but those two specific devices can decrypt the traffic. Every
+feature — screen, camera, audio, files, clipboard — is a separate
+multiplexed stream on that single QUIC connection.
+
+No cloud. No accounts. No telemetry. No ffmpeg, no OpenSSL — codecs are
+hardware NVENC / VAAPI with a pure-Rust software fallback, and crypto is
+`rustls` with custom public-key pinning.
+
+---
+
+## For developers
+
+The full design notes, roadmap, and per-feature breakdown live in
+[`PLAN.md`](./PLAN.md). The session-to-session conventions for working on
+the codebase live in [`CLAUDE.md`](./CLAUDE.md). The Android companion
+app's build / layout notes are in [`android/README.md`](./android/README.md).
+
+The codebase is a Rust workspace (`crates/*` for libraries, `bins/*` for
+the daemon and CLI) plus a Kotlin Android app under `android/` that links
+a Rust cdylib via JNI.
+
+```sh
+nix develop                # all build deps
+cargo build --workspace
+cargo test  --workspace
+```
+
+Pull requests welcome.
+
+## Licence
 
 MIT OR Apache-2.0
