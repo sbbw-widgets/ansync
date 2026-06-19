@@ -7,9 +7,6 @@ package org.gameros.ansync
  */
 const val PREFS = "ansync_prefs"
 
-/** Persisted `Uri` (as String) for the SAF tree the FS server walks. */
-const val PREF_TREE_URI = "shared_tree_uri"
-
 /** Persisted host TCP address (`host:port`) for the LAN fallback dial. */
 const val PREF_HOST_ADDR = "host_addr"
 

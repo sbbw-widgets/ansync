@@ -22,12 +22,10 @@ const CAP_TABLE: &[(Capabilities, &str)] = &[
     (Capabilities::AUDIO_IN, "audio_in"),
     (Capabilities::AUDIO_OUT, "audio_out"),
     (Capabilities::FILES, "files"),
-    (Capabilities::FILES_MOUNT, "files_mount"),
     (Capabilities::CLIPBOARD, "clipboard"),
     (Capabilities::INPUT_FROM_DEV, "input_from_device"),
     (Capabilities::INPUT_TO_DEV, "input_to_device"),
     (Capabilities::NOTIFICATIONS, "notifications"),
-    (Capabilities::SENSORS, "sensors"),
     (Capabilities::STYLUS, "stylus"),
     (Capabilities::HEVC, "hevc"),
 ];
@@ -241,33 +239,6 @@ impl Device {
 
     async fn send_file(&self, _path: String) -> zbus::fdo::Result<String> {
         Err(not_yet("SendFile"))
-    }
-
-    /// Ask the companion to share its filesystem. Sends a
-    /// `ControlMessage::RequestFileAccess` over the existing QUIC
-    /// connection; the device side either silently brings up its
-    /// SAF-backed FS server (if a tree URI was previously picked)
-    /// or posts a notif asking the user to pick a folder.
-    ///
-    /// The `mountpoint` argument is kept in the signature for
-    /// forward compat but ignored today — auto-mount handles the
-    /// host-side mount path.
-    async fn mount(&self, _mountpoint: String) -> zbus::fdo::Result<()> {
-        let tx = self.state.actions.as_ref().ok_or_else(|| {
-            zbus::fdo::Error::Failed("daemon action channel not wired".into())
-        })?;
-        tx.send(DaemonAction::MountFiles { device: self.id.clone() })
-            .map_err(|e| zbus::fdo::Error::Failed(format!("send action: {e}")))?;
-        Ok(())
-    }
-
-    async fn unmount(&self) -> zbus::fdo::Result<()> {
-        let tx = self.state.actions.as_ref().ok_or_else(|| {
-            zbus::fdo::Error::Failed("daemon action channel not wired".into())
-        })?;
-        tx.send(DaemonAction::UnmountFiles { device: self.id.clone() })
-            .map_err(|e| zbus::fdo::Error::Failed(format!("send action: {e}")))?;
-        Ok(())
     }
 
     /// Fired once for every `NotificationListenerService.onNotificationPosted`

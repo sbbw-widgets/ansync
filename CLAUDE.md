@@ -1,6 +1,6 @@
 # ansync — Claude instructions
 
-Reescritura de scrcpy en Rust con scope ampliado: mirror de pantalla, control bidireccional, transferencia y montaje FUSE de archivos, cámara/micrófono virtuales, audio bidireccional, clipboard sync, descubrimiento mDNS, pairing seguro con Ed25519 + Noise XX sobre QUIC.
+Reescritura de scrcpy en Rust con scope ampliado: mirror de pantalla, control bidireccional, transferencia de archivos, cámara/micrófono virtuales, audio bidireccional, clipboard sync, descubrimiento mDNS, pairing seguro con Ed25519 + Noise XX sobre QUIC.
 
 **Lee [`PLAN.md`](./PLAN.md) para el roadmap canónico, decisiones cerradas y estado de cada step.** Este archivo es la guía rápida para sesiones nuevas.
 
@@ -15,7 +15,7 @@ nix/         módulos NixOS / home-manager y derivaciones de build
 
 ## Reglas duras
 
-- **Traits primero**. Cada backend (`AudioBackend`, `VirtualCameraSink`, `VirtualInputDevice`, `Transport`, `Discovery`, `RemoteFsBackend`, `ClipboardBackend`, `PermissionsStore`) es un trait. Impls concretas detrás de feature flags. Esto permite sumar ALSA/JACK/PipeWire-camera/BT-HID/relay-NAT más adelante sin tocar al resto.
+- **Traits primero**. Cada backend (`AudioBackend`, `VirtualCameraSink`, `VirtualInputDevice`, `Transport`, `Discovery`, `ClipboardBackend`, `PermissionsStore`) es un trait. Impls concretas detrás de feature flags. Esto permite sumar ALSA/JACK/PipeWire-camera/BT-HID/relay-NAT más adelante sin tocar al resto.
 - **Permisos por dispositivo**. Cualquier acción que toque hardware, red u IO chequea `DevicePermissions` antes de proceder. Sin flag = `Error::PermissionDenied(Permission)`. Persistencia: `$XDG_CONFIG_HOME/ansync/devices/{id}.toml`.
 - **Sin ffmpeg**. Codecs vía `ferricast-encoder` / `ferricast-decoder` (NVENC, VAAPI, openh264). HEVC se extiende en ferricast — ver Step 5 del roadmap.
 - **Sin OpenSSL**. `rustls` con `default-features = false`, root store vacío, custom verifier que pinea al pubkey Ed25519 del peer.
@@ -57,8 +57,7 @@ El `flake.nix` pinea `nixpkgs` a `549bd84d6279f9852cae6225e372cc67fb91a4c1` para
 - **7e cerrado** — `AnsyncAccessibilityService` con `HandlerThread` dedicado polling `nativePollInputMessage()`. Wire format Rust→Kotlin: flat tag+payload binary (`encode_for_kotlin` en lib.rs ↔ `WireInputMessage.decode` en Kotlin) — schema en dos lugares, comentario forzando cambios paralelos. TouchSlot → `dispatchGesture(GestureDescription.StrokeDescription)` 16 ms. KeyPress / system actions wired si se necesitan a futuro. Mouse / Gamepad descartados silenciosamente (no aplica al device).
 - **Step 7 cerrado**. Pendiente: testing real con companion en device (no validable desde dev shell).
 - **Step 8 cerrado** — `ansync_files::transfer` con `send_file`/`receive_file` state machines (Offer + sha256 → Accept/Reject → Chunks 256 KiB → Complete + verify). `InboundPolicy` trait + `AutoAcceptPolicy` defaultea a `{root}/{peer_id}/{safe_name}`. Permission gates `FilesSend`/`FilesReceive` re-chequeados por chunk. Daemon accept `StreamKind::Files` → `files_stream_loop`. Companion cdylib expone `files_accept_loop` con `PermissivePermissions` in-memory store. `ansyncctl push <id> <path> [--addr] [--seconds]` direct dial bypass D-Bus.
-- **Step 9 host side cerrado (9a-9c)** — `FsOpMessage` extendido (Create/Unlink/Rename/Truncate/Chmod + Ok). `ansync_files::fs::{client,cache,fuse_mount}`: sequential RPC client + TTL metadata cache (stat 5s, readdir 5s, negative 1s, sin cache de contenido) + `FuseMount<S>: fuser::Filesystem`. Daemon auto-mount al connect si `Permission::FilesMount` ON, monta en `$XDG_RUNTIME_DIR/ansync/mounts/{name}/`. `nix/fuse.nix` partial. 4 tests del cache pasan.
-- **Step 9 cerrado end-to-end** — Companion native `streams_accept_loop` demuxa Files/Fs; `fs_serve_loop` sequencial postcard ↔ tag-binary bridge. JNI `nativePollFsRequest()` blocking + `nativeFsReply()`. Kotlin `FsOpCodec` espejo + `AnsyncFsServer` worker thread → SAF `DocumentsContract` ops. `stat`/`readdir`/`open`/`read`/`close` shipping; mutaciones devuelven ENOSYS (follow-up). `MainActivity` picker `ACTION_OPEN_DOCUMENT_TREE` + `takePersistableUriPermission` + SharedPreferences persist. `AnsyncCompanionService` arranca server si hay tree URI.
+- **Step 9 (FUSE + SAF) dropped 2026-06-19** — Toda la FS RPC + FUSE host-side + SAF server companion-side retirados (proto `FsOpMessage`/`FsMeta`/`FsEntry`, `ansync_files::fs`, `nix/fuse.nix`, `AnsyncFsServer.kt`, `FsOpCodec.kt`, `GrantStorageActivity.kt`, JNI `nativePollFsRequest`/`nativeFsReply`/`nativePollFileControl`). File transfer push/pull (Step 8) sigue siendo el surface oficial. Also dropped: `Capabilities::SENSORS` + `Permission::Sensors` (sin demanda real).
 - **Step 9.5 arrancado (glue integration)**:
   - **9.5a cerrado** — Renderer `MirrorApp`/`FrameSlot`/`run` movido a `ansync_video::sink_egui`. Daemon-core `video_stream_loop` decode H.264 → push a slot per-peer en `MirrorRegistry`. `ansyncd` lib-side ahora solo tiene el feeder Annex-B dev-only.
   - **9.5b cerrado** — `DaemonAction::{ShowScreen,HideScreen}` enum + `UnboundedSender` en `DaemonState`. D-Bus `Device.ShowScreen` envía action; `action_loop` spawnea thread con `sink_egui::run(title, slot)`. Window thread separado del tokio runtime. Ya se puede probar: pairing manual + `dbus-send` para ShowScreen + companion empujando Video.
@@ -68,15 +67,14 @@ El `flake.nix` pinea `nixpkgs` a `549bd84d6279f9852cae6225e372cc67fb91a4c1` para
   - **9.5e cerrado** — `TouchpadActivity` Compose full-screen MotionEvent capture → `WireInputMessage.encode()` tag-binary → `nativeSendInputMessage(blob)`. Native `decode_input_from_kotlin` → postcard → outbound Input stream lazy-open. Touch-down → MouseButton{1,true}, move → MouseMove{dx,dy}, up → MouseButton{1,false}.
   - **9.5e+ cerrado (device→host completo)** — TouchpadActivity gana long-press (>450 ms estacionario) → `MouseButton{2}`, 2-finger drag → `MouseWheel` (Δy /8 wheel ticks, Y-up positivo), 2-finger tap (<200 ms, sin movimiento) → `MouseButton{3}`. TOOL_TYPE_STYLUS detecta el pen y emite `Stylus` (x/y a 0..32767 escalado al canvas, pressure 0..8191, tiltX/tiltY de `AXIS_TILT`+orient, BUTTON_STYLUS_PRIMARY/SECONDARY → btn bits). Hardware kbd via `dispatchKeyEvent` override → `KeyPress`; soft IME via `BasicTextField` invisible + onValueChange sintetiza press/release por char (auto-shift mayúsculas + ASCII shifted punctuation). Nueva `GamepadActivity` + `GamepadTile`: overrides `dispatchKeyEvent` + `dispatchGenericMotionEvent` (SOURCE_JOYSTICK axes X/Y/Z/RZ + LTRIGGER/RTRIGGER fallback BRAKE/GAS) → emite `Gamepad` con bitmask 11-button mirror de `GP_BTN_LIST` (A/B/Y/X/L1/R1/Select/Start/Mode/ThumbL/ThumbR). DPAD + L2/R2-como-button drop silencioso (proto sin slots de hat axes, L2/R2 cubierto via triggers). Nuevo `KeycodeMap.kt` traduce Android KEYCODE_* → evdev KEY_*. WireInputMessage Kotlin encode arms Stylus/Gamepad ya no tiran. Rust `decode_input_from_kotlin` cubre tags 5+6 con helpers `take_u16`/`take_i16`.
 - **Step 9.5 cerrado end-to-end**. Ya se puede:
-  1. Daemon corriendo (`ansyncd` con FUSE + uinput perms + identity inicial).
+  1. Daemon corriendo (`ansyncd` con uinput perms + identity inicial).
   2. `ansyncctl pair --serial XXX` con Android conectado vía USB → auto-wake del companion vía broadcast → bootstrap → ambos lados persistidos.
   3. Restart daemon (D-Bus surface ve nuevo peer).
   4. Companion app → "Start screen capture" → MediaProjection grant → push H.264 → daemon decode + slot.
   5. `dbus-send` o `gdbus call /org/gameros/Ansync1/Device/{id} org.gameros.Ansync1.Device.ShowScreen` → ventana eframe + outbound Input.
   6. Click en ventana host → TouchSlot al Android → AccessibilityService dispatchGesture.
   7. Companion "Open touchpad" → MotionEvent → daemon uinput Mouse.
-  8. FUSE auto-mount si `files_mount` perm on; ls del mount → SAF.
-  9. `ansyncctl push id path` → transferencia + sha256 verify.
+  8. `ansyncctl push id path` → transferencia + sha256 verify.
 - **Post-9.5 gap closers (UX scrcpy-level)**:
   - **D-Bus dynamic registration** — `Manager.RefreshPeers()` D-Bus method; `ansyncctl pair` lo llama post-store.put. No más restart del daemon después de pair.
   - **Auto-install APK durante pair** — `pair_host_via_adb` ahora chequea `pm list packages` y corre `adb install -r -g` si el companion no está. CLI flag `--apk` o env `ANSYNC_COMPANION_APK` o default `/usr/share/ansync/companion.apk`. UX idéntica a scrcpy modulo path al APK.
@@ -107,7 +105,7 @@ El `flake.nix` pinea `nixpkgs` a `549bd84d6279f9852cae6225e372cc67fb91a4c1` para
   - `ansync_input::bt_hid::BtHidFactory` impl `InputDeviceFactory` (feature `bt-hid`). `BtHidDevice` abre `bluer::Session` + adapter + powered=true, loguea HID reports. Profile registration (SDP + L2CAP control/interrupt) deferred.
 - **Step 14 cerrado** — Nix module + crane:
   - `nix/package.nix` crane build, instala udev rule + systemd unit a `$out`.
-  - `nix/module.nix` consolida imports de uinput/fuse/v4l2loopback partials. Opciones `services.ansync.{enable,user,package,extraGroups}`. Suma user a `input`/`video`/`fuse`. Systemd user unit con sandboxing.
+  - `nix/module.nix` consolida imports de uinput/v4l2loopback partials. Opciones `services.ansync.{enable,user,package,extraGroups}`. Suma user a `input`/`video`. Systemd user unit con sandboxing.
   - `nix/hm-module.nix` fallback home-manager para no-NixOS.
   - `flake.nix` expone `nixosModules.default`, `homeManagerModules.default`, `packages.default`, apps `ansyncd`/`ansyncctl`.
   - `flake.nix` dev-shell gana `alsa-lib`.
@@ -140,7 +138,7 @@ El `flake.nix` pinea `nixpkgs` a `549bd84d6279f9852cae6225e372cc67fb91a4c1` para
 - **Retoques finales (post-roadmap)**:
   - **Bloqueantes cerrados**: R1 (APK upgrade flow: `--auto-upgrade` / `--skip-upgrade-check` + prompt), R2 (audio loops perm gates per-chunk), R4 (notifications wired: `StreamKind::Notifications` 0x09 + D-Bus signals `Device.NotificationPosted/Removed` + companion `NotificationForwarder` + JNI `nativeSendNotificationPosted/Removed`), R9 (`nix build .#default` verde — ferricast pasó a git dep `db0f7531`, drop path dep), R12 (cleanup auto-cerrado por R2).
   - **Cerrados además**: R5 (SAF write/create/unlink/rename/truncate via DocumentsContract; chmod queda ENOSYS; cross-dir rename → EXDEV), R6 (`InputBackend{Uinput,BtHid}` enum + factory selection; HID Boot reports KB 8-byte, Mouse 4-byte, Gamepad 8-byte; L2CAP PSM 0x11/0x13 SeqPacket listeners; SDP Profile1 registration documentado como follow-up), R11 (clipboard blob bidi: image MIMEs via MediaStore.Images.insert + `nativeSendClipboardBlob` / `nativePollClipboardBlob`).
-  - **Pendientes** (deliberately skipped): R3 (botón push clipboard host), R7 (MediaSession widget audio), R10 (sensors stream).
+  - **Pendientes** (deliberately skipped): R3 (botón push clipboard host), R7 (MediaSession widget audio).
   - **R8 cerrado (sesión 2026-06-18)** — v4l2loopback per-peer card_label vía `V4L2LOOPBACK_CTL_ADD` ioctl sobre `/dev/v4l2loopback`. Nuevo `ansync_camera::dyn_ctl` (libc::ioctl directo, struct layout pinned a v4l2loopback 0.15.x + static_assert size 72, version gate >= 0.15 antes de ADD). `V4l2LoopbackSink::register` ahora dyn-add con label `"<peer_name> (Ansync)"` (UTF-8 truncado a 31 bytes en char boundary), fallback a static scan si control device missing. `unregister` REMOVE owned node (drop fd antes para evitar EBUSY). `nix/v4l2loopback.nix` reescrito a modo dinámico: `devices=0`, udev rule para control device, catch-all rule para video nodes. Browsers / OBS / Discord ahora muestran "Pixel 9 (Ansync)" / "Galaxy S24 (Ansync)" en el picker.
 
 Ver `PLAN.md` § Roadmap para la lista completa.

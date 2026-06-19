@@ -41,7 +41,6 @@ pub enum StreamKind {
     Video,
     Audio,
     Files,
-    Fs,
     Input,
     Camera,
     Clipboard,

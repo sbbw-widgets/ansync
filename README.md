@@ -11,7 +11,6 @@ Pre-alpha. Funcional end-to-end para los flujos principales. Roadmap completo en
 | 1–6  | Skeleton + transport + crypto + discovery + video decode | ✅ |
 | 7    | Input virtual host (uinput) + companion Accessibility | ✅ |
 | 8    | File transfer push/pull | ✅ |
-| 9    | FUSE mount + SAF integration | ✅ |
 | 9.5  | Integration glue (eframe window + cable pairing + D-Bus) | ✅ |
 | 10   | Camera v4l2loopback + Camera2/MediaCodec | ✅ |
 | 11   | Audio bidireccional (cpal/PipeWire ↔ AudioRecord/AudioTrack) | ✅ |
@@ -29,7 +28,6 @@ Pre-alpha. Funcional end-to-end para los flujos principales. Roadmap completo en
   - PC → Android: pointer/keyboard via Accessibility (`dispatchGesture`).
   - Android → PC: keyboard / mouse / touchscreen MT-B / stylus / gamepad XInput-like via uinput.
 - **Transferencia de archivos** con sha256 verify + chunks de 256 KiB.
-- **FUSE mount** del FS Android (SAF backend en companion). Auto-mount al connect si `files_mount` ON.
 - **Cámara virtual** v4l2loopback con frames de Camera2 + MediaCodec H.264/H.265. Per-peer naming: cada Android paireado aparece en el picker (Chromium / Firefox / OBS / Discord) como `"<modelo> (Ansync)"` — el daemon hace ADD/REMOVE dinámico sobre `/dev/v4l2loopback` por sesión, sin pre-cargar nodes estáticos.
 - **Audio bidireccional**: cpal (Linux PipeWire/ALSA) ↔ AudioRecord/AudioTrack. 48 kHz stereo S16LE.
 - **Clipboard sync** Wayland ↔ Android ClipboardManager, con gates por device.
@@ -46,7 +44,7 @@ Pre-alpha. Funcional end-to-end para los flujos principales. Roadmap completo en
 │  ├── mDNS announcer                                       │
 │  ├── D-Bus surface (org.gameros.Ansync1)                  │
 │  ├── MirrorRegistry / CameraRegistry / AudioRegistry      │
-│  └── Per-peer: input session (uinput) / FUSE / sinks      │
+│  └── Per-peer: input session (uinput) / sinks             │
 └──────────────────────────────────────────────────────────┘
                           │ QUIC streams (multiplexed)
 ┌──────────────────────────────────────────────────────────┐
@@ -55,8 +53,7 @@ Pre-alpha. Funcional end-to-end para los flujos principales. Roadmap completo en
 │  ├── Camera2 → H.264 / H.265                             │
 │  ├── AudioRecord / AudioTrack                            │
 │  ├── ClipboardManager bridge                             │
-│  ├── AccessibilityService (gesture replay)               │
-│  └── SAF FS server                                       │
+│  └── AccessibilityService (gesture replay)               │
 └──────────────────────────────────────────────────────────┘
 ```
 
@@ -88,7 +85,7 @@ Codecs vía [ferricast](../../ferricast) — NVENC, VAAPI, openh264 SW fallback.
 }
 ```
 
-El módulo carga uinput + v4l2loopback + FUSE, agrega `alice` a los grupos `input`/`video`/`fuse`, abre los puertos firewall que el daemon necesita (UDP `47215` QUIC + UDP `5353` mDNS), e instala el systemd user unit (`systemctl --user enable ansyncd`). El puerto QUIC se override con `services.ansync.quicPort = N;` y el firewall se puede desactivar con `services.ansync.openFirewall = false;` si lo gestionás vos en otro módulo.
+El módulo carga uinput + v4l2loopback, agrega `alice` a los grupos `input`/`video`, abre los puertos firewall que el daemon necesita (UDP `47215` QUIC + UDP `5353` mDNS), e instala el systemd user unit (`systemctl --user enable ansyncd`). El puerto QUIC se override con `services.ansync.quicPort = N;` y el firewall se puede desactivar con `services.ansync.openFirewall = false;` si lo gestionás vos en otro módulo.
 
 home-manager (sin NixOS):
 
@@ -99,7 +96,7 @@ programs.ansync.enable = true;
 
 ## Install (manual)
 
-Requisitos: PipeWire (o ALSA), v4l2loopback, FUSE3, BlueZ, D-Bus, wl-clipboard.
+Requisitos: PipeWire (o ALSA), v4l2loopback, BlueZ, D-Bus, wl-clipboard.
 
 ```sh
 nix develop
@@ -110,7 +107,7 @@ sudo install -Dm644 bins/ansyncd/contrib/60-ansync-uinput.rules /etc/udev/rules.
 sudo udevadm control --reload-rules && sudo udevadm trigger
 sudo modprobe v4l2loopback devices=0
 sudo chgrp video /dev/v4l2loopback && sudo chmod 0660 /dev/v4l2loopback
-sudo usermod -aG input,video,fuse $USER
+sudo usermod -aG input,video $USER
 ```
 
 ### Firewall
@@ -208,8 +205,8 @@ Flags en `$XDG_CONFIG_HOME/ansync/devices/{id}.toml`:
 ```
 screen_mirror     camera_video      camera_audio      mic
 audio_in          audio_out         files_send        files_receive
-files_mount       clipboard_in      clipboard_out     input_from_device
-input_to_device   notifications     sensors
+clipboard_in      clipboard_out     input_from_device input_to_device
+notifications
 ```
 
 Cada acción del daemon chequea el flag antes de proceder. Defaults al pairing: `screen_mirror`, `files_send`, `files_receive`, `notifications` **on**; `clipboard_*` **prompt**; resto **off**.
@@ -222,7 +219,6 @@ Toggle vía `ansyncctl perm <id> <flag> on|off` o D-Bus `Permissions.Set`.
 - Mirror window vacía → companion no abrió `StreamKind::Video` aún. Botón "Start screen capture" en el app, grant MediaProjection.
 - Pair falla con "companion did not connect in time" → el broadcast `am broadcast PAIR` no llegó al `PairingReceiver`. `adb shell pm list packages org.gameros.ansync` para verificar install. El log del companion sale en `adb logcat -s ansync*`.
 - Audio mudo → `pactl list short sinks` debería mostrar la default donde cpal escribe. Para route inverso, el RECORD_AUDIO runtime perm tiene que estar grant-ed en el companion.
-- FUSE mount vacío → companion no eligió tree URI. "Pick shared folder" en MainActivity + `ACTION_OPEN_DOCUMENT_TREE`.
 - Device pegado en `Disconnected` aunque el daemon log muestre `companion reachable on LAN` → firewall del host está dropeando el QUIC inbound. Verificá que UDP `47215` esté abierto (ver § Firewall). Con NixOS módulo, asegurate de tener `services.ansync.openFirewall = true` (default). Con firewall externo (router / AP isolation / corporate VLAN) el companion mDNS-resuelve pero los paquetes UDP nunca llegan al daemon.
 
 ## Logs

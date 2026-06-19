@@ -29,7 +29,6 @@ pub enum Message {
     Control(ControlMessage),
     Pairing(PairingMessage),
     FileTransfer(FileTransferMessage),
-    FsOp(FsOpMessage),
     Clipboard(ClipboardMessage),
     Input(InputMessage),
     Notification(NotificationMessage),
@@ -72,16 +71,6 @@ pub enum ControlMessage {
     /// connection. Symmetric to `StopScreen` but on the
     /// control-stream surface.
     StopScreenCapture,
-    /// Host → companion: "I want to browse / mount your files." The
-    /// companion checks whether a SAF tree URI is already persisted
-    /// for the paired host; if so it brings up its `AnsyncFsServer`
-    /// silently. If not, it posts a heads-up notif asking the user
-    /// to pick a folder. This is the entry point for both ad-hoc
-    /// transfers and the daemon's FUSE auto-mount.
-    RequestFileAccess,
-    /// Host → companion: "Drop the FS server, nothing to share now."
-    /// Used when the host's `Device.Unmount` D-Bus method fires.
-    ReleaseFileAccess,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -169,46 +158,6 @@ pub enum FileTransferMessage {
     Reject { transfer_id: u64, reason: String },
     Chunk { transfer_id: u64, offset: u64, data: Vec<u8> },
     Complete { transfer_id: u64 },
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub enum FsOpMessage {
-    Stat { path: String },
-    StatReply { meta: FsMeta },
-    ReadDir { path: String },
-    ReadDirReply { entries: Vec<FsEntry> },
-    Open { path: String, flags: u32 },
-    OpenReply { handle: u64 },
-    Read { handle: u64, offset: u64, len: u32 },
-    ReadReply { data: Vec<u8> },
-    Write { handle: u64, offset: u64, data: Vec<u8> },
-    WriteReply { written: u32 },
-    Close { handle: u64 },
-    Create { path: String, mode: u32 },
-    CreateReply { handle: u64 },
-    Unlink { path: String },
-    Rename { from: String, to: String },
-    Truncate { path: String, size: u64 },
-    Chmod { path: String, mode: u32 },
-    /// Returned by the receiver in place of the matching Reply
-    /// variant when an op fails. `code` mirrors `errno` so the FUSE
-    /// glue layer can translate cleanly.
-    Ok,
-    Error { code: i32, message: String },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FsMeta {
-    pub size: u64,
-    pub mode: u32,
-    pub mtime: u64,
-    pub is_dir: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FsEntry {
-    pub name: String,
-    pub meta: FsMeta,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

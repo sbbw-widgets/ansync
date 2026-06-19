@@ -47,7 +47,6 @@ let
       libva-utils
       cudaPackages.cuda_cudart
       v4l-utils
-      fuse3
       bluez
       wayland
       libGL

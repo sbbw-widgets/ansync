@@ -76,12 +76,10 @@ bitflags::bitflags! {
         const AUDIO_IN         = 1 << 4;
         const AUDIO_OUT        = 1 << 5;
         const FILES            = 1 << 6;
-        const FILES_MOUNT      = 1 << 7;
         const CLIPBOARD        = 1 << 8;
         const INPUT_FROM_DEV   = 1 << 9;
         const INPUT_TO_DEV     = 1 << 10;
         const NOTIFICATIONS    = 1 << 11;
-        const SENSORS          = 1 << 12;
         const STYLUS           = 1 << 13;
         const HEVC             = 1 << 14;
     }
@@ -100,24 +98,22 @@ pub struct DevicePermissions {
     pub audio_out: bool,
     pub files_send: bool,
     pub files_receive: bool,
-    pub files_mount: bool,
     pub clipboard_in: ClipboardPolicy,
     pub clipboard_out: ClipboardPolicy,
     pub input_from_device: bool,
     pub input_to_device: bool,
     pub notifications: bool,
-    pub sensors: bool,
 }
 
 impl Default for DevicePermissions {
     fn default() -> Self {
         // Defaults tuned for "just-paired device works end-to-end":
         // screen mirror, files, clipboard, audio routes, notifications
-        // are all on. Camera / virtual input / FUSE mount stay off
-        // because they require host-side hardware glue (v4l2loopback,
-        // /dev/uinput, fuser) that may not be set up, and surprising
-        // a user with an active webcam or fake mouse is worse than
-        // surprising them with their clipboard syncing.
+        // are all on. Camera / virtual input stay off because they
+        // require host-side hardware glue (v4l2loopback, /dev/uinput)
+        // that may not be set up, and surprising a user with an active
+        // webcam or fake mouse is worse than surprising them with their
+        // clipboard syncing.
         //
         // The PC owns the gates: re-tighten any of these via
         // `Permissions/{id}.Set(<flag>, false)` on D-Bus or by editing
@@ -132,13 +128,11 @@ impl Default for DevicePermissions {
             audio_out: true,
             files_send: true,
             files_receive: true,
-            files_mount: false,
             clipboard_in: ClipboardPolicy::Allow,
             clipboard_out: ClipboardPolicy::Allow,
             input_from_device: false,
             input_to_device: false,
             notifications: true,
-            sensors: false,
         }
     }
 }
@@ -161,11 +155,9 @@ pub enum Permission {
     AudioOut,
     FilesSend,
     FilesReceive,
-    FilesMount,
     ClipboardIn,
     ClipboardOut,
     InputFromDevice,
     InputToDevice,
     Notifications,
-    Sensors,
 }

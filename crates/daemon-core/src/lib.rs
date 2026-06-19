@@ -21,9 +21,7 @@ use ansync_core::{Capabilities, DeviceId, DeviceName, Permission};
 use ansync_crypto::IdentityKeypair;
 use ansync_dbus::{ConnState, DaemonAction, DaemonState, Device, serve};
 use ansync_discovery::{Discovery, MdnsDiscovery};
-use ansync_files::{
-    AutoAcceptPolicy, fs::client::FsClient, fs::fuse_mount::FuseMount, receive_file,
-};
+use ansync_files::{AutoAcceptPolicy, receive_file};
 use ansync_input::{InputDeviceFactory, InputSession, UinputFactory};
 use ansync_pairing::PeerStore;
 use ansync_permissions::FilePermissionsStore;
@@ -416,6 +414,11 @@ pub struct AudioEntry {
     inbound_tx: StdMutex<Option<tokio::sync::mpsc::UnboundedSender<bytes::Bytes>>>,
     /// Active inbound render task; aborted on Stop.
     inbound_handle: StdMutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Which D-Bus `StreamStateChanged` tile this inbound route maps
+    /// to — `"mic"` for `StartMicrophone`, `"audio"` for the generic
+    /// `StartAudioRoute`. Read by `audio_inbound_loop` on exit so a
+    /// companion-side teardown fires the right tile-off signal.
+    inbound_tile_kind: StdMutex<Option<&'static str>>,
 }
 
 impl AudioRegistry {
@@ -430,6 +433,7 @@ impl AudioRegistry {
                     pump_handle: StdMutex::new(None),
                     inbound_tx: StdMutex::new(None),
                     inbound_handle: StdMutex::new(None),
+                    inbound_tile_kind: StdMutex::new(None),
                 })
             })
             .clone()
@@ -601,7 +605,16 @@ async fn action_loop(
     while let Some(action) = rx.recv().await {
         match action {
             DaemonAction::StartAudioRoute { device, direction } => {
-                match handle_start_audio(&mirrors, &audios, &permissions, &device, direction).await {
+                match handle_start_audio(
+                    &mirrors,
+                    &audios,
+                    &permissions,
+                    &device,
+                    direction,
+                    "audio",
+                )
+                .await
+                {
                     Ok(()) => emit_stream(&dbus_conn, &device, "audio", true).await,
                     Err(e) => warn!(%device, error = %e, "StartAudioRoute failed"),
                 }
@@ -617,6 +630,7 @@ async fn action_loop(
                     &permissions,
                     &device,
                     AudioDirection::DeviceToHost,
+                    "mic",
                 )
                 .await
                 {
@@ -633,33 +647,6 @@ async fn action_loop(
                     push_clipboard_to_peer(&mirrors, &permissions, &device, &clipboard_sync).await
                 {
                     warn!(%device, error = %e, "SyncClipboard failed");
-                }
-            }
-            DaemonAction::MountFiles { device } => {
-                let Some(entry) = mirrors.get(&device) else {
-                    warn!(%device, "MountFiles: no live connection");
-                    continue;
-                };
-                let conn = entry.conn.lock().expect("conn slot poisoned").clone();
-                if let Some(conn) = conn {
-                    if let Err(e) = send_control(&conn, ControlMessage::RequestFileAccess).await
-                    {
-                        warn!(%device, error = %e, "RequestFileAccess send failed");
-                    }
-                } else {
-                    warn!(%device, "MountFiles: peer not connected");
-                }
-            }
-            DaemonAction::UnmountFiles { device } => {
-                let Some(entry) = mirrors.get(&device) else {
-                    continue;
-                };
-                let conn = entry.conn.lock().expect("conn slot poisoned").clone();
-                if let Some(conn) = conn {
-                    if let Err(e) = send_control(&conn, ControlMessage::ReleaseFileAccess).await
-                    {
-                        warn!(%device, error = %e, "ReleaseFileAccess send failed");
-                    }
                 }
             }
             DaemonAction::StartCamera { device, config } => {
@@ -963,12 +950,6 @@ async fn handle_connection(
         }
     }
 
-    // Auto-mount FUSE if the peer's `files_mount` flag is on. The
-    // BackgroundSession is held on the stack so dropping it on
-    // peer-disconnect umounts cleanly.
-    let _fuse_session =
-        maybe_auto_mount(&conn_arc, &peer_id, &peer.name, permissions.as_ref()).await;
-
     loop {
         let (kind, stream) = match conn_arc.accept().await {
             Ok(v) => v,
@@ -1010,13 +991,15 @@ async fn handle_connection(
             StreamKind::Camera => {
                 let entry = camera_entry.clone();
                 let pid = peer_id.clone();
-                tokio::spawn(camera_stream_loop(stream, entry, pid));
+                let dbus = dbus_conn.clone();
+                tokio::spawn(camera_stream_loop(stream, entry, pid, dbus));
             }
             StreamKind::Audio => {
                 let entry = audio_entry.clone();
                 let pid = peer_id.clone();
                 let perms = permissions.clone();
-                tokio::spawn(audio_inbound_loop(stream, entry, pid, perms));
+                let dbus = dbus_conn.clone();
+                tokio::spawn(audio_inbound_loop(stream, entry, pid, perms, dbus));
             }
             StreamKind::Clipboard => {
                 let pid = peer_id.clone();
@@ -1121,8 +1104,45 @@ async fn camera_stream_loop(
     mut stream: QuicStream,
     entry: Arc<CameraEntry>,
     peer_id: DeviceId,
+    dbus_conn: Arc<zbus::Connection>,
 ) {
     info!(%peer_id, "camera stream wired");
+    // Fire `StreamStateChanged("camera", false)` if the stream dies
+    // while the daemon still thought the route was up (companion-side
+    // tile flip, MediaCodec crash, projection revoked). Daemon-initiated
+    // StopCamera already cleared `frame_tx` AND emitted, so the guard
+    // becomes a no-op there.
+    struct CameraExitGuard {
+        entry: Arc<CameraEntry>,
+        peer_id: DeviceId,
+        dbus_conn: Arc<zbus::Connection>,
+    }
+    impl Drop for CameraExitGuard {
+        fn drop(&mut self) {
+            let still_active = {
+                let mut slot = self.entry.frame_tx.lock().expect("frame tx slot poisoned");
+                if slot.is_some() {
+                    *slot = None;
+                    true
+                } else {
+                    false
+                }
+            };
+            if !still_active {
+                return;
+            }
+            let conn = self.dbus_conn.clone();
+            let device = self.peer_id.clone();
+            tokio::spawn(async move {
+                emit_stream(&conn, &device, "camera", false).await;
+            });
+        }
+    }
+    let _guard = CameraExitGuard {
+        entry: entry.clone(),
+        peer_id: peer_id.clone(),
+        dbus_conn,
+    };
     loop {
         let bytes = match stream.recv().await {
             Ok(b) => b,
@@ -1170,74 +1190,6 @@ async fn camera_stream_loop(
             return;
         }
     }
-}
-
-async fn maybe_auto_mount(
-    conn: &QuicConnection,
-    peer_id: &DeviceId,
-    peer_name: &DeviceName,
-    permissions: &dyn ansync_permissions::PermissionsStore,
-) -> Option<ansync_files::fs::BackgroundSession> {
-    match permissions.check(peer_id, Permission::FilesMount).await {
-        Ok(true) => {}
-        Ok(false) => {
-            debug!(%peer_id, "files_mount off; skip auto-mount");
-            return None;
-        }
-        Err(e) => {
-            warn!(error = %e, "files_mount perm check failed; skip auto-mount");
-            return None;
-        }
-    }
-    let stream = match conn.open(StreamKind::Fs).await {
-        Ok(s) => s,
-        Err(e) => {
-            warn!(error = %e, "open Fs stream for auto-mount failed");
-            return None;
-        }
-    };
-    let client = FsClient::new(stream);
-    let runtime = tokio::runtime::Handle::current();
-    let mount_root = match runtime_mount_dir() {
-        Some(r) => r,
-        None => {
-            warn!("$XDG_RUNTIME_DIR not set; skip auto-mount");
-            return None;
-        }
-    };
-    let mount_point = mount_root.join(sanitize(&peer_name.0));
-    if let Err(e) = std::fs::create_dir_all(&mount_point) {
-        warn!(error = %e, path = %mount_point.display(), "create mount dir failed");
-        return None;
-    }
-    let mount = FuseMount::new(client, runtime);
-    match mount.spawn(&mount_point) {
-        Ok(session) => {
-            info!(path = %mount_point.display(), "FUSE mount up");
-            Some(session)
-        }
-        Err(e) => {
-            warn!(error = %e, "FUSE mount failed");
-            None
-        }
-    }
-}
-
-fn runtime_mount_dir() -> Option<PathBuf> {
-    let base = std::env::var("XDG_RUNTIME_DIR").ok()?;
-    Some(PathBuf::from(base).join("ansync").join("mounts"))
-}
-
-fn sanitize(name: &str) -> String {
-    name.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
 }
 
 /// Open a one-shot `StreamKind::Hello` outbound, send the local Hello
@@ -1524,6 +1476,7 @@ async fn handle_start_audio(
     permissions: &Arc<dyn ansync_permissions::PermissionsStore>,
     device: &DeviceId,
     direction: AudioDirection,
+    inbound_tile_kind: &'static str,
 ) -> Result<(), DaemonError> {
     // Permission gates per direction. AudioIn = peer→host (mic
     // forwarding into host PipeWire), AudioOut = host→peer (host
@@ -1577,6 +1530,10 @@ async fn handle_start_audio(
     if need_in {
         let (tx, rx) = unbounded_channel::<bytes::Bytes>();
         *entry.inbound_tx.lock().expect("audio inbound tx poisoned") = Some(tx);
+        *entry
+            .inbound_tile_kind
+            .lock()
+            .expect("audio inbound tile slot poisoned") = Some(inbound_tile_kind);
         let label = format!("ansync-in-{}", entry.peer_name);
         let format = AudioFormat {
             sample_rate: 48_000,
@@ -1654,6 +1611,10 @@ async fn handle_stop_audio(audios: &AudioRegistry, device: &DeviceId) {
         h.abort();
     }
     *entry.inbound_tx.lock().expect("audio inbound tx poisoned") = None;
+    *entry
+        .inbound_tile_kind
+        .lock()
+        .expect("audio inbound tile slot poisoned") = None;
     *entry.sink.lock().await = None;
     info!(%device, "StopAudioRoute done");
 }
@@ -1706,7 +1667,47 @@ async fn audio_inbound_loop(
     entry: Arc<AudioEntry>,
     peer_id: DeviceId,
     permissions: Arc<dyn ansync_permissions::PermissionsStore>,
+    dbus_conn: Arc<zbus::Connection>,
 ) {
+    // Emit `StreamStateChanged(<tile>, false)` if the companion drops
+    // the inbound stream while the host still believed the route was
+    // alive — same pattern as `CameraExitGuard`. `inbound_tile_kind`
+    // holds whichever tile the route is attached to ("mic" / "audio");
+    // the daemon-initiated stop path clears it before the stream
+    // closes, turning the guard into a no-op.
+    struct AudioExitGuard {
+        entry: Arc<AudioEntry>,
+        peer_id: DeviceId,
+        dbus_conn: Arc<zbus::Connection>,
+    }
+    impl Drop for AudioExitGuard {
+        fn drop(&mut self) {
+            let kind = self
+                .entry
+                .inbound_tile_kind
+                .lock()
+                .expect("audio inbound tile slot poisoned")
+                .take();
+            let Some(kind) = kind else {
+                return;
+            };
+            *self
+                .entry
+                .inbound_tx
+                .lock()
+                .expect("audio inbound tx poisoned") = None;
+            let conn = self.dbus_conn.clone();
+            let device = self.peer_id.clone();
+            tokio::spawn(async move {
+                emit_stream(&conn, &device, kind, false).await;
+            });
+        }
+    }
+    let _guard = AudioExitGuard {
+        entry: entry.clone(),
+        peer_id: peer_id.clone(),
+        dbus_conn,
+    };
     // First frame: the AudioStreamInit header. We log it but use the
     // host-side sink format the action handler already provisioned.
     let _header = match stream.recv().await {

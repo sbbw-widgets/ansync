@@ -98,13 +98,11 @@ pub fn permission_value(perms: &DevicePermissions, permission: Permission) -> bo
         Permission::AudioOut => perms.audio_out,
         Permission::FilesSend => perms.files_send,
         Permission::FilesReceive => perms.files_receive,
-        Permission::FilesMount => perms.files_mount,
         Permission::ClipboardIn => matches!(perms.clipboard_in, ClipboardPolicy::Allow),
         Permission::ClipboardOut => matches!(perms.clipboard_out, ClipboardPolicy::Allow),
         Permission::InputFromDevice => perms.input_from_device,
         Permission::InputToDevice => perms.input_to_device,
         Permission::Notifications => perms.notifications,
-        Permission::Sensors => perms.sensors,
     }
 }
 
@@ -121,7 +119,6 @@ pub fn apply_permission(perms: &mut DevicePermissions, permission: Permission, v
         Permission::AudioOut => perms.audio_out = value,
         Permission::FilesSend => perms.files_send = value,
         Permission::FilesReceive => perms.files_receive = value,
-        Permission::FilesMount => perms.files_mount = value,
         Permission::ClipboardIn => {
             perms.clipboard_in = if value { ClipboardPolicy::Allow } else { ClipboardPolicy::Off };
         }
@@ -132,7 +129,6 @@ pub fn apply_permission(perms: &mut DevicePermissions, permission: Permission, v
         Permission::InputFromDevice => perms.input_from_device = value,
         Permission::InputToDevice => perms.input_to_device = value,
         Permission::Notifications => perms.notifications = value,
-        Permission::Sensors => perms.sensors = value,
     }
 }
 
@@ -147,13 +143,11 @@ pub fn parse_permission(name: &str) -> Option<Permission> {
         "audio_out" => Permission::AudioOut,
         "files_send" => Permission::FilesSend,
         "files_receive" => Permission::FilesReceive,
-        "files_mount" => Permission::FilesMount,
         "clipboard_in" => Permission::ClipboardIn,
         "clipboard_out" => Permission::ClipboardOut,
         "input_from_device" => Permission::InputFromDevice,
         "input_to_device" => Permission::InputToDevice,
         "notifications" => Permission::Notifications,
-        "sensors" => Permission::Sensors,
         _ => return None,
     })
 }
@@ -168,13 +162,11 @@ pub fn permission_name(permission: Permission) -> &'static str {
         Permission::AudioOut => "audio_out",
         Permission::FilesSend => "files_send",
         Permission::FilesReceive => "files_receive",
-        Permission::FilesMount => "files_mount",
         Permission::ClipboardIn => "clipboard_in",
         Permission::ClipboardOut => "clipboard_out",
         Permission::InputFromDevice => "input_from_device",
         Permission::InputToDevice => "input_to_device",
         Permission::Notifications => "notifications",
-        Permission::Sensors => "sensors",
     }
 }
 
@@ -230,7 +222,7 @@ mod tests {
         assert!(matches!(loaded.clipboard_in, ClipboardPolicy::Allow));
 
         assert!(store.check(&id, Permission::Mic).await.unwrap());
-        assert!(!store.check(&id, Permission::Sensors).await.unwrap());
+        assert!(!store.check(&id, Permission::CameraVideo).await.unwrap());
 
         let _ = fs::remove_dir_all(&dir);
     }

@@ -42,7 +42,6 @@ class AnsyncCompanionService : Service() {
 
     private var projection: MediaProjection? = null
     private var capture: CaptureSession? = null
-    private var fsServer: AnsyncFsServer? = null
     private var camera: CameraSession? = null
     private var cameraPollThread: HandlerThread? = null
     private var cameraPollHandler: Handler? = null
@@ -62,9 +61,6 @@ class AnsyncCompanionService : Service() {
     private var capturePollThread: HandlerThread? = null
     private var capturePollHandler: Handler? = null
     @Volatile private var capturePollRunning = false
-    private var filePollThread: HandlerThread? = null
-    private var filePollHandler: Handler? = null
-    @Volatile private var filePollRunning = false
     private var screenReceiver: BroadcastReceiver? = null
     private var keepAlive: KeepAlive? = null
 
@@ -90,7 +86,6 @@ class AnsyncCompanionService : Service() {
         // shade — no full-screen wizard. SetupStepActivity calls
         // back via ACTION_REFRESH_SETUP after each grant resolves.
         SetupNotif.refresh(this)
-        maybeStartFsServer()
         startCameraControlPoller()
         startAudioControlPoller()
         clipboard = ClipboardBridge(this).also { it.start() }
@@ -103,7 +98,6 @@ class AnsyncCompanionService : Service() {
         }
         wifiPair = WifiPairManager(this).also { it.start() }
         startCaptureControlPoller()
-        startFileControlPoller()
         startHostNamePoller()
         registerScreenWakeReceiver()
     }
@@ -199,82 +193,6 @@ class AnsyncCompanionService : Service() {
         }
         screenReceiver = r
         Log.i(TAG, "screen wake receiver registered")
-    }
-
-    /** Watches the host's Control stream for `RequestFileAccess` /
-     *  `ReleaseFileAccess`. Tag 0 → check whether a SAF tree URI is
-     *  already persisted; if so, start the FS server silently. If
-     *  not, fire [requestStorageFromUser] which posts a notif so the
-     *  user can pick a folder. Tag 1 → tear the FS server down. */
-    private fun startFileControlPoller() {
-        if (filePollThread != null) return
-        val ht = HandlerThread("ansync-file-ctrl").also { it.start() }
-        filePollThread = ht
-        filePollHandler = Handler(ht.looper)
-        filePollRunning = true
-        filePollHandler?.post(object : Runnable {
-            override fun run() {
-                while (filePollRunning) {
-                    val blob = NativeBridge.nativePollFileControl()
-                    if (blob == null) {
-                        // Session not yet wired (HostDialer still
-                        // dialing) or peer dropped — back off + retry
-                        // instead of killing the poller permanently.
-                        try { Thread.sleep(500) } catch (_: InterruptedException) {}
-                        continue
-                    }
-                    if (blob.isEmpty()) continue
-                    when (blob[0].toInt()) {
-                        0 -> Handler(mainLooper).post { handleRequestFileAccess() }
-                        1 -> Handler(mainLooper).post { handleReleaseFileAccess() }
-                        else -> Log.w(TAG, "unknown file-ctrl tag ${blob[0]}")
-                    }
-                }
-            }
-        })
-    }
-
-    private fun handleRequestFileAccess() {
-        val have = getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-            .getString(PREF_TREE_URI, null) != null
-        if (have) {
-            if (fsServer == null) maybeStartFsServer()
-        } else {
-            requestStorageFromUser()
-        }
-    }
-
-    private fun handleReleaseFileAccess() {
-        fsServer?.stop()
-        fsServer = null
-        getSystemService(NotificationManager::class.java)?.cancel(STORAGE_GRANT_NOTIFICATION_ID)
-    }
-
-    /** PC asked to share files but no SAF tree URI is configured.
-     *  Post a heads-up notif so the user can pick one without us
-     *  needing to background-launch an Activity (which Android 14+
-     *  blocks). Tap → [GrantStorageActivity] → SAF picker → service
-     *  receives [ACTION_TREE_URI_UPDATED] → fs server starts. */
-    private fun requestStorageFromUser() {
-        val intent = Intent(this, GrantStorageActivity::class.java).apply {
-            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)
-        }
-        val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        } else {
-            PendingIntent.FLAG_UPDATE_CURRENT
-        }
-        val pending = PendingIntent.getActivity(this, 0, intent, flags)
-        val n = NotificationCompat.Builder(this, GRANT_CHANNEL_ID)
-            .setContentTitle("PC wants to access your files")
-            .setContentText("Tap to choose a folder to share.")
-            .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
-            .setPriority(NotificationCompat.PRIORITY_HIGH)
-            .setContentIntent(pending)
-            .setAutoCancel(true)
-            .build()
-        getSystemService(NotificationManager::class.java)
-            ?.notify(STORAGE_GRANT_NOTIFICATION_ID, n)
     }
 
     /** Watches the host's Control stream for
@@ -415,14 +333,6 @@ class AnsyncCompanionService : Service() {
         refreshNotification()
     }
 
-    private fun maybeStartFsServer() {
-        val prefs = getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-        val uriStr = prefs.getString(PREF_TREE_URI, null) ?: return
-        val uri = Uri.parse(uriStr)
-        fsServer = AnsyncFsServer(this, uri).also { it.start() }
-        Log.i(TAG, "fs server started against $uri")
-    }
-
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         // Default to dataSync — Android 14+ rejects mediaProjection /
         // camera / microphone foreground starts unless the relevant
@@ -472,12 +382,6 @@ class AnsyncCompanionService : Service() {
     private fun handleIntent(intent: Intent) {
         when (intent.action) {
             ACTION_REQUEST_CAPTURE -> requestCaptureFromUser()
-            ACTION_TREE_URI_UPDATED -> {
-                if (fsServer == null) maybeStartFsServer()
-                getSystemService(NotificationManager::class.java)
-                    ?.cancel(STORAGE_GRANT_NOTIFICATION_ID)
-                SetupNotif.refresh(this)
-            }
             ACTION_REFRESH_SETUP -> SetupNotif.refresh(this)
             ACTION_START_MIC_SHARE -> startAudioFromTile(WireAudioControl.Direction.DeviceToHost)
             ACTION_STOP_MIC_SHARE -> stopAudioFromTile(WireAudioControl.Direction.DeviceToHost)
@@ -736,17 +640,11 @@ class AnsyncCompanionService : Service() {
         capturePollThread?.quitSafely()
         capturePollThread = null
         capturePollHandler = null
-        filePollRunning = false
-        filePollThread?.quitSafely()
-        filePollThread = null
-        filePollHandler = null
         hostNamePollRunning = false
         hostNamePoller?.quitSafely()
         hostNamePoller = null
         hostNameHandler = null
         stopCapture()
-        fsServer?.stop()
-        fsServer = null
         screenReceiver?.let {
             try { unregisterReceiver(it) } catch (e: IllegalArgumentException) {
                 Log.w(TAG, "unregisterReceiver screen wake threw", e)
@@ -769,7 +667,6 @@ class AnsyncCompanionService : Service() {
         /** High-importance channel used only for "host wants X, tap to grant" prompts. */
         const val GRANT_CHANNEL_ID = "ansync.grant"
         const val GRANT_NOTIFICATION_ID = 2
-        const val STORAGE_GRANT_NOTIFICATION_ID = 3
 
         /** MediaProjection result delivered by [GrantScreenCaptureActivity]. */
         const val ACTION_START_CAPTURE = "org.gameros.ansync.action.START_CAPTURE"
@@ -779,9 +676,6 @@ class AnsyncCompanionService : Service() {
 
         /** Sent by host control-stream (U5) or QSTile when the user wants to grant capture. */
         const val ACTION_REQUEST_CAPTURE = "org.gameros.ansync.action.REQUEST_CAPTURE"
-
-        /** Sent by [GrantStorageActivity] after the user picks a new tree URI. */
-        const val ACTION_TREE_URI_UPDATED = "org.gameros.ansync.action.TREE_URI_UPDATED"
 
         /** Sent by [SetupStepActivity] after any grant step resolves so the
          *  service can re-evaluate which step (if any) is still pending. */

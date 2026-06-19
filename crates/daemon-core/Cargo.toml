@@ -17,7 +17,7 @@ ansync-permissions.workspace = true
 ansync-dbus.workspace = true
 ansync-proto.workspace = true
 ansync-input = { workspace = true, features = ["uinput"] }
-ansync-files = { workspace = true, features = ["fuse"] }
+ansync-files.workspace = true
 ansync-video.workspace = true
 ansync-camera = { workspace = true, features = ["v4l2loopback"] }
 ansync-audio = { workspace = true, features = ["cpal-backend"] }

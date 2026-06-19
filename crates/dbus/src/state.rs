@@ -81,15 +81,6 @@ pub enum DaemonAction {
     /// over a fresh `StreamKind::Clipboard`. Gated by
     /// `Permission::ClipboardOut`.
     SyncClipboard { device: DeviceId },
-    /// Ask the companion to expose its SAF tree as the FUSE-mount
-    /// backend. Triggers a `ControlMessage::RequestFileAccess` push;
-    /// the companion either has a folder ready or pops a notif on
-    /// the device asking the user to pick one.
-    MountFiles { device: DeviceId },
-    /// Inverse of [`MountFiles`] — tells the companion to tear its
-    /// `AnsyncFsServer` down (releases the SAF tree handle but the
-    /// persisted URI stays so the next mount is one tap away).
-    UnmountFiles { device: DeviceId },
 }
 
 pub struct DaemonState {

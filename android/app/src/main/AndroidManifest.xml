@@ -110,13 +110,6 @@
             android:excludeFromRecents="true"
             android:noHistory="true" />
 
-        <activity
-            android:name=".GrantStorageActivity"
-            android:exported="false"
-            android:theme="@android:style/Theme.Translucent.NoTitleBar"
-            android:excludeFromRecents="true"
-            android:noHistory="true" />
-
         <!--
             Cable-pair driver. Launched by PairingReceiver after the
             host's am broadcast lands; runs the native bootstrap on a

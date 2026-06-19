@@ -8,7 +8,7 @@ Reescritura moderna de scrcpy en Rust con scope ampliado:
 
 1. Mirror de pantalla Android → Linux con baja latencia
 2. Control bidireccional (PC ↔ Android): teclado, mouse, touch, stylus, gamepad
-3. Transferencia de archivos bidireccional + FUSE mount del FS Android
+3. Transferencia de archivos bidireccional
 4. Cámara y micrófono virtuales en Linux usando el hardware del Android
 5. Audio bidireccional con widgets de control en la barra de notificaciones Android
 6. Clipboard sync configurable por dispositivo
@@ -46,10 +46,8 @@ Reescritura moderna de scrcpy en Rust con scope ampliado:
 | Audio | trait `AudioBackend`, impl inicial PipeWire (`pipewire-rs`) |
 | Input host | trait `VirtualInputDevice`, impl inicial uinput (`input-linux`) |
 | Input BT HID | crate `bluer`, perfil HID Device — secundario, no MVP |
-| FS mount | trait `RemoteFsBackend`, impl FUSE3 (`fuser`) |
 | Clipboard | trait `ClipboardBackend`, impl wayland (`wl-clipboard-rs`) + X11 fallback |
 | Permisos | `DevicePermissions` por device, persistido en `$XDG_CONFIG_HOME/ansync/devices/{id}.toml` |
-| Auto-mount | Sí, condicional a flag `files_mount` |
 | Logs | `tracing` + `tracing-journald` |
 
 ## Permisos por dispositivo
@@ -59,8 +57,8 @@ Flags en `ansync_core::DevicePermissions`:
 ```
 screen_mirror     camera_video      camera_audio      mic
 audio_in          audio_out         files_send        files_receive
-files_mount       clipboard_in      clipboard_out     input_from_device
-input_to_device   notifications     sensors
+clipboard_in      clipboard_out     input_from_device input_to_device
+notifications
 ```
 
 Defaults al pairing:
@@ -137,19 +135,6 @@ Object /org/gameros/Ansync1/PairingPrompt
 - Crate `bluer`, perfil HID Device. Permite Android-as-keyboard/stylus sin companion en PC.
 - No MVP — Step 13.
 
-## Plan FUSE mount
-
-- Crate `fuser` (FUSE3 puro Rust).
-- Mount default: `$XDG_RUNTIME_DIR/ansync/mounts/{device-name}/`.
-- Backend RPC sobre stream QUIC dedicado (`FsOp` en `ansync-proto`): `stat`, `readdir`, `open`, `read`, `write`, `create`, `unlink`, `rename`, `truncate`, `chmod`.
-- Caches: dirent (TTL 5 s), inode metadata (TTL 5 s), readahead 256 KB. Writeback opcional (off por default).
-- Anti-saturación:
-  - Throttle: máx 4 requests in-flight por device (configurable).
-  - Backpressure: batería <20 % o térmica alta → reduce a 1 in-flight + bloquea writes.
-  - Companion Android usa SAF (Storage Access Framework) — usuario otorga acceso a carpetas específicas, no al FS completo.
-- Privacy: primer acceso del host dispara prompt en Android. Permisos persistentes por carpeta.
-- Auto-mount: al reconnect, si `files_mount=true` → monta. Si `false` → solo CLI explícito puede pedirlo (y aún así respeta el flag).
-
 ## Workspace layout
 
 ```
@@ -172,7 +157,7 @@ ansync/
 │   ├── audio/                  trait AudioBackend + PipeWire impl
 │   ├── camera/                 trait VirtualCameraSink + v4l2loopback impl
 │   ├── input/                  trait VirtualInputDevice + uinput + BT HID impls
-│   ├── files/                  transfer protocol + trait RemoteFsBackend + FUSE impl
+│   ├── files/                  transfer protocol
 │   ├── clipboard/              trait ClipboardBackend + wayland/X11 impls
 │   ├── permissions/            DevicePermissions store + D-Bus surface
 │   ├── dbus/                   interfaces zbus + servidor + cliente lib
@@ -212,16 +197,7 @@ ansync/
   - Daemon: `StreamKind::Files` accept loop spawnea `files_stream_loop` por stream con `AutoAcceptPolicy { root: download_dir }`. `DaemonConfig.download_dir` configurable (default `$XDG_DATA_HOME/ansync/incoming/`). `Capabilities::FILES` activa por default.
   - `ansyncctl push <id> <path> [--addr host:port] [--seconds N]`: direct QUIC dial (bypass D-Bus por ahora), discovery vía mDNS si `--addr` ausente, abre `StreamKind::Files`, `send_file`.
   - Companion: `files_accept_loop` en cdylib spawnea recv tasks por inbound stream del daemon. `PermissivePermissions` in-memory store ("everything on" — pairing ya estableció trust). Inbound files land en `{filesDir}/incoming/{peer_id}/{name}`.
-- [x] **Step 9** — `files` FUSE mount + SAF integration Android side
-  - [x] **9a** — `FsOpMessage` extendido: `Create`/`Unlink`/`Rename`/`Truncate`/`Chmod` + variante genérica `Ok` para acks de ops sin payload. `FsMeta`/`FsEntry` ganan `Clone`.
-  - [x] **9b** — `ansync_files::fs` module:
-    - `client::FsClient<S>` — async RPC sequential req/reply sobre un stream (Mutex around stream). Métodos: stat, readdir, open, create, read, write, close, unlink, rename, truncate, chmod.
-    - `cache::MetadataCache` TTL — 5s stat, 5s readdir, 1s negative. Sin cache de contenido (kernel page cache cubre). `invalidate(path)` evicta path + parent (llamado tras writes). 4 tests pasan.
-    - `fuse_mount::FuseMount<S>` impl `fuser::Filesystem` — lookup, getattr, readdir, open, read, write, release, create, unlink, rename, setattr (truncate + chmod). `InodeTable` bi-mapa path↔ino, root inode 1 hardcoded. ATTR_TTL 5s, blksize 256 KiB matchea readahead recomendado. `spawn(mountpoint)` levanta sesión bg con `AutoUnmount + AllowOther + DefaultPermissions`.
-  - [x] **9c** — Daemon auto-mount al peer connect si `Permission::FilesMount` ON. Monta en `$XDG_RUNTIME_DIR/ansync/mounts/{sanitized_device_name}/`. `BackgroundSession` vive en stack frame de `handle_connection` — drop al disconnect umounta. Re-export `fuser::BackgroundSession` desde `ansync_files::fs` para no forzar dep directa.
-  - [x] **nix** — `nix/fuse.nix` partial: `fuse3` package + kernel module load + `userAllowOther = true` + reminder grupo `fuse`. Step 14 lo importa.
-  - [x] **9d** — Companion native: `streams_accept_loop` (rebautizado de `files_accept_loop`) demuxa `Files` y `Fs`. `fs_serve_loop` por stream Fs: recibe postcard `FsOpMessage`, re-encoda como tag-binary blob, push a `fs_req_tx` mpsc, espera reply blob desde `fs_reply_rx`, decoda + encoda postcard + manda al stream. Sequencial por stream. JNI: `nativePollFsRequest()` blocking + `nativeFsReply(bytes)` push. Tag-binary wire (Stat/ReadDir/Open/Read/Write/Close/Create/Unlink/Rename/Truncate/Chmod + Ok/StatReply/ReadDirReply/OpenReply/ReadReply/WriteReply/CreateReply/Error) documentado en `lib.rs` y espejado en `FsOpCodec.kt`.
-  - [x] **9e** — Companion Kotlin: `FsOpCodec` encode/decode espejo. `AnsyncFsServer` worker thread polls native + dispatchea contra `DocumentsContract` resolviendo paths por walk + matching de display names. Step 9e ship: `stat`/`readdir`/`open`/`read`/`close` con SAF reales (modes `0o755`/`0o644` sintéticos según `MIME_TYPE_DIR`). `write`/`create`/`unlink`/`rename`/`truncate`/`chmod` retornan `ENOSYS` por ahora (follow-up). `MainActivity` agrega botón "Pick shared folder" → `ACTION_OPEN_DOCUMENT_TREE` + `takePersistableUriPermission(R/W)` + persist en `SharedPreferences`. `AnsyncCompanionService.onCreate` arranca `AnsyncFsServer` si hay tree URI saved.
+- [x] **Step 9** — ~~FUSE mount + SAF integration~~ **DROPPED 2026-06-19**. Toda la FS RPC + FUSE mount + SAF server retirados (proto `FsOpMessage`/`FsMeta`/`FsEntry`, `ansync_files::fs`, `nix/fuse.nix`, `AnsyncFsServer.kt`, `FsOpCodec.kt`, `GrantStorageActivity.kt`, JNI fs methods). File transfer push/pull (Step 8) sigue siendo el surface oficial para mover archivos.
 - [x] **Step 9.5** — Integration glue (end-to-end demoable)
   - Post-9.5 gap-closers:
     - **D-Bus dynamic registration**: `Manager.RefreshPeers()` method en `ansync_dbus::Manager`. `ansyncctl pair` lo llama post-`store.put` via `zbus::Proxy` session bus. Daemon ya corriendo registra el nuevo `/Device/{id}` + `/Permissions/{id}` sin restart. Idempotente — chequea `interface::<Device>` antes de re-attach.
@@ -267,7 +243,7 @@ ansync/
   - Wire surface lista para que daemon-core pick BT factory en lugar de uinput cuando el peer pareé via BT en lugar de cable; profile SDP + L2CAP control/interrupt channels son follow-up.
 - [x] **Step 14** — Nix module + crane derivation
   - `nix/package.nix` — crane build, importa workspace, instala udev rule + systemd user unit a `$out`.
-  - `nix/module.nix` — NixOS module consolidado. Importa `uinput.nix` + `fuse.nix` + `v4l2loopback.nix`. Opciones `services.ansync.{enable,user,package,extraGroups}`. Suma el user a `input`/`video`/`fuse`. Wirea systemd user unit con sandboxing (`ProtectSystem=strict`, etc.).
+  - `nix/module.nix` — NixOS module consolidado. Importa `uinput.nix` + `v4l2loopback.nix`. Opciones `services.ansync.{enable,user,package,extraGroups}`. Suma el user a `input`/`video`. Wirea systemd user unit con sandboxing (`ProtectSystem=strict`, etc.).
   - `nix/hm-module.nix` — home-manager fallback para usuarios no-NixOS. `programs.ansync.{enable,package,autoStart}`.
   - `flake.nix` expone `nixosModules.default`, `homeManagerModules.default`, `packages.default = ansyncPkg`, apps `ansyncd`/`ansyncctl`.
 - [x] **Step 15** — README + docs
@@ -348,9 +324,7 @@ Gaps identificados al cerrar el roadmap. Ordenados por severidad. Cada uno es bo
   - `nix/v4l2loopback.nix` reescrito: `devices=0` (sin pre-cargar nodes), udev rule para `/dev/v4l2loopback` group `video`, catch-all rule para video[0-9]* whose driver es v4l2loopback. README troubleshooting actualizado.
   - 4 tests label encoding (build_card_label) + 2 ABI tests pasan. PipeWire-camera fallback queda como nice-to-have futuro pero ya no necesario para resolver per-peer label.
 
-- [ ] **R10 — Sensors wire**
-  - `Capabilities::SENSORS` + `Permission::Sensors` existen sin proto/handlers. Bajo prioridad (no es feature core scrcpy-equivalent).
-  - Posible: stream kind 0x0a, proto `SensorMessage::{Accelerometer{x,y,z}, Gyro{...}, etc.}`. Companion `SensorManager.registerListener`. Útil para casos como game controllers (gyro aim).
+- [x] **R10 — Sensors** (dropped del scope sesión 2026-06-19; sin demanda real)
 
 - [x] **R11 — Clipboard blob bidi**
   - Companion descarta `ClipboardMessage::Blob` silenciosamente. Wirea image MIMEs (`image/png`, `image/jpeg`) via `ClipData.newUri` + `MediaStore`. Text-only en Step 12 ship.
@@ -422,33 +396,23 @@ Surfaceado mientras se probaba el pair WiFi + mirror lifecycle real con DMS. Cad
 
 ### Pendiente para próxima sesión
 
-- [ ] **N1 — DMS plugin polish**
-  - Verificar que click en "tune" (Permissions) realmente expande el grid + que las DankToggle actualicen perms.
-  - Probable falla: `Repeater.model` array literal se re-evalúa al cambiar `svc.isStreamOn`, lo que tear-down + rebuild de inner items y puede tragarse el click.
-  - Diagnóstico: console.log en `onClicked` para confirmar dispatch.
+- [x] **N1 — DMS plugin polish** (cerrado sesión 2026-06-19)
 
-- [ ] **N2 — OEM-specific autostart hints**
-  - `SetupStep.MiuiAutostart` ya cubre Xiaomi. Sumar:
-    - Samsung "Device care → Battery → Sleeping apps" (Settings.ACTION_BATTERY_SAVER_SETTINGS).
-    - OnePlus "Battery → Battery optimization plus" (`com.oneplus.battery.action.AppBatteryOptimization`).
-    - Huawei "Protected apps" (`com.huawei.systemmanager.optimize.process.ProtectActivity`).
-    - Vivo / Oppo similar.
-  - Cada uno gated por `Build.MANUFACTURER` match. Pattern: replicar `launchMiuiAutostart`, persistir el "dismissed" flag en SharedPreferences.
+- [x] **N2 — OEM-specific autostart hints** (cerrado sesión 2026-06-19)
 
 - [ ] **N3 — WakeLock partial opcional para sessions activas**
   - WifiLock cubre radio; CPU también puede entrar en deep sleep durante streams largos.
   - `PowerManager.PARTIAL_WAKE_LOCK` acquired cuando `CaptureSession / AudioRouter / CameraSession` está activo, released cuando todos paran.
   - Battery cost real (~5%/h), gateado por SharedPreferences flag user-toggleable.
 
-- [ ] **N4 — Sensors stream (R10)**
-  - Bajo prioridad confirmado. Útil para gamepad gyro aim. Wire propuesto en R10.
-
 - [ ] **N5 — MediaSession widget activo durante mirror**
   - R7 ya cubre audio. Sumar widget similar para "mirror activo" — corte directo desde lock screen sin abrir notif shade.
 
-- [ ] **N6 — D-Bus signal para stream state changes**
-  - DMS cache de streams es optimista local. Cuando companion mata el stream solo (tile off, accessibility revoke, MediaCodec crash) → DMS muestra "on" stale hasta próximo click.
-  - Add `Device.StreamActiveChanged(kind, active)` signal en `ansync_dbus`. Daemon emite al spawn/exit del subprocess mirror, al StartCamera/StopCamera, etc. DMS suscribe + flippea cache.
+- [x] **N6 — D-Bus signal para stream state changes** (cerrado 2026-06-19)
+  - `Device.StreamStateChanged(kind, active)` ya existía + daemon-initiated paths emitían. Gap: companion-side teardown (tile off / MediaCodec crash / projection revoke / mic perm revoke) no fan-out al signal.
+  - `camera_stream_loop` + `audio_inbound_loop` ganan exit-guard. Si al salir el slot relevante (`frame_tx` para camera, `inbound_tile_kind` para audio) sigue Some → companion stop unilateral → guard limpia slot + emite `StreamStateChanged(kind, false)`. Daemon-initiated path limpia el slot ANTES del stream close → guard no-op (sin emisión doble).
+  - `AudioEntry` gana `inbound_tile_kind: StdMutex<Option<&'static str>>`. `handle_start_audio` recibe el tile name ("mic" para StartMicrophone, "audio" para StartAudioRoute) y lo persiste cuando `need_in`. `handle_stop_audio` lo clearea.
+  - Video stream loop ya tenía `InboundGuard` que disparaba `HideScreen` action → emit "screen=false" cubierto desde antes.
 
 - [ ] **N7 — Cable pair: verificar APK install grant flags**
   - `adb_client::install` no acepta `-g` (auto-grant runtime perms). Companion termina con perms sin granted → SetupNotif walkthrough mandatorio.
@@ -464,7 +428,7 @@ Surfaceado mientras se probaba el pair WiFi + mirror lifecycle real con DMS. Cad
 - R5 + R6 son medias jornadas individuales por la complejidad del wire format (SAF mutations) / BT stack.
 - R7, R11 son cosmética: dejan para post-v1.
 - ~~R8 documentar como upstream limitation en README + cerrar como WONTFIX.~~ Cerrado vía dyn-ctl ioctl (sesión 2026-06-18).
-- R10 evaluar demanda: si nadie lo pide, dropear del scope.
+- ~~R10 evaluar demanda: si nadie lo pide, dropear del scope.~~ Dropped sesión 2026-06-19.
 
 ## Triaje UX post-v1 (sesión 2026-06-15)
 
@@ -573,7 +537,6 @@ Categorías:
 - **audio**: pipewire (consumido en Step 11)
 - **camera**: v4l (consumido en Step 10)
 - **input**: input-linux, bluer (consumidos en Steps 7 / 13)
-- **fs**: fuser (consumido en Step 9)
 - **clipboard**: wl-clipboard-rs (consumido en Step 12)
 - **cli**: clap
 - **ferricast** (path deps `../../ferricast/crates/...`): ferricast-core, ferricast-encoder, ferricast-decoder — wired en Steps 5/6

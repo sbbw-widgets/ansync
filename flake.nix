@@ -67,9 +67,6 @@
             # Camera
             v4l-utils
 
-            # Filesystem
-            fuse3
-
             # Bluetooth
             bluez
 

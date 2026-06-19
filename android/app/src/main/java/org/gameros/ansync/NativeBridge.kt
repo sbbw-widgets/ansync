@@ -71,20 +71,6 @@ object NativeBridge {
     external fun nativePollInputMessage(): ByteArray?
 
     /**
-     * Block (in native) until the next remote `FsOpMessage` arrives
-     * from the host, then return the tag-binary encoding (see
-     * `FsOpCodec`). Returns `null` on session teardown.
-     */
-    external fun nativePollFsRequest(): ByteArray?
-
-    /**
-     * Submit the tag-binary reply for the most recent request returned
-     * by `nativePollFsRequest`. Sequential per Fs stream — callers
-     * MUST poll and reply in strict alternation.
-     */
-    external fun nativeFsReply(reply: ByteArray): Boolean
-
-    /**
      * Drive the cable pairing flow against `127.0.0.1:port`. The host
      * has already configured an `adb reverse`. Returns
      * `"<host_pubkey_hex>|<host_name>"` on success and `null` on
@@ -114,15 +100,6 @@ object NativeBridge {
      * session teardown.
      */
     external fun nativePollCaptureControl(): ByteArray?
-
-    /**
-     * Block until the host sends a file-access control:
-     * `RequestFileAccess` (0x00) or `ReleaseFileAccess` (0x01).
-     * The service decides whether to silently start the FS server
-     * (URI already picked) or pop a notif asking the user to pick
-     * a folder.
-     */
-    external fun nativePollFileControl(): ByteArray?
 
     /**
      * Push one encoded camera frame (H.264 / H.265 access unit) over

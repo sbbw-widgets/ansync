@@ -35,8 +35,8 @@ use ansync_pairing::cable::bootstrap_companion;
 use ansync_pairing::wifi::{read_pair_hello, respond_pair_pin, CompanionWifiOutcome};
 use ansync_permissions::{PermissionsError, PermissionsStore};
 use ansync_proto::{
-    ClipboardMessage, ControlMessage, Envelope, FsOpMessage, GamepadState, Hello, InputMessage,
-    Message, NotificationMessage, PROTOCOL_VERSION,
+    ClipboardMessage, ControlMessage, Envelope, GamepadState, Hello, InputMessage, Message,
+    NotificationMessage, PROTOCOL_VERSION,
 };
 use ansync_transport::{
     Connection, QuicConnection, QuicStream, QuicTransport, Stream as _, StreamKind,
@@ -199,12 +199,6 @@ struct ActiveSession {
     /// can call `nativePollInputMessage` from any thread without
     /// reading-while-spawning races against the recv task.
     input_rx: Arc<AsyncMutex<UnboundedReceiver<Vec<u8>>>>,
-    /// Per-Fs-stream pair of queues: native pushes inbound
-    /// `FsOpMessage` requests as tag-binary blobs for the Kotlin
-    /// worker; Kotlin replies through `fs_reply_tx` after running
-    /// the SAF op. Sequential per stream.
-    fs_req_rx: Arc<AsyncMutex<UnboundedReceiver<Vec<u8>>>>,
-    fs_reply_tx: Arc<UnboundedSender<Vec<u8>>>,
     /// Outbound device→host Camera stream. Lazy-opened on first
     /// `nativeSendCameraChunk` call (typically right after Kotlin
     /// processes a StartCamera control message).
@@ -221,11 +215,6 @@ struct ActiveSession {
     /// `StopScreenCapture`. Two single-byte tags so Kotlin can poll
     /// without postcard.
     capture_ctrl_rx: Arc<AsyncMutex<UnboundedReceiver<Vec<u8>>>>,
-    /// Inbound `ControlMessage::RequestFileAccess` /
-    /// `ReleaseFileAccess`. Tag 0 = request, tag 1 = release. Kotlin
-    /// polls and pops the SAF picker on tag 0 if no tree URI is
-    /// persisted yet, otherwise just brings up the FS server.
-    file_ctrl_rx: Arc<AsyncMutex<UnboundedReceiver<Vec<u8>>>>,
     /// Outbound device→host Audio stream for mic forwarding.
     /// Lazy-opened on the first `nativeSendAudioChunk` (device-side).
     outbound_audio: Arc<AsyncMutex<Option<QuicStream>>>,
@@ -478,12 +467,6 @@ pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativeOpenConnection
     let (input_tx, input_rx) = unbounded_channel::<Vec<u8>>();
     let input_tx_arc = Arc::new(input_tx);
 
-    let (fs_req_tx, fs_req_rx) = unbounded_channel::<Vec<u8>>();
-    let (fs_reply_tx, fs_reply_rx) = unbounded_channel::<Vec<u8>>();
-    let fs_req_tx = Arc::new(fs_req_tx);
-    let fs_reply_tx = Arc::new(fs_reply_tx);
-    let fs_reply_rx = Arc::new(AsyncMutex::new(fs_reply_rx));
-
     let (camera_ctrl_tx, camera_ctrl_rx) = unbounded_channel::<Vec<u8>>();
     let camera_ctrl_tx = Arc::new(camera_ctrl_tx);
 
@@ -492,9 +475,6 @@ pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativeOpenConnection
 
     let (capture_ctrl_tx, capture_ctrl_rx) = unbounded_channel::<Vec<u8>>();
     let capture_ctrl_tx = Arc::new(capture_ctrl_tx);
-
-    let (file_ctrl_tx, file_ctrl_rx) = unbounded_channel::<Vec<u8>>();
-    let file_ctrl_tx = Arc::new(file_ctrl_tx);
 
     let (audio_in_tx, audio_in_rx) = unbounded_channel::<Vec<u8>>();
     let audio_in_tx = Arc::new(audio_in_tx);
@@ -524,8 +504,6 @@ pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativeOpenConnection
         conn_arc.clone(),
         host_device_id,
         download_dir,
-        fs_req_tx.clone(),
-        fs_reply_rx.clone(),
         input_tx_arc.clone(),
         camera_ctrl_tx.clone(),
         audio_ctrl_tx.clone(),
@@ -534,7 +512,6 @@ pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativeOpenConnection
         clip_blob_tx.clone(),
         host_name_slot,
         capture_ctrl_tx.clone(),
-        file_ctrl_tx.clone(),
     ));
 
     let session = ActiveSession {
@@ -542,8 +519,6 @@ pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativeOpenConnection
         video_stream: Arc::new(AsyncMutex::new(video_stream)),
         outbound_input: Arc::new(AsyncMutex::new(None)),
         input_rx: Arc::new(AsyncMutex::new(input_rx)),
-        fs_req_rx: Arc::new(AsyncMutex::new(fs_req_rx)),
-        fs_reply_tx,
         outbound_camera: Arc::new(AsyncMutex::new(None)),
         camera_ctrl_rx: Arc::new(AsyncMutex::new(camera_ctrl_rx)),
         audio_ctrl_rx: Arc::new(AsyncMutex::new(audio_ctrl_rx)),
@@ -552,7 +527,6 @@ pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativeOpenConnection
         clipboard_in_rx: Arc::new(AsyncMutex::new(clip_in_rx)),
         clipboard_in_blob_rx: Arc::new(AsyncMutex::new(clip_blob_rx)),
         capture_ctrl_rx: Arc::new(AsyncMutex::new(capture_ctrl_rx)),
-        file_ctrl_rx: Arc::new(AsyncMutex::new(file_ctrl_rx)),
     };
     let mut slot = state_slot().lock().expect("state mutex poisoned");
     if let Some(s) = slot.as_mut() {
@@ -581,8 +555,6 @@ async fn streams_accept_loop(
     conn: Arc<QuicConnection>,
     host_id: DeviceId,
     download_dir: PathBuf,
-    fs_req_tx: Arc<UnboundedSender<Vec<u8>>>,
-    fs_reply_rx: Arc<AsyncMutex<UnboundedReceiver<Vec<u8>>>>,
     input_inbound_tx: Arc<UnboundedSender<Vec<u8>>>,
     camera_ctrl_tx: Arc<UnboundedSender<Vec<u8>>>,
     audio_ctrl_tx: Arc<UnboundedSender<Vec<u8>>>,
@@ -591,7 +563,6 @@ async fn streams_accept_loop(
     clip_blob_tx: Arc<UnboundedSender<(String, Vec<u8>)>>,
     host_name_slot: Arc<Mutex<Option<String>>>,
     capture_ctrl_tx: Arc<UnboundedSender<Vec<u8>>>,
-    file_ctrl_tx: Arc<UnboundedSender<Vec<u8>>>,
 ) {
     let permissions: Arc<dyn PermissionsStore> = Arc::new(PermissivePermissions);
     // Helper struct so any early return out of the accept loop —
@@ -640,22 +611,15 @@ async fn streams_accept_loop(
                     }
                 });
             }
-            StreamKind::Fs => {
-                let tx = fs_req_tx.clone();
-                let rx = fs_reply_rx.clone();
-                tokio::spawn(fs_serve_loop(stream, tx, rx));
-            }
             StreamKind::Control => {
                 let cam_tx = camera_ctrl_tx.clone();
                 let aud_tx = audio_ctrl_tx.clone();
                 let cap_tx = capture_ctrl_tx.clone();
-                let file_tx = file_ctrl_tx.clone();
                 tokio::spawn(control_recv_loop(
                     stream,
                     (*cam_tx).clone(),
                     (*aud_tx).clone(),
                     (*cap_tx).clone(),
-                    (*file_tx).clone(),
                 ));
             }
             StreamKind::Audio => {
@@ -677,237 +641,6 @@ async fn streams_accept_loop(
             }
         }
     }
-}
-
-async fn fs_serve_loop(
-    mut stream: QuicStream,
-    req_tx: Arc<UnboundedSender<Vec<u8>>>,
-    reply_rx: Arc<AsyncMutex<UnboundedReceiver<Vec<u8>>>>,
-) {
-    loop {
-        let bytes = match stream.recv().await {
-            Ok(b) => b,
-            Err(ansync_transport::TransportError::Closed) => {
-                info!("fs_serve_loop: stream closed");
-                return;
-            }
-            Err(e) => {
-                warn!("fs_serve_loop: recv error: {e}");
-                return;
-            }
-        };
-        let msg: FsOpMessage = match postcard::from_bytes(&bytes) {
-            Ok(m) => m,
-            Err(e) => {
-                warn!("fs_serve_loop: malformed FsOpMessage: {e}");
-                let err_reply = FsOpMessage::Error {
-                    code: 5, // EIO
-                    message: "malformed request".into(),
-                };
-                if let Ok(bytes) = postcard::to_allocvec(&err_reply) {
-                    let _ = stream.send(Bytes::from(bytes)).await;
-                }
-                continue;
-            }
-        };
-        let req_blob = encode_fs_req_for_kotlin(&msg);
-        if req_tx.send(req_blob).is_err() {
-            info!("fs_serve_loop: req receiver gone; exiting");
-            return;
-        }
-        let reply_blob = {
-            let mut guard = reply_rx.lock().await;
-            match guard.recv().await {
-                Some(b) => b,
-                None => {
-                    info!("fs_serve_loop: reply sender gone; exiting");
-                    return;
-                }
-            }
-        };
-        let reply_msg = match decode_fs_reply_from_kotlin(&reply_blob) {
-            Ok(m) => m,
-            Err(e) => {
-                warn!("fs_serve_loop: bad reply blob: {e}");
-                FsOpMessage::Error {
-                    code: 5,
-                    message: format!("bad reply: {e}"),
-                }
-            }
-        };
-        let out = match postcard::to_allocvec(&reply_msg) {
-            Ok(v) => v,
-            Err(e) => {
-                warn!("fs_serve_loop: postcard encode reply: {e}");
-                return;
-            }
-        };
-        if let Err(e) = stream.send(Bytes::from(out)).await {
-            warn!("fs_serve_loop: stream send reply failed: {e}");
-            return;
-        }
-    }
-}
-
-/// Tag-binary FsOp wire format — native → Kotlin direction.
-///
-/// Layout per tag (multi-byte ints little-endian, strings are length-
-/// prefixed u32 + UTF-8 bytes, byte blobs are u32 + bytes):
-///   0 Stat(path)
-///   1 ReadDir(path)
-///   2 Open(path, flags u32)
-///   3 Read(handle u64, offset u64, len u32)
-///   4 Write(handle u64, offset u64, data blob)
-///   5 Close(handle u64)
-///   6 Create(path, mode u32)
-///   7 Unlink(path)
-///   8 Rename(from, to)
-///   9 Truncate(path, size u64)
-///  10 Chmod(path, mode u32)
-///
-/// Mirrored verbatim in Kotlin `FsOpCodec.kt`. Any change requires
-/// matching diffs on both files in the same commit.
-fn encode_fs_req_for_kotlin(msg: &FsOpMessage) -> Vec<u8> {
-    let mut out = Vec::with_capacity(64);
-    match msg {
-        FsOpMessage::Stat { path } => {
-            out.push(0);
-            write_str(&mut out, path);
-        }
-        FsOpMessage::ReadDir { path } => {
-            out.push(1);
-            write_str(&mut out, path);
-        }
-        FsOpMessage::Open { path, flags } => {
-            out.push(2);
-            write_str(&mut out, path);
-            out.extend_from_slice(&flags.to_le_bytes());
-        }
-        FsOpMessage::Read { handle, offset, len } => {
-            out.push(3);
-            out.extend_from_slice(&handle.to_le_bytes());
-            out.extend_from_slice(&offset.to_le_bytes());
-            out.extend_from_slice(&len.to_le_bytes());
-        }
-        FsOpMessage::Write { handle, offset, data } => {
-            out.push(4);
-            out.extend_from_slice(&handle.to_le_bytes());
-            out.extend_from_slice(&offset.to_le_bytes());
-            write_blob(&mut out, data);
-        }
-        FsOpMessage::Close { handle } => {
-            out.push(5);
-            out.extend_from_slice(&handle.to_le_bytes());
-        }
-        FsOpMessage::Create { path, mode } => {
-            out.push(6);
-            write_str(&mut out, path);
-            out.extend_from_slice(&mode.to_le_bytes());
-        }
-        FsOpMessage::Unlink { path } => {
-            out.push(7);
-            write_str(&mut out, path);
-        }
-        FsOpMessage::Rename { from, to } => {
-            out.push(8);
-            write_str(&mut out, from);
-            write_str(&mut out, to);
-        }
-        FsOpMessage::Truncate { path, size } => {
-            out.push(9);
-            write_str(&mut out, path);
-            out.extend_from_slice(&size.to_le_bytes());
-        }
-        FsOpMessage::Chmod { path, mode } => {
-            out.push(10);
-            write_str(&mut out, path);
-            out.extend_from_slice(&mode.to_le_bytes());
-        }
-        FsOpMessage::Ok
-        | FsOpMessage::StatReply { .. }
-        | FsOpMessage::ReadDirReply { .. }
-        | FsOpMessage::OpenReply { .. }
-        | FsOpMessage::ReadReply { .. }
-        | FsOpMessage::WriteReply { .. }
-        | FsOpMessage::CreateReply { .. }
-        | FsOpMessage::Error { .. } => {
-            // Reply-side variants — should not appear as inbound requests.
-            // Emit a single zero byte so Kotlin can flag "unexpected".
-            out.clear();
-            out.push(0xFF);
-        }
-    }
-    out
-}
-
-/// Tag-binary FsOp reply wire — Kotlin → native. Tag layout:
-///   0  Ok                 : (no payload)
-///   1  StatReply          : meta(size u64, mode u32, mtime u64, is_dir u8)
-///   2  ReadDirReply       : count u32, then count × { name(str), meta(20B) }
-///   3  OpenReply          : handle u64
-///   4  ReadReply          : data(blob)
-///   5  WriteReply         : written u32
-///   6  CreateReply        : handle u64
-///   7  Error              : code i32, message(str)
-fn decode_fs_reply_from_kotlin(bytes: &[u8]) -> Result<FsOpMessage, String> {
-    let mut c = Cursor::new(bytes);
-    let tag = c.take(1)?[0];
-    match tag {
-        0 => Ok(FsOpMessage::Ok),
-        1 => {
-            let meta = read_meta(&mut c)?;
-            Ok(FsOpMessage::StatReply { meta })
-        }
-        2 => {
-            let count = c.take_u32()?;
-            let mut entries = Vec::with_capacity(count as usize);
-            for _ in 0..count {
-                let name = c.take_str()?;
-                let meta = read_meta(&mut c)?;
-                entries.push(ansync_proto::FsEntry { name, meta });
-            }
-            Ok(FsOpMessage::ReadDirReply { entries })
-        }
-        3 => Ok(FsOpMessage::OpenReply {
-            handle: c.take_u64()?,
-        }),
-        4 => Ok(FsOpMessage::ReadReply {
-            data: c.take_blob()?,
-        }),
-        5 => Ok(FsOpMessage::WriteReply {
-            written: c.take_u32()?,
-        }),
-        6 => Ok(FsOpMessage::CreateReply {
-            handle: c.take_u64()?,
-        }),
-        7 => Ok(FsOpMessage::Error {
-            code: c.take_i32()?,
-            message: c.take_str()?,
-        }),
-        other => Err(format!("unknown reply tag {other}")),
-    }
-}
-
-fn read_meta(c: &mut Cursor<'_>) -> Result<ansync_proto::FsMeta, String> {
-    Ok(ansync_proto::FsMeta {
-        size: c.take_u64()?,
-        mode: c.take_u32()?,
-        mtime: c.take_u64()?,
-        is_dir: c.take(1)?[0] != 0,
-    })
-}
-
-fn write_str(out: &mut Vec<u8>, s: &str) {
-    let bytes = s.as_bytes();
-    let len = bytes.len() as u32;
-    out.extend_from_slice(&len.to_le_bytes());
-    out.extend_from_slice(bytes);
-}
-
-fn write_blob(out: &mut Vec<u8>, b: &[u8]) {
-    let len = b.len() as u32;
-    out.extend_from_slice(&len.to_le_bytes());
-    out.extend_from_slice(b);
 }
 
 struct Cursor<'a> {
@@ -941,21 +674,6 @@ impl<'a> Cursor<'a> {
     fn take_i16(&mut self) -> Result<i16, String> {
         Ok(self.take_u16()? as i16)
     }
-    fn take_u64(&mut self) -> Result<u64, String> {
-        let s = self.take(8)?;
-        let mut a = [0u8; 8];
-        a.copy_from_slice(s);
-        Ok(u64::from_le_bytes(a))
-    }
-    fn take_str(&mut self) -> Result<String, String> {
-        let n = self.take_u32()? as usize;
-        let s = self.take(n)?;
-        String::from_utf8(s.to_vec()).map_err(|e| e.to_string())
-    }
-    fn take_blob(&mut self) -> Result<Vec<u8>, String> {
-        let n = self.take_u32()? as usize;
-        Ok(self.take(n)?.to_vec())
-    }
 }
 
 /// Decode `Envelope`s off the Control stream and surface the
@@ -973,7 +691,6 @@ async fn control_recv_loop(
     camera_tx: UnboundedSender<Vec<u8>>,
     audio_tx: UnboundedSender<Vec<u8>>,
     capture_tx: UnboundedSender<Vec<u8>>,
-    file_tx: UnboundedSender<Vec<u8>>,
 ) {
     loop {
         let bytes = match stream.recv().await {
@@ -1049,16 +766,6 @@ async fn control_recv_loop(
             }
             Message::Control(ControlMessage::StopScreenCapture) => {
                 if capture_tx.send(vec![1u8]).is_err() {
-                    return;
-                }
-            }
-            Message::Control(ControlMessage::RequestFileAccess) => {
-                if file_tx.send(vec![0u8]).is_err() {
-                    return;
-                }
-            }
-            Message::Control(ControlMessage::ReleaseFileAccess) => {
-                if file_tx.send(vec![1u8]).is_err() {
                     return;
                 }
             }
@@ -1562,61 +1269,6 @@ pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativeSendInputMessa
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativePollFsRequest<'local>(
-    env: JNIEnv<'local>,
-    _class: JClass<'local>,
-) -> jni::sys::jbyteArray {
-    let fs_req_rx = {
-        let slot = state_slot().lock().expect("state mutex poisoned");
-        match slot.as_ref().and_then(|s| s.session.as_ref()) {
-            Some(sess) => sess.fs_req_rx.clone(),
-            None => return std::ptr::null_mut(),
-        }
-    };
-    let bytes = runtime().block_on(async move {
-        let mut guard = fs_req_rx.lock().await;
-        guard.recv().await
-    });
-    match bytes {
-        Some(b) => match env.byte_array_from_slice(&b) {
-            Ok(arr) => arr.into_raw(),
-            Err(e) => {
-                error!("nativePollFsRequest: byte_array_from_slice: {e}");
-                std::ptr::null_mut()
-            }
-        },
-        None => std::ptr::null_mut(),
-    }
-}
-
-#[unsafe(no_mangle)]
-pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativeFsReply<'local>(
-    env: JNIEnv<'local>,
-    _class: JClass<'local>,
-    reply: JByteArray<'local>,
-) -> jboolean {
-    let bytes = match env.convert_byte_array(&reply) {
-        Ok(b) => b,
-        Err(e) => {
-            error!("nativeFsReply: convert_byte_array: {e}");
-            return jni::sys::JNI_FALSE;
-        }
-    };
-    let fs_reply_tx = {
-        let slot = state_slot().lock().expect("state mutex poisoned");
-        match slot.as_ref().and_then(|s| s.session.as_ref()) {
-            Some(sess) => sess.fs_reply_tx.clone(),
-            None => return jni::sys::JNI_FALSE,
-        }
-    };
-    if fs_reply_tx.send(bytes).is_err() {
-        warn!("nativeFsReply: reply channel closed");
-        return jni::sys::JNI_FALSE;
-    }
-    jni::sys::JNI_TRUE
-}
-
-#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativePollCameraControl<'local>(
     env: JNIEnv<'local>,
     _class: JClass<'local>,
@@ -1708,36 +1360,6 @@ pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativeStopCameraStre
         *guard = None;
     });
     jni::sys::JNI_TRUE
-}
-
-/// Block until the host sends a `ControlMessage::RequestFileAccess`
-/// / `ReleaseFileAccess`. Tag 0 = request, tag 1 = release.
-#[unsafe(no_mangle)]
-pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativePollFileControl<'local>(
-    env: JNIEnv<'local>,
-    _class: JClass<'local>,
-) -> jni::sys::jbyteArray {
-    let rx = {
-        let slot = state_slot().lock().expect("state mutex poisoned");
-        match slot.as_ref().and_then(|s| s.session.as_ref()) {
-            Some(sess) => sess.file_ctrl_rx.clone(),
-            None => return std::ptr::null_mut(),
-        }
-    };
-    let bytes = runtime().block_on(async move {
-        let mut guard = rx.lock().await;
-        guard.recv().await
-    });
-    match bytes {
-        Some(b) => match env.byte_array_from_slice(&b) {
-            Ok(arr) => arr.into_raw(),
-            Err(e) => {
-                error!("nativePollFileControl: byte_array_from_slice: {e}");
-                std::ptr::null_mut()
-            }
-        },
-        None => std::ptr::null_mut(),
-    }
 }
 
 /// Block (in native) until the host sends a

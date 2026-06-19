@@ -1,8 +1,8 @@
 # Consolidated NixOS module for ansync.
 #
-# Imports the per-feature partials (uinput / fuse / v4l2loopback) and
-# wires them with the systemd user unit + udev rule + group
-# memberships. Single import surface for users:
+# Imports the per-feature partials (uinput / v4l2loopback) and wires
+# them with the systemd user unit + udev rule + group memberships.
+# Single import surface for users:
 #
 #   imports = [ inputs.ansync.nixosModules.default ];
 #   services.ansync = {
@@ -18,7 +18,6 @@ in
 {
   imports = [
     ./uinput.nix
-    ./fuse.nix
     ./v4l2loopback.nix
   ];
 
@@ -29,9 +28,8 @@ in
       type = lib.types.str;
       description = ''
         User the daemon runs as. The module adds this user to the
-        `input`, `video`, and `fuse` groups so the daemon can claim
-        uinput, v4l2loopback, and FUSE mounts without privilege
-        escalation.
+        `input` and `video` groups so the daemon can claim uinput
+        and v4l2loopback without privilege escalation.
       '';
     };
 
@@ -77,7 +75,6 @@ in
     users.users.${cfg.user}.extraGroups = [
       "input"
       "video"
-      "fuse"
     ] ++ cfg.extraGroups;
 
     # Install the udev rule + companion APK directory.
