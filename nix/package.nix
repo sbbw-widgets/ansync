@@ -47,7 +47,6 @@ let
       libva-utils
       cudaPackages.cuda_cudart
       v4l-utils
-      bluez
       wayland
       libGL
       libxkbcommon

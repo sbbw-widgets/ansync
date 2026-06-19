@@ -32,7 +32,6 @@ Reescritura moderna de scrcpy en Rust con scope ampliado:
 | Discovery | mDNS (`mdns-sd`) |
 | NAT traversal | NO MVP. Trait `Transport` abstrae para futuro relay/WireGuard |
 | Pairing primario | Cable ADB one-shot (intercambio Ed25519). Después Wi-Fi puro |
-| Pairing secundario | BT-HID para input-only (más adelante) |
 | Crypto handshake | Noise XX vía `snow` |
 | Identity | Ed25519 long-term, X25519 sessions |
 | Proto | `postcard` + `serde`, versionado por `Envelope.version` |
@@ -45,7 +44,6 @@ Reescritura moderna de scrcpy en Rust con scope ampliado:
 | Cámara virtual | trait `VirtualCameraSink`, impl inicial v4l2loopback con nombre = nombre del device |
 | Audio | trait `AudioBackend`, impl inicial PipeWire (`pipewire-rs`) |
 | Input host | trait `VirtualInputDevice`, impl inicial uinput (`input-linux`) |
-| Input BT HID | crate `bluer`, perfil HID Device — secundario, no MVP |
 | Clipboard | trait `ClipboardBackend`, impl wayland (`wl-clipboard-rs`) + X11 fallback |
 | Permisos | `DevicePermissions` por device, persistido en `$XDG_CONFIG_HOME/ansync/devices/{id}.toml` |
 | Logs | `tracing` + `tracing-journald` |
@@ -130,11 +128,6 @@ Object /org/gameros/Ansync1/PairingPrompt
 - Companion app expone `AccessibilityService` (one-time grant) → `dispatchGesture()` para touch, `performGlobalAction()` para back/home, `InputConnection` para texto.
 - Fallback con shell uid vía ADB para casos sin accessibility.
 
-**Modo secundario BT-HID**:
-
-- Crate `bluer`, perfil HID Device. Permite Android-as-keyboard/stylus sin companion en PC.
-- No MVP — Step 13.
-
 ## Workspace layout
 
 ```
@@ -156,7 +149,7 @@ ansync/
 │   ├── video/                  wrap ferricast-decoder, render a wgpu texture
 │   ├── audio/                  trait AudioBackend + PipeWire impl
 │   ├── camera/                 trait VirtualCameraSink + v4l2loopback impl
-│   ├── input/                  trait VirtualInputDevice + uinput + BT HID impls
+│   ├── input/                  trait VirtualInputDevice + uinput impl
 │   ├── files/                  transfer protocol
 │   ├── clipboard/              trait ClipboardBackend + wayland/X11 impls
 │   ├── permissions/            DevicePermissions store + D-Bus surface
@@ -238,9 +231,7 @@ ansync/
   - Companion native: `nativeSendClipboardText` (one-shot stream open + send) + `nativePollClipboardText`. Blob payloads se loguean + descartan por ahora (text-only para Step 12 ship).
   - Companion Kotlin: `ClipboardBridge` polea native + `ClipboardManager.setPrimaryClip`. `pushToHost()` lee `primaryClip` y manda via JNI. `AnsyncCompanionService` arranca/para el bridge.
   - `Capabilities::CLIPBOARD` default-on en `DaemonConfig`.
-- [x] **Step 13** — `input` BT-HID secundario via `bluer` (scaffold)
-  - `ansync_input::bt_hid::BtHidFactory` impl `InputDeviceFactory` (feature `bt-hid`). `BtHidDevice` abre `bluer::Session` + adapter, set_powered, loguea HID reports sin transmitirlos.
-  - Wire surface lista para que daemon-core pick BT factory en lugar de uinput cuando el peer pareé via BT en lugar de cable; profile SDP + L2CAP control/interrupt channels son follow-up.
+- [x] **Step 13 (BT-HID) dropped 2026-06-19** — Companion `TouchpadActivity` + `GamepadActivity` + uinput cubren input remoto. BT-HID standalone (Android-as-HID sin companion) sale del scope; `bluer` dep + `bt_hid.rs` + `InputBackend::BtHid` + `bluez` nix retirados.
 - [x] **Step 14** — Nix module + crane derivation
   - `nix/package.nix` — crane build, importa workspace, instala udev rule + systemd user unit a `$out`.
   - `nix/module.nix` — NixOS module consolidado. Importa `uinput.nix` + `v4l2loopback.nix`. Opciones `services.ansync.{enable,user,package,extraGroups}`. Suma el user a `input`/`video`. Wirea systemd user unit con sandboxing (`ProtectSystem=strict`, etc.).
@@ -302,13 +293,7 @@ Gaps identificados al cerrar el roadmap. Ordenados por severidad. Cada uno es bo
   - `AnsyncFsServer` retorna ENOSYS para `write/create/unlink/rename/truncate/chmod`. Implementar usando `DocumentsContract.createDocument` / `deleteDocument` / `renameDocument` / `OutputStream` via `openOutputStream(uri, "w" | "wa" | "rwt")`. `chmod` deja `ENOSYS` (SAF no expone modes — limitación intencional).
   - Files: `android/app/src/main/java/.../AnsyncFsServer.kt`.
 
-- [x] **R6 — BT-HID full profile registration (cerrar Step 13)**
-  - `BtHidDevice::send` loguea sin transmitir. Wirea:
-    - SDP record con HID descriptor (keyboard / mouse / gamepad reports).
-    - L2CAP PSM 0x11 (control) + 0x13 (interrupt) sockets via `bluer::l2cap::Socket`.
-    - HID Boot protocol report frames matching `InputEvent` → 6+2 byte keyboard reports / 3-byte mouse reports / etc.
-  - `daemon-core::DaemonConfig` gana `input_backend: InputBackend{Uinput|BtHid}` enum. `Daemon::run` construye `BtHidFactory` si elegido.
-  - Files: `crates/input/src/bt_hid.rs`, `crates/daemon-core/src/lib.rs`.
+- [x] **R6 (BT-HID full profile) dropped 2026-06-19** — Step 13 retirado entero; ver entry de Step 13.
 
 - [x] **R7 — Android MediaSession widget para audio route**
   - `AudioMediaSession.kt` envuelve `android.media.session.MediaSession` (raw API, no Compat — minSdk 26 ya cubre). `FLAG_HANDLES_MEDIA_BUTTONS | FLAG_HANDLES_TRANSPORT_CONTROLS` activa AVRCP / hardware media keys / Wear OS / Auto. Lock-screen widget aparece automático cuando `PlaybackState = PLAYING`.
@@ -558,7 +543,7 @@ Categorías:
 - **ui**: eframe, egui, wgpu (consumidos en Step 6)
 - **audio**: pipewire (consumido en Step 11)
 - **camera**: v4l (consumido en Step 10)
-- **input**: input-linux, bluer (consumidos en Steps 7 / 13)
+- **input**: input-linux (consumido en Step 7)
 - **clipboard**: wl-clipboard-rs (consumido en Step 12)
 - **cli**: clap
 - **ferricast** (path deps `../../ferricast/crates/...`): ferricast-core, ferricast-encoder, ferricast-decoder — wired en Steps 5/6

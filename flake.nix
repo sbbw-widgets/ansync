@@ -67,9 +67,6 @@
             # Camera
             v4l-utils
 
-            # Bluetooth
-            bluez
-
             # Gamepad input — `gilrs` opens evdev nodes for connected
             # controllers and pulls hot-plug events from libudev. We
             # use `eudev` (the systemd-less fork) so the runtime

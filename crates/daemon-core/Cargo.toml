@@ -31,9 +31,3 @@ directories.workspace = true
 zbus.workspace = true
 libc.workspace = true
 sha2.workspace = true
-
-[features]
-default = []
-# Pass-through to the input crate; daemon-core picks the factory at
-# runtime based on `DaemonConfig.input_backend`.
-bt-hid = ["ansync-input/bt-hid"]

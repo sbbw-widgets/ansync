@@ -109,9 +109,8 @@ cpal = "0.15"
 v4l = "0.14"
 libc = "0.2"
 
-# Input (consumed in Steps 7 / 13)
+# Input (consumed in Step 7)
 input-linux = "0.7"
-bluer = { version = "0.17", default-features = false, features = ["bluetoothd", "l2cap"] }
 
 # Pure-Rust ADB client (Step 16). Replaces the `Command::new("adb")`
 # shell-outs from `pair_host_via_adb` etc. with structured calls

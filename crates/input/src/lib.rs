@@ -1,10 +1,8 @@
 //! Virtual input device abstraction.
 //!
-//! Two impl families:
-//! - `uinput` — local kernel uinput devices (default Linux path).
-//! - `bt-hid` — Bluetooth HID Device profile via `bluer`, lets the Android
-//!   device act as a keyboard / stylus / gamepad for the host without any
-//!   host-side companion.
+//! Linux-side impl is `uinput` — kernel evdev devices created on
+//! demand, fed events the host receives over the QUIC `Input`
+//! stream.
 
 use async_trait::async_trait;
 
@@ -13,14 +11,9 @@ pub mod session;
 #[cfg(feature = "uinput")]
 pub mod uinput;
 
-#[cfg(feature = "bt-hid")]
-pub mod bt_hid;
-
 pub use session::{InputDeviceFactory, InputSession, SessionError};
 #[cfg(feature = "uinput")]
 pub use session::UinputFactory;
-#[cfg(feature = "bt-hid")]
-pub use bt_hid::BtHidFactory;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputKind {

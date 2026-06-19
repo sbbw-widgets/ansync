@@ -68,15 +68,10 @@ pub enum DaemonError {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputBackend {
-    /// Local kernel uinput devices. The default; works on every
-    /// Linux host with the `uinput` module loaded + a udev rule that
-    /// lets the daemon's user write `/dev/uinput`.
+    /// Local kernel uinput devices. Works on every Linux host with
+    /// the `uinput` module loaded + a udev rule that lets the
+    /// daemon's user write `/dev/uinput`.
     Uinput,
-    /// Bluetooth HID Device. Turns the host into a BT-HID emitter
-    /// the peer (or any other paired host) consumes. Requires BlueZ
-    /// running + the adapter powered. SDP profile registration is
-    /// best-effort — see `ansync_input::bt_hid` for caveats.
-    BtHid,
 }
 
 #[derive(Debug, Clone)]
@@ -235,18 +230,6 @@ impl Daemon {
 
         let factory: Arc<dyn InputDeviceFactory> = match self.config.input_backend {
             InputBackend::Uinput => Arc::new(UinputFactory),
-            InputBackend::BtHid => {
-                #[cfg(feature = "bt-hid")]
-                {
-                    Arc::new(ansync_input::BtHidFactory::new())
-                }
-                #[cfg(not(feature = "bt-hid"))]
-                {
-                    return Err(DaemonError::Startup(
-                        "input_backend = BtHid requires the `bt-hid` feature".into(),
-                    ));
-                }
-            }
         };
         // RAM diagnostic: print VmRSS every 30 s under
         // `RUST_LOG=ansync_daemon_core=debug`. Useful for telling
