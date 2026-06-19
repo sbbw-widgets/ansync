@@ -36,7 +36,7 @@ use ansync_transport::pinning::TrustedPeers;
 use ansync_transport::{
     Connection, QuicConnection, QuicServer, QuicStream, QuicTransport, Stream as _, StreamKind,
 };
-use ansync_video::{HostDecoder, PixelFormat, VideoCodec, VideoDecoder};
+use ansync_video::{DecodedFrame, HostDecoder, PixelFormat, VideoCodec, VideoDecoder};
 
 mod mirror_subprocess;
 use mirror_subprocess::spawn_mirror_subprocess;
@@ -212,6 +212,7 @@ impl Daemon {
 
         let dbus_conn = serve(state.clone()).await?;
         info!(service = ansync_dbus::SERVICE_NAME, "D-Bus surface ready");
+        let dbus_conn_arc = Arc::new(dbus_conn);
 
         let mirrors = Arc::new(MirrorRegistry::default());
         let cameras = Arc::new(CameraRegistry::default());
@@ -225,6 +226,7 @@ impl Daemon {
             audios.clone(),
             permissions.clone(),
             clipboard_sync.clone(),
+            dbus_conn_arc.clone(),
         ));
 
         let device_name = DeviceName(self.config.device_name.clone());
@@ -255,7 +257,6 @@ impl Daemon {
         // because reading `/proc/self/status` has no resource to
         // release on drop.
         let mem_stats_handle = tokio::spawn(mem_stats_loop());
-        let dbus_conn_arc = Arc::new(dbus_conn);
         let watcher_handle = tokio::spawn(companion_watcher(
             state.clone(),
             dbus_conn_arc.clone(),
@@ -595,21 +596,22 @@ async fn action_loop(
     audios: Arc<AudioRegistry>,
     permissions: Arc<dyn ansync_permissions::PermissionsStore>,
     clipboard_sync: ClipboardSync,
+    dbus_conn: Arc<zbus::Connection>,
 ) {
     while let Some(action) = rx.recv().await {
         match action {
             DaemonAction::StartAudioRoute { device, direction } => {
-                if let Err(e) =
-                    handle_start_audio(&mirrors, &audios, &permissions, &device, direction).await
-                {
-                    warn!(%device, error = %e, "StartAudioRoute failed");
+                match handle_start_audio(&mirrors, &audios, &permissions, &device, direction).await {
+                    Ok(()) => emit_stream(&dbus_conn, &device, "audio", true).await,
+                    Err(e) => warn!(%device, error = %e, "StartAudioRoute failed"),
                 }
             }
             DaemonAction::StopAudioRoute { device } => {
                 handle_stop_audio(&audios, &device).await;
+                emit_stream(&dbus_conn, &device, "audio", false).await;
             }
             DaemonAction::StartMicrophone { device } => {
-                if let Err(e) = handle_start_audio(
+                match handle_start_audio(
                     &mirrors,
                     &audios,
                     &permissions,
@@ -618,11 +620,13 @@ async fn action_loop(
                 )
                 .await
                 {
-                    warn!(%device, error = %e, "StartMicrophone failed");
+                    Ok(()) => emit_stream(&dbus_conn, &device, "mic", true).await,
+                    Err(e) => warn!(%device, error = %e, "StartMicrophone failed"),
                 }
             }
             DaemonAction::StopMicrophone { device } => {
                 handle_stop_audio(&audios, &device).await;
+                emit_stream(&dbus_conn, &device, "mic", false).await;
             }
             DaemonAction::SyncClipboard { device } => {
                 if let Err(e) =
@@ -659,15 +663,16 @@ async fn action_loop(
                 }
             }
             DaemonAction::StartCamera { device, config } => {
-                if let Err(e) =
-                    handle_start_camera(&mirrors, &cameras, &permissions, &device, config).await
+                match handle_start_camera(&mirrors, &cameras, &permissions, &device, config).await
                 {
-                    warn!(%device, error = %e, "StartCamera failed");
+                    Ok(()) => emit_stream(&dbus_conn, &device, "camera", true).await,
+                    Err(e) => warn!(%device, error = %e, "StartCamera failed"),
                 }
             }
             DaemonAction::StopCamera { device } => {
-                if let Err(e) = handle_stop_camera(&cameras, &device).await {
-                    warn!(%device, error = %e, "StopCamera failed");
+                match handle_stop_camera(&mirrors, &cameras, &device).await {
+                    Ok(()) => emit_stream(&dbus_conn, &device, "camera", false).await,
+                    Err(e) => warn!(%device, error = %e, "StopCamera failed"),
                 }
             }
             DaemonAction::ShowScreen { device } => {
@@ -760,7 +765,10 @@ async fn action_loop(
                 )
                 .await
                 {
-                    Ok(()) => info!(%device, "ShowScreen: subprocess spawned"),
+                    Ok(()) => {
+                        info!(%device, "ShowScreen: subprocess spawned");
+                        emit_stream(&dbus_conn, &device, "screen", true).await;
+                    }
                     Err(e) => warn!(%device, error = %e, "ShowScreen subprocess failed"),
                 }
             }
@@ -798,8 +806,26 @@ async fn action_loop(
                     }
                 }
                 info!(%device, "HideScreen: subprocess down, companion notified");
+                emit_stream(&dbus_conn, &device, "screen", false).await;
             }
         }
+    }
+}
+
+/// Fire-and-forget wrapper around `Device::emit_stream_state` so the
+/// action loop doesn't have to spell out the error path on every
+/// call. Failures (peer never connected → no D-Bus path) are logged
+/// at debug since they're benign.
+async fn emit_stream(
+    conn: &Arc<zbus::Connection>,
+    device: &DeviceId,
+    kind: &str,
+    active: bool,
+) {
+    if let Err(e) =
+        ansync_dbus::Device::emit_stream_state(conn.as_ref(), device, kind, active).await
+    {
+        debug!(%device, kind, active, error = %e, "emit_stream_state failed");
     }
 }
 
@@ -1105,7 +1131,21 @@ async fn camera_stream_loop(
                 return;
             }
             Err(e) => {
-                warn!(%peer_id, error = %e, "camera stream recv error");
+                // StopCamera path: companion drops its end of the stream
+                // and quinn surfaces that as `early eof` on the next
+                // recv. The local side already cleared `frame_tx` so we
+                // know this is a graceful teardown — keep the log at
+                // info to avoid scaring the user.
+                let graceful = entry
+                    .frame_tx
+                    .lock()
+                    .expect("frame tx slot poisoned")
+                    .is_none();
+                if graceful {
+                    info!(%peer_id, "camera stream closed by peer");
+                } else {
+                    warn!(%peer_id, error = %e, "camera stream recv error");
+                }
                 return;
             }
         };
@@ -1792,9 +1832,32 @@ async fn handle_start_camera(
 }
 
 async fn handle_stop_camera(
+    mirrors: &MirrorRegistry,
     cameras: &CameraRegistry,
     device: &DeviceId,
 ) -> Result<(), DaemonError> {
+    // Push the StopCamera control to the companion FIRST so the
+    // Android-side `CameraSession` tears down its sensor + encoder
+    // before we drop the local sink. If we yanked the local
+    // pipeline before notifying the device, Camera2 + MediaCodec
+    // would keep running for ~60 s of idle frames (no consumer
+    // backpressure on the Surface input path) and the LED + battery
+    // drain would stay on. Best-effort: if the conn is gone we
+    // proceed with the local teardown anyway.
+    let conn_opt = mirrors.get(device).and_then(|mirror| {
+        mirror
+            .conn
+            .lock()
+            .expect("conn slot poisoned")
+            .clone()
+    });
+    if let Some(conn) = conn_opt {
+        if let Err(e) = send_control(&conn, ControlMessage::StopCamera).await {
+            warn!(%device, error = %e, "StopCamera control push failed");
+        }
+    } else {
+        warn!(%device, "StopCamera: peer not connected; skipping wire push");
+    }
     let entry = match cameras.get(device) {
         Some(e) => e,
         None => return Ok(()),
@@ -1847,14 +1910,16 @@ async fn camera_decode_loop(
                 continue;
             }
         };
-        let pixel = match frame.format {
-            PixelFormat::Nv12 => CameraPixelFormat::Nv12,
-            PixelFormat::I420 => CameraPixelFormat::Nv12,
-            // BGRA / RGBA decoders should be exceedingly rare for
-            // companion camera streams (Android encodes NV12 from the
-            // HW pipeline); if it does happen we drop the frame
-            // rather than do a CPU repack — v4l2loopback wouldn't
-            // present BGRA correctly to most consumers anyway.
+        // v4l2loopback consumers (OBS / browsers / Discord) expect a
+        // tightly packed NV12 buffer: Y plane `w*h` bytes followed by
+        // interleaved UV `w*h/2`. Hardware decoders almost always emit
+        // either NV12 with a row stride > width (NVDEC pads to 256 / 512)
+        // or I420 (three separate planes). Feeding the raw decoder buffer
+        // straight to the sink produces solid-green output because the
+        // chroma offsets land in the wrong place. Convert here.
+        let packed = match frame.format {
+            PixelFormat::Nv12 => repack_nv12(&frame),
+            PixelFormat::I420 => i420_to_nv12(&frame),
             PixelFormat::Bgra8 | PixelFormat::Rgba8 => {
                 warn!("camera decoder emitted packed RGB; dropping (sink wants NV12)");
                 continue;
@@ -1872,7 +1937,7 @@ async fn camera_decode_loop(
                 width: frame.width,
                 height: frame.height,
                 fps: 30,
-                pixel_format: pixel,
+                pixel_format: CameraPixelFormat::Nv12,
             };
             if let Err(e) = sink.register(&entry.peer_name, fmt).await {
                 warn!(error = %e, "camera sink register failed");
@@ -1880,11 +1945,69 @@ async fn camera_decode_loop(
             }
             sink_registered = true;
         }
-        if let Err(e) = sink.write_frame(frame.data).await {
+        if let Err(e) = sink.write_frame(packed).await {
             warn!(error = %e, "camera sink write_frame failed");
         }
     }
     info!(name = %entry.peer_name, "camera_decode_loop: channel closed");
+}
+
+/// Copy a stride-padded NV12 buffer into a tightly packed `width * height *
+/// 3 / 2` byte block. When the decoder already emits no padding this is a
+/// single contiguous copy.
+fn repack_nv12(frame: &DecodedFrame) -> bytes::Bytes {
+    let w = frame.width as usize;
+    let h = frame.height as usize;
+    let stride = frame.stride.max(frame.width) as usize;
+    if stride == w {
+        return frame.data.clone();
+    }
+    let mut out = vec![0u8; w * h * 3 / 2];
+    let src = frame.data.as_ref();
+    for row in 0..h {
+        let s = row * stride;
+        let d = row * w;
+        out[d..d + w].copy_from_slice(&src[s..s + w]);
+    }
+    let uv_src_base = stride * h;
+    let uv_dst_base = w * h;
+    for row in 0..(h / 2) {
+        let s = uv_src_base + row * stride;
+        let d = uv_dst_base + row * w;
+        out[d..d + w].copy_from_slice(&src[s..s + w]);
+    }
+    bytes::Bytes::from(out)
+}
+
+/// Convert I420 (three planes Y / U / V, U+V each at half-stride and
+/// half-height) into tightly packed NV12. v4l2loopback consumers can't read
+/// I420 from us because we negotiated the FOURCC as `NV12` upstream.
+fn i420_to_nv12(frame: &DecodedFrame) -> bytes::Bytes {
+    let w = frame.width as usize;
+    let h = frame.height as usize;
+    let y_stride = frame.stride.max(frame.width) as usize;
+    let uv_stride = y_stride / 2;
+    let src = frame.data.as_ref();
+    let mut out = vec![0u8; w * h * 3 / 2];
+    for row in 0..h {
+        let s = row * y_stride;
+        let d = row * w;
+        out[d..d + w].copy_from_slice(&src[s..s + w]);
+    }
+    let u_base = y_stride * h;
+    let v_base = u_base + uv_stride * (h / 2);
+    let uv_dst_base = w * h;
+    let half_w = w / 2;
+    for row in 0..(h / 2) {
+        let u_row = u_base + row * uv_stride;
+        let v_row = v_base + row * uv_stride;
+        let d = uv_dst_base + row * w;
+        for col in 0..half_w {
+            out[d + col * 2] = src[u_row + col];
+            out[d + col * 2 + 1] = src[v_row + col];
+        }
+    }
+    bytes::Bytes::from(out)
 }
 
 async fn input_writer_loop(

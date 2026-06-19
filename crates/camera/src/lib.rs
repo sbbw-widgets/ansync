@@ -9,6 +9,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 
 #[cfg(feature = "v4l2loopback")]
+pub mod dyn_ctl;
+#[cfg(feature = "v4l2loopback")]
 pub mod v4l2loopback;
 
 #[cfg(feature = "v4l2loopback")]

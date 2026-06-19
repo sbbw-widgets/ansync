@@ -341,9 +341,12 @@ Gaps identificados al cerrar el roadmap. Ordenados por severidad. Cada uno es bo
   - Wired en `AnsyncCompanionService.handleStartAudio` + `handleStopAudio` + `startAudioFromTile` + `stopAudioFromTile` + `onDestroy`. Dirección merge/peel mantiene MediaSession sincronizada con `AudioRouter` actual.
   - Gradle: `androidx.media:media:1.7.0` agregado al version catalog para `androidx.media.app.NotificationCompat.MediaStyle`.
 
-- [ ] **R8 — v4l2loopback card_label per-peer** (limitación upstream, no fixable host-side)
-  - Documentado en README. Opciones futuras: feature request a v4l2loopback upstream, o switch a PipeWire-camera backend cuando madure el API (alternative implementation behind `pipewire-camera` feature flag, future trait impl en `ansync_camera`).
-  - No action item hasta upstream cambio.
+- [x] **R8 — v4l2loopback card_label per-peer** (cerrado vía dyn-ctl ioctl)
+  - Re-evaluado: v4l2loopback 0.13+ expone `/dev/v4l2loopback` con `V4L2LOOPBACK_CTL_ADD` (struct `v4l2_loopback_config` con `card_label[32]` per call). Mismo path que usa `v4l2loopback-ctl add`.
+  - Nuevo `ansync_camera::dyn_ctl`: raw libc::ioctl sobre el control device. `add(label, w, h) -> (nr, /dev/videoN)`, `remove(nr)`, `version()` con gate `>= 0.15` antes de trustear el struct layout. Static assert `size_of::<LoopbackConfig>() == 72` previene drift.
+  - `V4l2LoopbackSink::register` ahora intenta dyn-add primero (label = `"<Build.MODEL> (Ansync)"` derivado del peer name vía U1 Hello), cae a static scan si `/dev/v4l2loopback` no existe o el ioctl falla. `unregister` REMOVE el node owned + drop del fd antes de REMOVE (kernel devuelve EBUSY si hay openers). Rollback REMOVE en path de error post-add.
+  - `nix/v4l2loopback.nix` reescrito: `devices=0` (sin pre-cargar nodes), udev rule para `/dev/v4l2loopback` group `video`, catch-all rule para video[0-9]* whose driver es v4l2loopback. README troubleshooting actualizado.
+  - 4 tests label encoding (build_card_label) + 2 ABI tests pasan. PipeWire-camera fallback queda como nice-to-have futuro pero ya no necesario para resolver per-peer label.
 
 - [ ] **R10 — Sensors wire**
   - `Capabilities::SENSORS` + `Permission::Sensors` existen sin proto/handlers. Bajo prioridad (no es feature core scrcpy-equivalent).
@@ -400,6 +403,17 @@ Surfaceado mientras se probaba el pair WiFi + mirror lifecycle real con DMS. Cad
   - Nuevo `SetupStep.BatteryWhitelist`: lanza `ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS` con `Uri.fromParts("package", …)`. Fallback a `ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS`. `KeepAlive.isBatteryWhitelisted(ctx)` para `isDone`.
   - Manifest: nueva perm `REQUEST_IGNORE_BATTERY_OPTIMIZATIONS`.
 
+- [x] **S11 — Camera UX + sink fixes**
+  - **Short writes**: `V4l2LoopbackSink::write_frame` ahora loop hasta drenar `frame.len()`. POSIX write(2) puede devolver < total (v4l2loopback cappea por buffer slot del ringbuffer). Retry en `EINTR`/`EAGAIN`; surface `WriteZero` si kernel devuelve 0 bytes (sin consumer).
+  - **StopCamera no propagaba al device**: `handle_stop_camera` ahora dispara `ControlMessage::StopCamera` por `StreamKind::Control` ANTES del teardown local. Sin esto, `CameraSession` Camera2 + MediaCodec quedaban corriendo (no hay backpressure por Surface input) → LED + drain de batería persistentes. Mantenemos teardown local aunque el send falle (peer puede haber colgado).
+  - **DMS picker popup**: nuevo `popoutState === "camera"` en `AnsyncWidget.qml`. Click en camera tile OFF → popup con DankDropdowns para lens (back/front), resolución (1920x1080 / 1280x720 / 4K / etc.), fps (15/24/30/60), codec (h264/h265), aspect (crop/letterbox/stretch), bitrate (DankTextField), toggle stabilization. Pre-seeded con `pluginData` defaults. Click ON → stop directo (sin popup). Defaults siguen modificables desde Settings.
+
+- [x] **S10 — NixOS module abre firewall por default**
+  - Síntoma reportado: tras restart del daemon el companion mostraba `companion reachable on LAN` repetido pero cero handshake. Diagnóstico: `networking.firewall.allowedUDPPorts` en el host solo tenía 5353; UDP 47215 (QUIC) bloqueado por kernel → `ConnState::Disconnected` permanente.
+  - `nix/module.nix` gana opciones `services.ansync.quicPort` (default 47215) + `services.ansync.openFirewall` (default true). Cuando ambos están on, `networking.firewall.allowedUDPPorts = [ quicPort 5353 ]` se setea automático.
+  - README: nueva sección Firewall (post Install manual) + entry de Troubleshooting para device pegado en Disconnected con mDNS funcionando.
+  - Eval verificada: `nix eval ... config.networking.firewall.allowedUDPPorts → [ 5353 47215 ]`.
+
 - [x] **S9 — DMS plugin: toggle buttons + auto-detect pair**
   - Cambios en `~/.config/DankMaterialShell/plugins/Ansync/` (no es repo git, sin commit).
   - `AnsyncService.qml`: `streams: { id: {mirror, mic, camera, audio} }` cache local + helpers `isStreamOn / toggleScreen / toggleMic / toggleCamera / toggleAudio`. Reset cache on device-offline. Nuevas funciones `browseAvailable / startWifiPair / submitPin / cancelPair` para el flujo D-Bus de PairingSession. Signals `wifiCandidatesFound / wifiPairStarted / wifiPairAwaitingPin / wifiPairCompleted / wifiPairFailed`. `_busMonitor` ahora parsea PairingSession `PropertiesChanged` + `Completed` + `Failed`.
@@ -449,7 +463,7 @@ Surfaceado mientras se probaba el pair WiFi + mirror lifecycle real con DMS. Cad
 - Empezar por R1, R2, R4, R9 (bloqueantes). Cada uno cierra en <1h.
 - R5 + R6 son medias jornadas individuales por la complejidad del wire format (SAF mutations) / BT stack.
 - R7, R11 son cosmética: dejan para post-v1.
-- R8 documentar como upstream limitation en README + cerrar como WONTFIX.
+- ~~R8 documentar como upstream limitation en README + cerrar como WONTFIX.~~ Cerrado vía dyn-ctl ioctl (sesión 2026-06-18).
 - R10 evaluar demanda: si nadie lo pide, dropear del scope.
 
 ## Triaje UX post-v1 (sesión 2026-06-15)

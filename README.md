@@ -30,7 +30,7 @@ Pre-alpha. Funcional end-to-end para los flujos principales. Roadmap completo en
   - Android → PC: keyboard / mouse / touchscreen MT-B / stylus / gamepad XInput-like via uinput.
 - **Transferencia de archivos** con sha256 verify + chunks de 256 KiB.
 - **FUSE mount** del FS Android (SAF backend en companion). Auto-mount al connect si `files_mount` ON.
-- **Cámara virtual** v4l2loopback con frames de Camera2 + MediaCodec H.264/H.265.
+- **Cámara virtual** v4l2loopback con frames de Camera2 + MediaCodec H.264/H.265. Per-peer naming: cada Android paireado aparece en el picker (Chromium / Firefox / OBS / Discord) como `"<modelo> (Ansync)"` — el daemon hace ADD/REMOVE dinámico sobre `/dev/v4l2loopback` por sesión, sin pre-cargar nodes estáticos.
 - **Audio bidireccional**: cpal (Linux PipeWire/ALSA) ↔ AudioRecord/AudioTrack. 48 kHz stereo S16LE.
 - **Clipboard sync** Wayland ↔ Android ClipboardManager, con gates por device.
 - **Descubrimiento** automático mDNS (`_ansync._udp.local.`).
@@ -88,7 +88,7 @@ Codecs vía [ferricast](../../ferricast) — NVENC, VAAPI, openh264 SW fallback.
 }
 ```
 
-El módulo carga uinput + v4l2loopback + FUSE, agrega `alice` a los grupos `input`/`video`/`fuse`, e instala el systemd user unit (`systemctl --user enable ansyncd`).
+El módulo carga uinput + v4l2loopback + FUSE, agrega `alice` a los grupos `input`/`video`/`fuse`, abre los puertos firewall que el daemon necesita (UDP `47215` QUIC + UDP `5353` mDNS), e instala el systemd user unit (`systemctl --user enable ansyncd`). El puerto QUIC se override con `services.ansync.quicPort = N;` y el firewall se puede desactivar con `services.ansync.openFirewall = false;` si lo gestionás vos en otro módulo.
 
 home-manager (sin NixOS):
 
@@ -108,8 +108,36 @@ sudo install -Dm755 target/release/ansyncd /usr/local/bin/ansyncd
 sudo install -Dm755 target/release/ansyncctl /usr/local/bin/ansyncctl
 sudo install -Dm644 bins/ansyncd/contrib/60-ansync-uinput.rules /etc/udev/rules.d/
 sudo udevadm control --reload-rules && sudo udevadm trigger
-sudo modprobe v4l2loopback devices=1 video_nr=10 card_label="Ansync" exclusive_caps=1
+sudo modprobe v4l2loopback devices=0
+sudo chgrp video /dev/v4l2loopback && sudo chmod 0660 /dev/v4l2loopback
 sudo usermod -aG input,video,fuse $USER
+```
+
+### Firewall
+
+El companion descubre el daemon por mDNS y dialea por QUIC sobre UDP. Si el firewall del host bloquea esos paquetes, el device aparece para siempre como `Disconnected` aunque mDNS/announce funcione (la conexión QUIC inbound nunca completa el handshake).
+
+Puertos a abrir en el host:
+
+| Proto | Puerto | Para qué |
+|-------|--------|----------|
+| UDP   | `47215` | QUIC server del daemon (companion → host). Override con `services.ansync.quicPort` o flag `--listen 0.0.0.0:<port>` al daemon. |
+| UDP   | `5353`  | mDNS (anuncio + browse). Compartido con cualquier otro stack zeroconf en el host (Avahi, etc.). |
+
+Con el módulo NixOS de arriba ambos se abren automático (`services.ansync.openFirewall = true` por default). Manual con firewall de NixOS:
+
+```nix
+networking.firewall.allowedUDPPorts = [ 5353 47215 ];
+```
+
+`firewalld` / `ufw` / `iptables` raw:
+
+```sh
+sudo firewall-cmd --add-port=47215/udp --permanent && sudo firewall-cmd --reload
+# o
+sudo ufw allow 47215/udp
+# o (run-time, no persiste)
+sudo iptables -I INPUT -p udp --dport 47215 -j ACCEPT
 ```
 
 ## Pair
@@ -190,11 +218,12 @@ Toggle vía `ansyncctl perm <id> <flag> on|off` o D-Bus `Permissions.Set`.
 
 ## Troubleshooting
 
-- `ansyncd` se queja de `BackendUnavailable` para camera → `v4l2loopback` no cargado o `card_label` no matchea. `lsmod | grep v4l2loopback` y `modprobe v4l2loopback ...`.
+- `ansyncd` se queja de `BackendUnavailable` para camera → `v4l2loopback` no cargado, o el daemon no puede abrir `/dev/v4l2loopback`. `lsmod | grep v4l2loopback`, `ls -l /dev/v4l2loopback` (debe ser group `video` y el user del daemon en ese grupo). Si el módulo está en modo estático legacy (`devices=N video_nr=...`) el daemon usa scan + reusa el node pre-creado, pero pierde el per-peer label — recargar con `devices=0` para activar el modo dinámico.
 - Mirror window vacía → companion no abrió `StreamKind::Video` aún. Botón "Start screen capture" en el app, grant MediaProjection.
 - Pair falla con "companion did not connect in time" → el broadcast `am broadcast PAIR` no llegó al `PairingReceiver`. `adb shell pm list packages org.gameros.ansync` para verificar install. El log del companion sale en `adb logcat -s ansync*`.
 - Audio mudo → `pactl list short sinks` debería mostrar la default donde cpal escribe. Para route inverso, el RECORD_AUDIO runtime perm tiene que estar grant-ed en el companion.
 - FUSE mount vacío → companion no eligió tree URI. "Pick shared folder" en MainActivity + `ACTION_OPEN_DOCUMENT_TREE`.
+- Device pegado en `Disconnected` aunque el daemon log muestre `companion reachable on LAN` → firewall del host está dropeando el QUIC inbound. Verificá que UDP `47215` esté abierto (ver § Firewall). Con NixOS módulo, asegurate de tener `services.ansync.openFirewall = true` (default). Con firewall externo (router / AP isolation / corporate VLAN) el companion mDNS-resuelve pero los paquetes UDP nunca llegan al daemon.
 
 ## Logs
 

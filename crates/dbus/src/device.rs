@@ -290,6 +290,19 @@ impl Device {
         ctxt: &zbus::object_server::SignalEmitter<'_>,
         id: u64,
     ) -> zbus::Result<()>;
+
+    /// Fired on every stream lifecycle transition (camera, microphone,
+    /// audio-out, mirror, files-mount, …). `kind` is the lowercase tag
+    /// (`"camera"`, `"mic"`, `"audio"`, `"screen"`, `"files"`); `active`
+    /// reflects the new state. UIs that drive the stream via D-Bus —
+    /// DMS plugin, ansyncctl — listen here so a `gdbus` call from
+    /// another process re-syncs the widget without polling.
+    #[zbus(signal)]
+    pub async fn stream_state_changed(
+        ctxt: &zbus::object_server::SignalEmitter<'_>,
+        kind: &str,
+        active: bool,
+    ) -> zbus::Result<()>;
 }
 
 impl Device {
@@ -332,5 +345,28 @@ impl Device {
         )
         .await?;
         Ok(())
+    }
+
+    /// Emit `StreamStateChanged(kind, active)` on `Device` for a peer.
+    /// Used by `daemon-core` after `handle_start_*` / `handle_stop_*`
+    /// succeeds. No-op when the per-device interface isn't registered
+    /// (peer never connected → no D-Bus path).
+    pub async fn emit_stream_state(
+        conn: &zbus::Connection,
+        device: &DeviceId,
+        kind: &str,
+        active: bool,
+    ) -> zbus::Result<()> {
+        let path = crate::path_device(device);
+        let object_path = zbus::zvariant::ObjectPath::try_from(path.as_str())
+            .map_err(|e| zbus::Error::Failure(format!("bad path {path}: {e}")))?;
+        let Ok(iface) = conn
+            .object_server()
+            .interface::<_, Device>(object_path)
+            .await
+        else {
+            return Ok(());
+        };
+        Device::stream_state_changed(iface.signal_emitter(), kind, active).await
     }
 }

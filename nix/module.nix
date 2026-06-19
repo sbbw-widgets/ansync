@@ -46,6 +46,28 @@ in
       default = [ ];
       description = "Additional groups to add the daemon user to.";
     };
+
+    quicPort = lib.mkOption {
+      type = lib.types.port;
+      default = 47215;
+      description = ''
+        UDP port the QUIC server binds to. The default matches
+        `DaemonConfig.listen_addr` in the daemon — only override
+        if you also pass `--listen 0.0.0.0:<port>` to ansyncd.
+      '';
+    };
+
+    openFirewall = lib.mkOption {
+      type = lib.types.bool;
+      default = true;
+      description = ''
+        Open the firewall for the QUIC server port and mDNS (5353).
+        Without this, the companion's connection attempts and the
+        peer-discovery announce/browse both die at the kernel without
+        reaching the daemon. Disable only if you manage firewall
+        rules in a separate module.
+      '';
+    };
   };
 
   config = lib.mkIf cfg.enable {
@@ -60,6 +82,14 @@ in
 
     # Install the udev rule + companion APK directory.
     services.udev.packages = [ ansyncPkg ];
+
+    # Open the QUIC server port + mDNS so the companion can reach
+    # the daemon and resolve its announce. Without 47215 the inbound
+    # QUIC INITIAL is dropped and the device stays Disconnected
+    # forever from the GUI's perspective.
+    networking.firewall = lib.mkIf cfg.openFirewall {
+      allowedUDPPorts = [ cfg.quicPort 5353 ];
+    };
 
     # The daemon's systemd user unit ships inside the package; this
     # tells systemd to expose it so users can `systemctl --user
