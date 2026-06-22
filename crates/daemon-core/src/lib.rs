@@ -251,6 +251,7 @@ impl Daemon {
             permissions.clone(),
             clipboard_sync.clone(),
         ));
+        let inbound_coalescer = InboundCoalescer::new(std::time::Duration::from_secs(2));
         let accept_handle = tokio::spawn(accept_loop(AcceptCtx {
             server,
             peers,
@@ -266,6 +267,7 @@ impl Daemon {
             identity: identity.clone(),
             dbus_state: state.clone(),
             clipboard_sync: clipboard_sync.clone(),
+            inbound_coalescer,
         }));
 
         wait_for_shutdown().await?;
@@ -334,6 +336,9 @@ struct AcceptCtx {
     /// Echo-loop guard shared with the host clipboard watcher (see
     /// [`ClipboardSync`]).
     clipboard_sync: ClipboardSync,
+    /// Coalesces inbound file completions so multi-share bursts
+    /// surface as one notif instead of N stacked entries.
+    inbound_coalescer: Arc<InboundCoalescer>,
 }
 
 /// Per-peer mirror state. The window itself lives in a subprocess so
@@ -826,6 +831,7 @@ async fn accept_loop(ctx: AcceptCtx) {
                 let identity = ctx.identity.clone();
                 let dbus_state = ctx.dbus_state.clone();
                 let clipboard_sync = ctx.clipboard_sync.clone();
+                let inbound_coalescer = ctx.inbound_coalescer.clone();
                 tokio::spawn(async move {
                     if let Err(e) = handle_connection(
                         conn,
@@ -842,6 +848,7 @@ async fn accept_loop(ctx: AcceptCtx) {
                         identity,
                         dbus_state,
                         clipboard_sync,
+                        inbound_coalescer,
                     )
                     .await
                     {
@@ -872,6 +879,7 @@ async fn handle_connection(
     identity: IdentityKeypair,
     dbus_state: Arc<DaemonState>,
     clipboard_sync: ClipboardSync,
+    inbound_coalescer: Arc<InboundCoalescer>,
 ) -> Result<(), DaemonError> {
     let pubkey = conn.peer_identity().as_bytes();
     let mut id_bytes = [0u8; 16];
@@ -972,6 +980,7 @@ async fn handle_connection(
                     perms,
                     policy,
                     dbus,
+                    inbound_coalescer.clone(),
                 ));
             }
             StreamKind::Video => {
@@ -2129,19 +2138,122 @@ async fn files_stream_loop(
     permissions: Arc<dyn ansync_permissions::PermissionsStore>,
     policy: Arc<AutoAcceptPolicy>,
     dbus_conn: Arc<zbus::Connection>,
+    coalescer: Arc<InboundCoalescer>,
 ) {
     match receive_file(&peer_id, permissions.as_ref(), &mut stream, policy.as_ref(), None).await {
         Ok(path) => {
             info!(%peer_id, dest = %path.display(), "inbound transfer ok");
             let path_str = path.display().to_string();
+            // Per-file D-Bus signal stays — programmatic consumers
+            // want one event per file, not the coalesced batch.
             if let Err(e) =
                 ansync_dbus::Device::emit_file_received(&dbus_conn, &peer_id, &path_str).await
             {
                 debug!(%peer_id, error = %e, "emit FileReceived failed");
             }
-            spawn_share_notif(&peer_name, "File received", &format!("{}", path.display()));
+            // Coalesce the notif UX: bursts of arrivals from the
+            // same peer within `window` collapse into a single
+            // "Received N files" toast.
+            coalescer.record(peer_id, peer_name, path).await;
         }
         Err(e) => warn!(%peer_id, error = %e, "inbound transfer failed"),
+    }
+}
+
+/// Coalesce inbound file completions per peer within a TTL so a
+/// burst (e.g. multi-share of 5 photos) collapses into a single
+/// "Received 5 files from <peer>" notif instead of 5 stacked entries.
+///
+/// Generation tagging is the trick that lets a single sleeping task
+/// be the canonical flusher even while later arrivals reset the TTL:
+/// every new record bumps the slot's `generation`; the deferred
+/// flush snapshots the gen it was spawned for and aborts on mismatch.
+pub struct InboundCoalescer {
+    window: std::time::Duration,
+    slots: tokio::sync::Mutex<HashMap<DeviceId, CoalesceSlot>>,
+}
+
+struct CoalesceSlot {
+    peer_name: String,
+    paths: Vec<PathBuf>,
+    generation: u64,
+}
+
+impl InboundCoalescer {
+    pub fn new(window: std::time::Duration) -> Arc<Self> {
+        Arc::new(Self {
+            window,
+            slots: tokio::sync::Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// Stash an inbound completion. Always spawns a flush timer; the
+    /// generation check inside the task guarantees only the latest
+    /// timer wins, so concurrent records collapse cleanly.
+    pub async fn record(self: &Arc<Self>, peer_id: DeviceId, peer_name: String, path: PathBuf) {
+        let mut slots = self.slots.lock().await;
+        let slot = slots.entry(peer_id.clone()).or_insert_with(|| CoalesceSlot {
+            peer_name: peer_name.clone(),
+            paths: Vec::new(),
+            generation: 0,
+        });
+        slot.peer_name = peer_name;
+        slot.paths.push(path);
+        slot.generation = slot.generation.wrapping_add(1);
+        let generation = slot.generation;
+        let window = self.window;
+        let coalescer = self.clone();
+        let pid = peer_id.clone();
+        drop(slots);
+        tokio::spawn(async move {
+            tokio::time::sleep(window).await;
+            coalescer.flush_if_generation(pid, generation).await;
+        });
+    }
+
+    async fn flush_if_generation(self: &Arc<Self>, peer_id: DeviceId, expected_gen: u64) {
+        let mut slots = self.slots.lock().await;
+        let Some(slot) = slots.get(&peer_id) else {
+            return;
+        };
+        if slot.generation != expected_gen {
+            return;
+        }
+        let slot = slots.remove(&peer_id).expect("just checked present");
+        drop(slots);
+
+        let count = slot.paths.len();
+        if count == 0 {
+            return;
+        }
+        if count == 1 {
+            let path = &slot.paths[0];
+            spawn_share_notif(
+                &slot.peer_name,
+                "File received",
+                &format!("{}", path.display()),
+            );
+        } else {
+            let mut sample = slot
+                .paths
+                .iter()
+                .take(3)
+                .map(|p| {
+                    p.file_name()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| p.display().to_string())
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            if count > 3 {
+                sample.push_str(", …");
+            }
+            spawn_share_notif(
+                &slot.peer_name,
+                &format!("Received {count} files"),
+                &sample,
+            );
+        }
     }
 }
 
