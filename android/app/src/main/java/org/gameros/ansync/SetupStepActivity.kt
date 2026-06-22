@@ -4,6 +4,7 @@ import android.Manifest
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
 import android.util.Log
@@ -74,6 +75,7 @@ class SetupStepActivity : ComponentActivity() {
             SetupStep.Microphone -> requestPermLauncher.launch(
                 Manifest.permission.RECORD_AUDIO
             )
+            SetupStep.ManageExternalStorage -> launchManageExternalStorage()
             SetupStep.Accessibility -> launchSettings(
                 Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)
             )
@@ -82,6 +84,31 @@ class SetupStepActivity : ComponentActivity() {
             )
             SetupStep.MiuiAutostart -> launchMiuiAutostart()
             SetupStep.BatteryWhitelist -> launchBatteryWhitelist()
+        }
+    }
+
+    private fun launchManageExternalStorage() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
+            afterStep()
+            return
+        }
+        // Filtered "All files access" screen for this package. The
+        // user flips the switch + hits back; the next
+        // SetupNotif.refresh re-checks Environment.isExternalStorageManager.
+        val intent = Intent(
+            Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+            Uri.parse("package:$packageName"),
+        )
+        try {
+            settingsLauncher.launch(intent)
+        } catch (e: Exception) {
+            Log.w(TAG, "all-files settings launch failed; falling back to global list", e)
+            try {
+                settingsLauncher.launch(Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION))
+            } catch (e2: Exception) {
+                Log.w(TAG, "global all-files fallback failed too", e2)
+                afterStep()
+            }
         }
     }
 

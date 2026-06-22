@@ -8,6 +8,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
+import android.os.Environment
 import android.provider.Settings
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
@@ -43,6 +44,12 @@ enum class SetupStep(
         "Allow microphone",
         "Required for the PC to use this phone as a microphone.",
     ),
+    ManageExternalStorage(
+        "manage_external_storage",
+        "Allow access to files",
+        "ansync needs all-files access so received files land in Download/ansync " +
+            "where you can find them from any file manager or gallery app.",
+    ),
     Accessibility(
         "accessibility",
         "Enable Accessibility",
@@ -77,6 +84,9 @@ enum class SetupStep(
         Microphone -> ContextCompat.checkSelfPermission(
             ctx, Manifest.permission.RECORD_AUDIO
         ) == PackageManager.PERMISSION_GRANTED
+        ManageExternalStorage ->
+            Build.VERSION.SDK_INT < Build.VERSION_CODES.R ||
+                Environment.isExternalStorageManager()
         Accessibility -> isAccessibilityEnabled(ctx)
         NotificationListener -> isNotifListenerEnabled(ctx)
         MiuiAutostart -> ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)

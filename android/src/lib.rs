@@ -137,6 +137,29 @@ fn runtime() -> &'static Runtime {
     RUNTIME.get().expect("nativeInit() not called before runtime use")
 }
 
+/// Prefer the public `Download/ansync` tree (user can find received
+/// files in any file manager / gallery) when MANAGE_EXTERNAL_STORAGE
+/// is granted, otherwise fall back to the app-private sandbox so
+/// transfers still complete. Re-evaluated on every `nativeInit`, so
+/// revoking the perm + relaunching the service rebuilds with the
+/// fallback path while the setup notif re-flags the missing grant.
+fn resolve_download_root(files_dir: &std::path::Path) -> PathBuf {
+    let public = PathBuf::from("/storage/emulated/0/Download/ansync");
+    match std::fs::create_dir_all(&public) {
+        Ok(()) => {
+            info!("download root: {}", public.display());
+            public
+        }
+        Err(e) => {
+            warn!(
+                "download root {} unavailable ({e}); falling back to sandbox",
+                public.display()
+            );
+            files_dir.join("incoming")
+        }
+    }
+}
+
 struct CompanionState {
     identity: IdentityKeypair,
     /// Path the inbound files accept loop writes received files
@@ -284,7 +307,7 @@ pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativeInit(
         identity.device_id()
     );
     let mut slot = state_slot().lock().expect("state mutex poisoned");
-    let download_dir = files_dir.join("incoming");
+    let download_dir = resolve_download_root(&files_dir);
     *slot = Some(CompanionState {
         identity,
         download_dir,

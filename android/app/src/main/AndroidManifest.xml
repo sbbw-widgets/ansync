@@ -51,6 +51,15 @@
     <!-- Auto-restart the companion service after device reboot (U4c). -->
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
 
+    <!-- "All files access". Received files land under
+         /sdcard/Download/ansync/{host}/ so the user can browse them
+         in any file manager / gallery without poking the notif. The
+         app is sideloaded (no Play distribution) so the All-Files
+         policy restriction does not apply. -->
+    <uses-permission
+        android:name="android.permission.MANAGE_EXTERNAL_STORAGE"
+        tools:ignore="ScopedStorage" />
+
     <!-- Floating cursor overlay shown in real time while the host
          streams pointer events. The accessibility service queues the
          actual tap/drag gestures (which only land at the end of each
