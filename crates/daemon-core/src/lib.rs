@@ -972,6 +972,10 @@ async fn handle_connection(
                 let dbus = dbus_conn.clone();
                 let policy = Arc::new(AutoAcceptPolicy {
                     root: download_dir.clone(),
+                    peer_subdir: AutoAcceptPolicy::sanitize_peer_subdir(
+                        &peer_name_inbound,
+                        &peer_id_inbound,
+                    ),
                 });
                 tokio::spawn(files_stream_loop(
                     stream,

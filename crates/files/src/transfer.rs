@@ -378,18 +378,50 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 /// Convenience policy used by the daemon: drop every accepted file
-/// into `{root}/{peer_id_hex}/{offer.name}`. The daemon picks
-/// `$XDG_DOWNLOAD_DIR/ansync/` as `root`; the companion will use a
-/// SAF-picked tree URI instead.
+/// into `{root}/{peer_subdir}/{offer.name}`. The caller picks
+/// `peer_subdir` — typically a sanitized peer name like `"Pixel 9"`
+/// — so the user sees recognisable folders instead of a hex
+/// `DeviceId`. Falls back to the hex id when no name is known yet.
 pub struct AutoAcceptPolicy {
     pub root: PathBuf,
+    pub peer_subdir: String,
+}
+
+impl AutoAcceptPolicy {
+    /// Sanitize a human-readable peer name into a path-safe segment.
+    /// Strips anything outside `[A-Za-z0-9 ._-]`, collapses runs of
+    /// underscores, and falls back to `peer_id` hex if the result is
+    /// empty (so a peer with a weird name still gets *some* folder).
+    pub fn sanitize_peer_subdir(name: &str, peer_id: &DeviceId) -> String {
+        let cleaned: String = name
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric()
+                    || c == '.'
+                    || c == '-'
+                    || c == '_'
+                    || c == ' '
+                {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        let trimmed = cleaned.trim().trim_matches('_').trim();
+        if trimmed.is_empty() {
+            peer_id.to_string()
+        } else {
+            trimmed.to_string()
+        }
+    }
 }
 
 #[async_trait::async_trait]
 impl InboundPolicy for AutoAcceptPolicy {
     async fn on_offer(
         &self,
-        peer_id: &DeviceId,
+        _peer_id: &DeviceId,
         offer: &OfferSummary,
     ) -> InboundDecision {
         let safe_name: String = offer
@@ -410,7 +442,7 @@ impl InboundPolicy for AutoAcceptPolicy {
             .collect();
         let dest = self
             .root
-            .join(peer_id.to_string())
+            .join(&self.peer_subdir)
             .join(if safe_name.is_empty() { "unnamed".into() } else { safe_name });
         InboundDecision::Accept(dest)
     }

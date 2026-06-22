@@ -660,10 +660,19 @@ async fn streams_accept_loop(
             }
             StreamKind::Files => {
                 let mut stream = stream;
+                let host_id = host_id.clone();
+                let host_name_for_subdir = host_name_slot
+                    .lock()
+                    .expect("host_name_slot poisoned")
+                    .clone()
+                    .unwrap_or_default();
                 let policy = Arc::new(AutoAcceptPolicy {
                     root: download_dir.clone(),
+                    peer_subdir: AutoAcceptPolicy::sanitize_peer_subdir(
+                        &host_name_for_subdir,
+                        &host_id,
+                    ),
                 });
-                let host_id = host_id.clone();
                 let perms = permissions.clone();
                 let received_tx = received_file_tx.clone();
                 let prog_tx = progress_tx.clone();
