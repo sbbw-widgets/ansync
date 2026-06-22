@@ -282,6 +282,27 @@ impl Device {
         path: &str,
     ) -> zbus::Result<()>;
 
+    /// Per-chunk progress fan-out for an in-flight file transfer.
+    /// Direction is `"send"` (host → peer) or `"receive"` (peer →
+    /// host); `batch_*` fields cover the multi-file Share sheet case
+    /// and are `0` for one-off transfers on the receive side (the
+    /// host can't see the sender's batch shape). Throttled by the
+    /// emitter to a 1% delta + file boundary so the bus stays calm.
+    #[zbus(signal)]
+    pub async fn file_transfer_progress(
+        ctxt: &zbus::object_server::SignalEmitter<'_>,
+        batch_id: u64,
+        transfer_id: u64,
+        name: &str,
+        bytes: u64,
+        total: u64,
+        batch_files: u32,
+        batch_files_done: u32,
+        batch_bytes_done: u64,
+        batch_total_bytes: u64,
+        direction: &str,
+    ) -> zbus::Result<()>;
+
     /// Fired once for every `NotificationListenerService.onNotificationPosted`
     /// the companion forwards. Subscribers (e.g. a desktop notification
     /// daemon bridge) receive `(id, app, title, body)`.
@@ -380,6 +401,50 @@ impl Device {
             return Ok(());
         };
         Device::stream_state_changed(iface.signal_emitter(), kind, active).await
+    }
+
+    /// Emit `FileTransferProgress(...)` on `Device` for a peer. The
+    /// caller is expected to throttle; this just fans the event onto
+    /// the bus. No-op when the per-device interface isn't registered.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn emit_file_transfer_progress(
+        conn: &zbus::Connection,
+        device: &DeviceId,
+        batch_id: u64,
+        transfer_id: u64,
+        name: &str,
+        bytes: u64,
+        total: u64,
+        batch_files: u32,
+        batch_files_done: u32,
+        batch_bytes_done: u64,
+        batch_total_bytes: u64,
+        direction: &str,
+    ) -> zbus::Result<()> {
+        let dev_path = crate::path_device(device);
+        let object_path = zbus::zvariant::ObjectPath::try_from(dev_path.as_str())
+            .map_err(|e| zbus::Error::Failure(format!("bad path {dev_path}: {e}")))?;
+        let Ok(iface) = conn
+            .object_server()
+            .interface::<_, Device>(object_path)
+            .await
+        else {
+            return Ok(());
+        };
+        Device::file_transfer_progress(
+            iface.signal_emitter(),
+            batch_id,
+            transfer_id,
+            name,
+            bytes,
+            total,
+            batch_files,
+            batch_files_done,
+            batch_bytes_done,
+            batch_total_bytes,
+            direction,
+        )
+        .await
     }
 
     /// Emit `FileReceived(path)` on `Device` for a peer. Called by

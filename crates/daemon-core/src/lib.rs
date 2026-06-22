@@ -642,7 +642,7 @@ async fn action_loop(
                 }
             }
             DaemonAction::SendFiles { device, paths } => {
-                handle_send_files(&mirrors, &permissions, &device, paths).await;
+                handle_send_files(&mirrors, &permissions, &dbus_conn, &device, paths).await;
             }
             DaemonAction::SendUrl { device, url } => {
                 handle_send_url(&mirrors, &device, url).await;
@@ -2140,7 +2140,58 @@ async fn files_stream_loop(
     dbus_conn: Arc<zbus::Connection>,
     coalescer: Arc<InboundCoalescer>,
 ) {
-    match receive_file(&peer_id, permissions.as_ref(), &mut stream, policy.as_ref(), None).await {
+    let last_pct = Arc::new(std::sync::atomic::AtomicU8::new(255));
+    let cb_device = peer_id.clone();
+    let cb_dbus = dbus_conn.clone();
+    let cb_pct = last_pct.clone();
+    let progress: ProgressFn = Arc::new(move |ev: ProgressEvent| {
+        if ev.direction != TransferDirection::Receive {
+            return;
+        }
+        let pct = if ev.total == 0 {
+            100u8
+        } else {
+            ((ev.bytes.saturating_mul(100) / ev.total).min(100)) as u8
+        };
+        let last = cb_pct.load(std::sync::atomic::Ordering::Relaxed);
+        let is_final = ev.bytes == ev.total && ev.total > 0;
+        if pct == last && !is_final {
+            return;
+        }
+        cb_pct.store(pct, std::sync::atomic::Ordering::Relaxed);
+        let dbus = cb_dbus.clone();
+        let device = cb_device.clone();
+        let name = ev.name.clone();
+        let bytes = ev.bytes;
+        let total = ev.total;
+        let transfer_id = ev.transfer_id;
+        tokio::spawn(async move {
+            let _ = ansync_dbus::Device::emit_file_transfer_progress(
+                &dbus,
+                &device,
+                0,
+                transfer_id,
+                &name,
+                bytes,
+                total,
+                0,
+                0,
+                0,
+                0,
+                "receive",
+            )
+            .await;
+        });
+    });
+    match receive_file(
+        &peer_id,
+        permissions.as_ref(),
+        &mut stream,
+        policy.as_ref(),
+        Some(progress),
+    )
+    .await
+    {
         Ok(path) => {
             info!(%peer_id, dest = %path.display(), "inbound transfer ok");
             let path_str = path.display().to_string();
@@ -2327,6 +2378,7 @@ struct BatchProgress {
 async fn handle_send_files(
     mirrors: &MirrorRegistry,
     permissions: &Arc<dyn ansync_permissions::PermissionsStore>,
+    dbus_conn: &Arc<zbus::Connection>,
     device: &DeviceId,
     paths: Vec<PathBuf>,
 ) {
@@ -2382,6 +2434,8 @@ async fn handle_send_files(
 
         let cb_batch = batch.clone();
         let cb_peer = peer_name.clone();
+        let cb_device = device.clone();
+        let cb_dbus = dbus_conn.clone();
         let prev_in_file = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let progress: ProgressFn = Arc::new(move |ev: ProgressEvent| {
             // Receive callbacks share the type with us via the trait;
@@ -2415,6 +2469,36 @@ async fn handle_send_files(
                 );
                 let body = format!("{} · {}%", ev.name, pct);
                 spawn_progress_notif(cb_batch.batch_id, &summary, &body, pct);
+
+                // Fan the same throttled event onto D-Bus so external
+                // UIs (DMS plugin, ansyncctl) can render their own
+                // progress without spawning notify-send themselves.
+                let dbus = cb_dbus.clone();
+                let device = cb_device.clone();
+                let batch_id = cb_batch.batch_id;
+                let name = ev.name.clone();
+                let bytes = ev.bytes;
+                let total = ev.total;
+                let batch_files = cb_batch.total_files;
+                let batch_total_bytes = cb_batch.total_bytes;
+                let transfer_id = ev.transfer_id;
+                tokio::spawn(async move {
+                    let _ = ansync_dbus::Device::emit_file_transfer_progress(
+                        &dbus,
+                        &device,
+                        batch_id,
+                        transfer_id,
+                        &name,
+                        bytes,
+                        total,
+                        batch_files,
+                        files_done,
+                        cum,
+                        batch_total_bytes,
+                        "send",
+                    )
+                    .await;
+                });
             }
             if is_final {
                 cb_batch
