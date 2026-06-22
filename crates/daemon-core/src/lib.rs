@@ -21,7 +21,10 @@ use ansync_core::{Capabilities, DeviceId, DeviceName, Permission};
 use ansync_crypto::IdentityKeypair;
 use ansync_dbus::{ConnState, DaemonAction, DaemonState, Device, serve};
 use ansync_discovery::{Discovery, MdnsDiscovery};
-use ansync_files::{AutoAcceptPolicy, receive_file, send_file};
+use ansync_files::{
+    AutoAcceptPolicy, Direction as TransferDirection, ProgressEvent, ProgressFn, receive_file,
+    send_file,
+};
 use ansync_input::{InputDeviceFactory, InputSession, UinputFactory};
 use ansync_pairing::PeerStore;
 use ansync_permissions::FilePermissionsStore;
@@ -2196,6 +2199,19 @@ async fn url_inbound_loop(
     info!(%peer_id, url, "inbound url opened");
 }
 
+/// Cross-file shared state captured by every per-file `ProgressFn` so
+/// the batch sender can render a single notif ("Sending 2 of 5 · 47%")
+/// instead of five independent ones. Atomics keep the callback
+/// allocation-free on the chunk path.
+struct BatchProgress {
+    batch_id: u64,
+    total_files: u32,
+    total_bytes: u64,
+    files_done: std::sync::atomic::AtomicU32,
+    bytes_done: std::sync::atomic::AtomicU64,
+    last_pct: std::sync::atomic::AtomicU8,
+}
+
 async fn handle_send_files(
     mirrors: &MirrorRegistry,
     permissions: &Arc<dyn ansync_permissions::PermissionsStore>,
@@ -2211,7 +2227,38 @@ async fn handle_send_files(
         warn!(%device, "SendFiles: peer not connected");
         return;
     };
+    let peer_name = entry.peer_name.clone();
+
+    // Upfront sizing pass: stat every path so the batch notif has a
+    // real total to divide against. Anything that fails to stat is
+    // skipped from the batch entirely — better to under-report than
+    // to inflate the denominator and stall the bar at 99%.
+    let mut sized: Vec<(PathBuf, u64)> = Vec::with_capacity(paths.len());
+    let mut total_bytes: u64 = 0;
     for path in paths {
+        match tokio::fs::metadata(&path).await {
+            Ok(m) => {
+                total_bytes = total_bytes.saturating_add(m.len());
+                sized.push((path, m.len()));
+            }
+            Err(e) => warn!(%device, error = %e, path = %path.display(), "stat failed; skipping path"),
+        }
+    }
+    if sized.is_empty() {
+        warn!(%device, "SendFiles: nothing to send after stat");
+        return;
+    }
+
+    let batch = Arc::new(BatchProgress {
+        batch_id: next_transfer_id(),
+        total_files: sized.len() as u32,
+        total_bytes,
+        files_done: std::sync::atomic::AtomicU32::new(0),
+        bytes_done: std::sync::atomic::AtomicU64::new(0),
+        last_pct: std::sync::atomic::AtomicU8::new(255),
+    });
+
+    for (idx, (path, file_size)) in sized.into_iter().enumerate() {
         let mut stream = match conn.open(StreamKind::Files).await {
             Ok(s) => s,
             Err(e) => {
@@ -2220,11 +2267,114 @@ async fn handle_send_files(
             }
         };
         let tid = next_transfer_id();
-        match send_file(device, permissions.as_ref(), &mut stream, &path, tid, None).await {
+
+        let cb_batch = batch.clone();
+        let cb_peer = peer_name.clone();
+        let prev_in_file = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let progress: ProgressFn = Arc::new(move |ev: ProgressEvent| {
+            // Receive callbacks share the type with us via the trait;
+            // ignore the wrong direction defensively.
+            if ev.direction != TransferDirection::Send {
+                return;
+            }
+            let prev = prev_in_file.swap(ev.bytes, std::sync::atomic::Ordering::Relaxed);
+            let delta = ev.bytes.saturating_sub(prev);
+            let cum = cb_batch
+                .bytes_done
+                .fetch_add(delta, std::sync::atomic::Ordering::Relaxed)
+                + delta;
+            let pct = if cb_batch.total_bytes == 0 {
+                100u8
+            } else {
+                ((cum.saturating_mul(100) / cb_batch.total_bytes).min(100)) as u8
+            };
+            let last = cb_batch.last_pct.load(std::sync::atomic::Ordering::Relaxed);
+            let is_final = ev.bytes == ev.total && ev.total > 0;
+            if pct != last || is_final {
+                cb_batch
+                    .last_pct
+                    .store(pct, std::sync::atomic::Ordering::Relaxed);
+                let files_done = cb_batch.files_done.load(std::sync::atomic::Ordering::Relaxed);
+                let summary = format!(
+                    "Sending {} of {} to {}",
+                    (files_done + 1).min(cb_batch.total_files),
+                    cb_batch.total_files,
+                    cb_peer
+                );
+                let body = format!("{} · {}%", ev.name, pct);
+                spawn_progress_notif(cb_batch.batch_id, &summary, &body, pct);
+            }
+            if is_final {
+                cb_batch
+                    .files_done
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        });
+
+        match send_file(
+            device,
+            permissions.as_ref(),
+            &mut stream,
+            &path,
+            tid,
+            Some(progress),
+        )
+        .await
+        {
             Ok(_) => info!(%device, path = %path.display(), "outbound file sent"),
             Err(e) => warn!(%device, error = %e, path = %path.display(), "outbound file failed"),
         }
+        let _ = (idx, file_size);
     }
+
+    // Final summary: collapse the synchronous progress notif into a
+    // single "Sent N files" toast. Same tag → libnotify replaces the
+    // progress notif in-place on KDE / GNOME.
+    let files_done = batch.files_done.load(std::sync::atomic::Ordering::Relaxed);
+    let summary = format!("Sent {} of {} to {}", files_done, batch.total_files, peer_name);
+    spawn_batch_done_notif(batch.batch_id, &summary);
+}
+
+/// Fire a progress notif. Uses the synchronous tag so KDE / GNOME
+/// replace the previous progress entry instead of stacking N of them
+/// in the shade. `pct` is encoded as the `value` hint libnotify
+/// renders as a built-in progress bar.
+fn spawn_progress_notif(batch_id: u64, summary: &str, body: &str, pct: u8) {
+    let summary = format!("ansync · {summary}");
+    let body = body.to_string();
+    let tag = format!("ansync-xfer-{batch_id}");
+    let pct = pct.min(100);
+    std::thread::spawn(move || {
+        if let Err(e) = std::process::Command::new("notify-send")
+            .arg("--app-name=ansync")
+            .arg("--icon=document-send")
+            .arg(format!("--hint=int:value:{pct}"))
+            .arg(format!("--hint=string:x-canonical-private-synchronous:{tag}"))
+            .arg(summary)
+            .arg(body)
+            .status()
+        {
+            debug!(error = %e, "notify-send progress invoke failed");
+        }
+    });
+}
+
+/// Final-summary notif replacing the synchronous progress entry for
+/// `batch_id` once the last file completes.
+fn spawn_batch_done_notif(batch_id: u64, summary: &str) {
+    let summary = format!("ansync · {summary}");
+    let tag = format!("ansync-xfer-{batch_id}");
+    std::thread::spawn(move || {
+        if let Err(e) = std::process::Command::new("notify-send")
+            .arg("--app-name=ansync")
+            .arg("--icon=document-send")
+            .arg(format!("--hint=string:x-canonical-private-synchronous:{tag}"))
+            .arg(summary)
+            .status()
+        {
+            debug!(error = %e, "notify-send batch-done invoke failed");
+        }
+    });
 }
 
 async fn handle_send_url(
