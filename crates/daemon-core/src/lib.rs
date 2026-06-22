@@ -41,7 +41,7 @@ use ansync_video::{DecodedFrame, HostDecoder, PixelFormat, VideoCodec, VideoDeco
 
 mod mirror_subprocess;
 use mirror_subprocess::spawn_mirror_subprocess;
-use directories::BaseDirs;
+use directories::{BaseDirs, UserDirs};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::Mutex;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
@@ -166,7 +166,7 @@ impl Daemon {
             .config
             .download_dir
             .clone()
-            .unwrap_or(default_data_dir()?.join("incoming"));
+            .unwrap_or_else(default_download_dir);
 
         let identity = IdentityKeypair::load_or_generate(&identity_path)?;
         info!(device_id = %identity.device_id(), "identity loaded");
@@ -972,10 +972,6 @@ async fn handle_connection(
                 let dbus = dbus_conn.clone();
                 let policy = Arc::new(AutoAcceptPolicy {
                     root: download_dir.clone(),
-                    peer_subdir: AutoAcceptPolicy::sanitize_peer_subdir(
-                        &peer_name_inbound,
-                        &peer_id_inbound,
-                    ),
                 });
                 tokio::spawn(files_stream_loop(
                     stream,
@@ -2673,6 +2669,21 @@ fn default_data_dir() -> Result<PathBuf, DaemonError> {
     BaseDirs::new()
         .map(|b| b.data_dir().join("ansync"))
         .ok_or_else(|| DaemonError::Startup("$HOME not set; cannot resolve XDG paths".into()))
+}
+
+/// `$XDG_DOWNLOAD_DIR/ansync` when XDG resolves the Downloads dir,
+/// falling back to `$HOME/Downloads/ansync` and finally `./ansync`.
+/// Picked so received files land somewhere the user actually opens
+/// (file manager, browser downloads list) instead of buried inside
+/// `~/.local/share/ansync/incoming`.
+fn default_download_dir() -> PathBuf {
+    if let Some(u) = UserDirs::new() {
+        if let Some(d) = u.download_dir() {
+            return d.join("ansync");
+        }
+        return u.home_dir().join("Downloads").join("ansync");
+    }
+    PathBuf::from("ansync")
 }
 
 fn default_config_dir() -> Result<PathBuf, DaemonError> {
