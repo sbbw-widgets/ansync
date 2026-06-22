@@ -103,11 +103,35 @@ class ShareActivity : ComponentActivity() {
             return
         }
         thread(name = "ansync-share-multi") {
-            var sent = 0
+            val cacheRoot = File(cacheDir, "share").apply { mkdirs() }
+            val staged = ArrayList<File>(uris.size)
             for (uri in uris) {
-                if (sendOne(uri)) sent += 1
+                val name = queryDisplayName(uri) ?: "shared-${System.currentTimeMillis()}"
+                val tmp = File(cacheRoot, "${System.nanoTime()}-$name")
+                try {
+                    contentResolver.openInputStream(uri)?.use { input ->
+                        FileOutputStream(tmp).use { out -> input.copyTo(out) }
+                    } ?: continue
+                    staged.add(tmp)
+                } catch (t: Throwable) {
+                    Log.w(TAG, "share-multi: stage uri failed", t)
+                }
             }
-            uiToast("Share: sent $sent/${uris.size} files to $hostLabel.")
+            val ok = if (staged.isNotEmpty()) {
+                val batchId = System.nanoTime()
+                val paths = staged.map { it.absolutePath }.toTypedArray()
+                try {
+                    NativeBridge.nativeSendFiles(batchId, paths)
+                } catch (t: Throwable) {
+                    Log.w(TAG, "nativeSendFiles threw", t)
+                    false
+                }
+            } else false
+            for (f in staged) f.delete()
+            uiToast(
+                if (ok) "Share: sent ${staged.size}/${uris.size} files to $hostLabel."
+                else "Share: send failed — host offline?",
+            )
             runOnUiThread { finish() }
         }
     }

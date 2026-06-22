@@ -30,7 +30,10 @@ fn mark_connected(state: bool) {
 
 use ansync_core::{Capabilities, DeviceId, DeviceName, DevicePermissions, Permission};
 use ansync_crypto::IdentityKeypair;
-use ansync_files::{AutoAcceptPolicy, receive_file, send_file};
+use ansync_files::{
+    AutoAcceptPolicy, Direction as TransferDirection, ProgressEvent, ProgressFn, receive_file,
+    send_file,
+};
 use ansync_pairing::cable::bootstrap_companion;
 use ansync_pairing::wifi::{read_pair_hello, respond_pair_pin, CompanionWifiOutcome};
 use ansync_permissions::{PermissionsError, PermissionsStore};
@@ -261,6 +264,11 @@ struct ActiveSession {
     /// Host's stable device id derived from its Ed25519 pubkey. Used
     /// as the `peer_id` argument to `send_file` for outbound shares.
     host_id: DeviceId,
+    /// Progress events emitted by `nativeSendFiles`. Drained by the
+    /// Kotlin service via `nativePollTransferProgress`. Tag-binary
+    /// blobs encoded by `encode_progress_for_kotlin`.
+    progress_tx: Arc<UnboundedSender<Vec<u8>>>,
+    progress_rx: Arc<AsyncMutex<UnboundedReceiver<Vec<u8>>>>,
 }
 
 #[unsafe(no_mangle)]
@@ -525,6 +533,9 @@ pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativeOpenConnection
     let (received_file_tx, received_file_rx) = unbounded_channel::<String>();
     let received_file_tx = Arc::new(received_file_tx);
 
+    let (progress_tx, progress_rx) = unbounded_channel::<Vec<u8>>();
+    let progress_tx = Arc::new(progress_tx);
+
     let conn_arc = Arc::new(conn);
     let download_dir = {
         let slot = state_slot().lock().expect("state mutex poisoned");
@@ -554,6 +565,7 @@ pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativeOpenConnection
         capture_ctrl_tx.clone(),
         url_in_tx.clone(),
         received_file_tx.clone(),
+        progress_tx.clone(),
     ));
 
     let session = ActiveSession {
@@ -572,6 +584,8 @@ pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativeOpenConnection
         url_in_rx: Arc::new(AsyncMutex::new(url_in_rx)),
         received_files_rx: Arc::new(AsyncMutex::new(received_file_rx)),
         host_id: host_device_id,
+        progress_tx,
+        progress_rx: Arc::new(AsyncMutex::new(progress_rx)),
     };
     let mut slot = state_slot().lock().expect("state mutex poisoned");
     if let Some(s) = slot.as_mut() {
@@ -610,6 +624,7 @@ async fn streams_accept_loop(
     capture_ctrl_tx: Arc<UnboundedSender<Vec<u8>>>,
     url_in_tx: Arc<UnboundedSender<String>>,
     received_file_tx: Arc<UnboundedSender<String>>,
+    progress_tx: Arc<UnboundedSender<Vec<u8>>>,
 ) {
     let permissions: Arc<dyn PermissionsStore> = Arc::new(PermissivePermissions);
     // Helper struct so any early return out of the accept loop —
@@ -651,8 +666,20 @@ async fn streams_accept_loop(
                 let host_id = host_id.clone();
                 let perms = permissions.clone();
                 let received_tx = received_file_tx.clone();
+                let prog_tx = progress_tx.clone();
+                let prog: ProgressFn = Arc::new(move |ev: ProgressEvent| {
+                    let blob = encode_progress_for_kotlin(0, &ev, 0, 0, 0, 0);
+                    let _ = prog_tx.send(blob);
+                });
                 tokio::spawn(async move {
-                    match receive_file(&host_id, perms.as_ref(), &mut stream, policy.as_ref(), None).await
+                    match receive_file(
+                        &host_id,
+                        perms.as_ref(),
+                        &mut stream,
+                        policy.as_ref(),
+                        Some(prog),
+                    )
+                    .await
                     {
                         Ok(p) => {
                             info!("inbound file -> {}", p.display());
@@ -1839,12 +1866,55 @@ fn send_notification(msg: NotificationMessage) -> jboolean {
     }
 }
 
-/// Push one file at `path` over a fresh `StreamKind::Files` to the
-/// paired host. Returns `true` once the chunks + final ack flush.
-/// Blocking on the JNI thread for the full transfer is intentional:
-/// callers (`ShareActivity`) already run on a worker pool, and
-/// surfacing per-call success / failure keeps the Kotlin UX
-/// straightforward.
+/// Push a batch of files over fresh `StreamKind::Files` streams.
+/// `paths` is a Java `String[]`. `batch_id` is opaque to the native
+/// side — Kotlin owns its lifecycle and uses it as the notif key so
+/// every per-chunk progress event can be reattached to the right
+/// notif. Blocking on the JNI thread is intentional: callers
+/// (`ShareActivity`, `ShareTile`) already run on a worker pool.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativeSendFiles<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    batch_id: jni::sys::jlong,
+    paths: jni::objects::JObjectArray<'local>,
+) -> jboolean {
+    let count = match env.get_array_length(&paths) {
+        Ok(n) => n,
+        Err(e) => {
+            error!("nativeSendFiles: array length: {e}");
+            return jni::sys::JNI_FALSE;
+        }
+    };
+    let mut path_vec: Vec<String> = Vec::with_capacity(count as usize);
+    for i in 0..count {
+        let elt = match env.get_object_array_element(&paths, i) {
+            Ok(o) => o,
+            Err(e) => {
+                warn!("nativeSendFiles: get element {i}: {e}");
+                continue;
+            }
+        };
+        let js: JString = elt.into();
+        match env.get_string(&js) {
+            Ok(s) => path_vec.push(s.into()),
+            Err(e) => warn!("nativeSendFiles: get_string {i}: {e}"),
+        }
+    }
+    if path_vec.is_empty() {
+        warn!("nativeSendFiles: empty paths array");
+        return jni::sys::JNI_FALSE;
+    }
+    if send_files_blocking(batch_id as u64, path_vec) {
+        jni::sys::JNI_TRUE
+    } else {
+        jni::sys::JNI_FALSE
+    }
+}
+
+/// Legacy single-path entry point — kept so existing Kotlin callers
+/// keep linking. Wraps the input in a 1-element batch so the batch
+/// notif / progress wiring is exercised even for one-off shares.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativeSendFile<'local>(
     mut env: JNIEnv<'local>,
@@ -1858,44 +1928,147 @@ pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativeSendFile<'loca
             return jni::sys::JNI_FALSE;
         }
     };
-    let (conn, host_id) = {
+    if send_files_blocking(next_transfer_id(), vec![path_str]) {
+        jni::sys::JNI_TRUE
+    } else {
+        jni::sys::JNI_FALSE
+    }
+}
+
+/// Core send loop shared between `nativeSendFile` and
+/// `nativeSendFiles`. Walks the batch sequentially, opens a fresh
+/// Files stream per file, and emits a `ProgressEvent` per chunk into
+/// the per-session progress channel.
+fn send_files_blocking(batch_id: u64, paths: Vec<String>) -> bool {
+    let (conn, host_id, progress_tx) = {
         let slot = state_slot().lock().expect("state mutex poisoned");
         match slot.as_ref().and_then(|s| s.session.as_ref()) {
-            Some(sess) => (sess.conn.clone(), sess.host_id.clone()),
+            Some(sess) => (
+                sess.conn.clone(),
+                sess.host_id.clone(),
+                sess.progress_tx.clone(),
+            ),
             None => {
-                warn!("nativeSendFile: no active session");
-                return jni::sys::JNI_FALSE;
+                warn!("send_files_blocking: no active session");
+                return false;
             }
         }
     };
     let permissions: Arc<dyn PermissionsStore> = Arc::new(PermissivePermissions);
-    let ok = runtime().block_on(async move {
-        let mut stream = match conn.open(StreamKind::Files).await {
-            Ok(s) => s,
-            Err(e) => {
-                warn!("nativeSendFile: open Files stream failed: {e}");
-                return false;
-            }
-        };
-        let tid = next_transfer_id();
-        match send_file(
-            &host_id,
-            permissions.as_ref(),
-            &mut stream,
-            std::path::Path::new(&path_str),
-            tid,
-            None,
-        )
-        .await
-        {
-            Ok(_) => true,
-            Err(e) => {
-                warn!("nativeSendFile: send_file failed: {e}");
-                false
+    runtime().block_on(async move {
+        // Stat pass: anything that fails to size drops out of the
+        // batch — better to under-report the denominator than to
+        // stall at 99% forever.
+        let mut sized: Vec<(std::path::PathBuf, u64)> = Vec::with_capacity(paths.len());
+        let mut total_bytes: u64 = 0;
+        for p in paths.into_iter() {
+            let pb = std::path::PathBuf::from(p);
+            match tokio::fs::metadata(&pb).await {
+                Ok(m) => {
+                    total_bytes = total_bytes.saturating_add(m.len());
+                    sized.push((pb, m.len()));
+                }
+                Err(e) => warn!("send_files_blocking: stat {} failed: {e}", pb.display()),
             }
         }
+        if sized.is_empty() {
+            return false;
+        }
+        let total_files = sized.len() as u32;
+        let batch_bytes_done = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let files_done = Arc::new(std::sync::atomic::AtomicU32::new(0));
+
+        let mut all_ok = true;
+        for (path, _file_size) in sized.into_iter() {
+            let mut stream = match conn.open(StreamKind::Files).await {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!("send_files_blocking: open Files stream failed: {e}");
+                    all_ok = false;
+                    continue;
+                }
+            };
+            let tid = next_transfer_id();
+
+            let prev = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let cb_batch_bytes = batch_bytes_done.clone();
+            let cb_files = files_done.clone();
+            let cb_tx = progress_tx.clone();
+            let prog: ProgressFn = Arc::new(move |ev: ProgressEvent| {
+                if ev.direction != TransferDirection::Send {
+                    return;
+                }
+                let prev_v = prev.swap(ev.bytes, std::sync::atomic::Ordering::Relaxed);
+                let delta = ev.bytes.saturating_sub(prev_v);
+                let cum = cb_batch_bytes
+                    .fetch_add(delta, std::sync::atomic::Ordering::Relaxed)
+                    + delta;
+                let fd = cb_files.load(std::sync::atomic::Ordering::Relaxed);
+                let blob = encode_progress_for_kotlin(
+                    batch_id,
+                    &ev,
+                    total_files,
+                    fd,
+                    cum,
+                    total_bytes,
+                );
+                let _ = cb_tx.send(blob);
+                if ev.bytes == ev.total && ev.total > 0 {
+                    cb_files.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            });
+
+            match send_file(
+                &host_id,
+                permissions.as_ref(),
+                &mut stream,
+                &path,
+                tid,
+                Some(prog),
+            )
+            .await
+            {
+                Ok(_) => {}
+                Err(e) => {
+                    warn!("send_files_blocking: send_file {} failed: {e}", path.display());
+                    all_ok = false;
+                }
+            }
+        }
+        all_ok
+    })
+}
+
+/// Block until the next `ProgressEvent` lands on the per-session
+/// channel. Returns a tag-binary blob mirroring
+/// `encode_progress_for_kotlin`; `null` once the session is torn
+/// down or no events are pending.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativePollTransferProgress<'local>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+) -> jni::sys::jbyteArray {
+    let rx = {
+        let slot = state_slot().lock().expect("state mutex poisoned");
+        match slot.as_ref().and_then(|s| s.session.as_ref()) {
+            Some(sess) => sess.progress_rx.clone(),
+            None => return std::ptr::null_mut(),
+        }
+    };
+    let blob = runtime().block_on(async move {
+        let mut guard = rx.lock().await;
+        guard.recv().await
     });
-    if ok { jni::sys::JNI_TRUE } else { jni::sys::JNI_FALSE }
+    let Some(blob) = blob else {
+        return std::ptr::null_mut();
+    };
+    match env.byte_array_from_slice(&blob) {
+        Ok(arr) => arr.into_raw(),
+        Err(e) => {
+            error!("nativePollTransferProgress: byte_array_from_slice failed: {e}");
+            std::ptr::null_mut()
+        }
+    }
 }
 
 /// Open a `StreamKind::Url` to the host, send a single postcard
@@ -2014,6 +2187,49 @@ pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativePollReceivedFi
         },
         None => std::ptr::null_mut(),
     }
+}
+
+/// Flat binary blob consumed by `WireProgress.decode` on the Kotlin
+/// side. All multi-byte integers little-endian. Defined in one place
+/// so the Kotlin decoder can mirror it exactly:
+///
+///   batch_id           u64
+///   transfer_id        u64
+///   name_len           u16
+///   name               utf8[name_len]
+///   bytes              u64
+///   total              u64
+///   direction          u8     (0 send, 1 receive)
+///   batch_files        u32
+///   batch_files_done   u32
+///   batch_bytes_done   u64
+///   batch_total_bytes  u64
+fn encode_progress_for_kotlin(
+    batch_id: u64,
+    ev: &ProgressEvent,
+    batch_files: u32,
+    batch_files_done: u32,
+    batch_bytes_done: u64,
+    batch_total_bytes: u64,
+) -> Vec<u8> {
+    let name = ev.name.as_bytes();
+    let name_len = name.len().min(u16::MAX as usize) as u16;
+    let mut out = Vec::with_capacity(8 + 8 + 2 + name_len as usize + 8 + 8 + 1 + 4 + 4 + 8 + 8);
+    out.extend_from_slice(&batch_id.to_le_bytes());
+    out.extend_from_slice(&ev.transfer_id.to_le_bytes());
+    out.extend_from_slice(&name_len.to_le_bytes());
+    out.extend_from_slice(&name[..name_len as usize]);
+    out.extend_from_slice(&ev.bytes.to_le_bytes());
+    out.extend_from_slice(&ev.total.to_le_bytes());
+    out.push(match ev.direction {
+        TransferDirection::Send => 0,
+        TransferDirection::Receive => 1,
+    });
+    out.extend_from_slice(&batch_files.to_le_bytes());
+    out.extend_from_slice(&batch_files_done.to_le_bytes());
+    out.extend_from_slice(&batch_bytes_done.to_le_bytes());
+    out.extend_from_slice(&batch_total_bytes.to_le_bytes());
+    out
 }
 
 /// Monotonic transfer id for outbound `nativeSendFile` calls.

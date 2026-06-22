@@ -66,6 +66,11 @@ class AnsyncCompanionService : Service() {
     @Volatile private var urlPollRunning = false
     private var receivedFilePollThread: HandlerThread? = null
     @Volatile private var receivedFilePollRunning = false
+    private var progressPollThread: HandlerThread? = null
+    @Volatile private var progressPollRunning = false
+    /** Last percentage notif'd per `batchId`, so chunk-rate callbacks
+     *  don't repost the same percent. */
+    private val lastProgressPct = mutableMapOf<Long, Int>()
     private var screenReceiver: BroadcastReceiver? = null
     private var keepAlive: KeepAlive? = null
     /** Names of currently-held streams (`"capture"`, `"camera"`, `"audio"`).
@@ -111,6 +116,7 @@ class AnsyncCompanionService : Service() {
         startHostNamePoller()
         startUrlPoller()
         startReceivedFilePoller()
+        startTransferProgressPoller()
         registerScreenWakeReceiver()
         registerCpuWakePrefReceiver()
     }
@@ -281,6 +287,118 @@ class AnsyncCompanionService : Service() {
      * `MediaScannerConnection.scanFile` so the file appears under
      * Files / gallery without a manual rescan.
      */
+    /**
+     * Drain per-chunk transfer progress events emitted by the native
+     * batch sender. Single low-priority notif per `batchId` (sender)
+     * or `transferId` (receive), updated in-place via
+     * `setOnlyAlertOnce(true)` + `setProgress()`. Throttled to 1% to
+     * keep the shade calm.
+     */
+    private fun startTransferProgressPoller() {
+        if (progressPollThread != null) return
+        val ht = HandlerThread("ansync-progress").also { it.start() }
+        progressPollThread = ht
+        progressPollRunning = true
+        Handler(ht.looper).post(object : Runnable {
+            override fun run() {
+                while (progressPollRunning) {
+                    val blob = try {
+                        NativeBridge.nativePollTransferProgress()
+                    } catch (e: Throwable) {
+                        Log.w(TAG, "pollTransferProgress threw", e)
+                        null
+                    }
+                    if (blob == null) {
+                        try { Thread.sleep(250) } catch (_: InterruptedException) { return }
+                        continue
+                    }
+                    val ev = WireProgress.decode(blob) ?: continue
+                    handleProgressEvent(ev)
+                }
+            }
+        })
+    }
+
+    private fun handleProgressEvent(ev: WireProgress) {
+        val notifId = when (ev.direction) {
+            WireProgress.Direction.Send -> PROGRESS_NOTIF_BASE + (ev.batchId.hashCode() and 0x7fff)
+            WireProgress.Direction.Receive ->
+                PROGRESS_NOTIF_BASE + (ev.transferId.hashCode() and 0x7fff)
+        }
+        val mgr = getSystemService(NotificationManager::class.java) ?: return
+
+        val isFinal = ev.bytes == ev.total && ev.total > 0L
+        when (ev.direction) {
+            WireProgress.Direction.Send -> {
+                val key = ev.batchId
+                val pct = ev.batchPercent()
+                val last = lastProgressPct[key] ?: -1
+                if (!isFinal && pct == last) return
+                lastProgressPct[key] = pct
+                val filesDone = ev.batchFilesDone
+                val title = if (ev.batchFiles > 1) {
+                    val current = (filesDone + 1).coerceAtMost(ev.batchFiles)
+                    "Sending $current of ${ev.batchFiles} to PC"
+                } else {
+                    "Sending to PC"
+                }
+                val text = "${ev.name} · $pct%"
+                val builder = NotificationCompat.Builder(this, CHANNEL_ID)
+                    .setSmallIcon(android.R.drawable.stat_sys_upload)
+                    .setContentTitle(title)
+                    .setContentText(text)
+                    .setOnlyAlertOnce(true)
+                    .setOngoing(true)
+                    .setPriority(NotificationCompat.PRIORITY_LOW)
+                    .setProgress(100, pct, false)
+                mgr.notify(notifId, builder.build())
+                if (isFinal && filesDone + 1 >= ev.batchFiles) {
+                    // Final summary collapses the progress entry into a
+                    // tap-dismissible toast.
+                    mgr.cancel(notifId)
+                    val total = ev.batchFiles
+                    val summary = if (total > 1) "Sent $total files to PC" else "Sent ${ev.name}"
+                    val done = NotificationCompat.Builder(this, CHANNEL_ID)
+                        .setSmallIcon(android.R.drawable.stat_sys_upload_done)
+                        .setContentTitle(summary)
+                        .setOnlyAlertOnce(true)
+                        .setAutoCancel(true)
+                        .setPriority(NotificationCompat.PRIORITY_LOW)
+                        .build()
+                    mgr.notify(notifId, done)
+                    lastProgressPct.remove(key)
+                }
+            }
+            WireProgress.Direction.Receive -> {
+                val key = ev.transferId
+                val pct = if (ev.total <= 0L) 100 else
+                    ((ev.bytes * 100L) / ev.total).coerceIn(0L, 100L).toInt()
+                val last = lastProgressPct[key] ?: -1
+                if (!isFinal && pct == last) return
+                lastProgressPct[key] = pct
+                val title = "Receiving ${ev.name}"
+                val text = "$pct%"
+                val builder = NotificationCompat.Builder(this, CHANNEL_ID)
+                    .setSmallIcon(android.R.drawable.stat_sys_download)
+                    .setContentTitle(title)
+                    .setContentText(text)
+                    .setOnlyAlertOnce(true)
+                    .setOngoing(true)
+                    .setPriority(NotificationCompat.PRIORITY_LOW)
+                    .setProgress(100, pct, false)
+                mgr.notify(notifId, builder.build())
+                if (isFinal) {
+                    // postReceivedFileNotif (driven by the
+                    // received-file poller) replaces the entry once
+                    // the path lands in the channel — clear the
+                    // progress placeholder now.
+                    mgr.cancel(notifId)
+                    lastProgressPct.remove(key)
+                }
+            }
+        }
+    }
+
     private fun startReceivedFilePoller() {
         if (receivedFilePollThread != null) return
         val ht = HandlerThread("ansync-files-in").also { it.start() }
@@ -827,6 +945,10 @@ class AnsyncCompanionService : Service() {
         receivedFilePollRunning = false
         receivedFilePollThread?.quitSafely()
         receivedFilePollThread = null
+        progressPollRunning = false
+        progressPollThread?.quitSafely()
+        progressPollThread = null
+        lastProgressPct.clear()
         hostNamePollRunning = false
         hostNamePoller?.quitSafely()
         hostNamePoller = null
@@ -868,6 +990,9 @@ class AnsyncCompanionService : Service() {
         /** Base id for inbound file completions. Mixed with the path
          *  hash for the same reason as URLs. */
         const val FILE_NOTIF_ID_BASE = 20_000
+        /** Base id for in-flight transfer progress notifs. Mixed with
+         *  the batch id (sender) or transfer id (receive). */
+        const val PROGRESS_NOTIF_BASE = 30_000
 
         /** MediaProjection result delivered by [GrantScreenCaptureActivity]. */
         const val ACTION_START_CAPTURE = "org.gameros.ansync.action.START_CAPTURE"

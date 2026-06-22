@@ -193,6 +193,24 @@ object NativeBridge {
     external fun nativeSendFile(path: String): Boolean
 
     /**
+     * Push a batch of files. `batchId` is opaque to native — the
+     * caller owns the lifecycle and uses it as the progress-notif
+     * key. Per-chunk `ProgressEvent`s flow through
+     * [nativePollTransferProgress]. Returns `true` if every file
+     * completed; `false` if any one failed (other files in the batch
+     * may still have flushed).
+     */
+    external fun nativeSendFiles(batchId: Long, paths: Array<String>): Boolean
+
+    /**
+     * Block until the next transfer progress event lands. Returns a
+     * tag-binary blob matching [WireProgress.decode] or `null` on
+     * session teardown. Covers both send (driven by
+     * [nativeSendFiles]) and receive (host → device) directions.
+     */
+    external fun nativePollTransferProgress(): ByteArray?
+
+    /**
      * Push `url` to the host over a one-shot `StreamKind::Url`
      * stream. The host's daemon shells out to `xdg-open` directly.
      */
