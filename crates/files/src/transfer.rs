@@ -15,6 +15,7 @@
 //! wire so a revoke mid-transfer can still surface a clean reject.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use ansync_core::{DeviceId, Permission};
 use ansync_permissions::{PermissionsError, PermissionsStore};
@@ -32,6 +33,33 @@ use tracing::{debug, info, warn};
 /// overhead. Smaller than the cap keeps decode buffers reasonable
 /// without sacrificing throughput on LAN-class links.
 pub const CHUNK_SIZE: usize = 256 * 1024;
+
+/// Direction of a single [`ProgressEvent`] from the caller's
+/// perspective. Send events come from `send_file`, receive events
+/// from `receive_file`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Direction {
+    Send,
+    Receive,
+}
+
+/// Per-chunk progress event. Emitted once per chunk write/read plus
+/// one final event with `bytes == total` after the integrity check.
+/// Throttling is the caller's responsibility — `send_file` /
+/// `receive_file` always emit on every chunk.
+#[derive(Debug, Clone)]
+pub struct ProgressEvent {
+    pub transfer_id: u64,
+    pub name: String,
+    pub bytes: u64,
+    pub total: u64,
+    pub direction: Direction,
+}
+
+/// Callback handed to `send_file` / `receive_file` to surface
+/// per-chunk progress. Shared between transfers in the same batch so
+/// the caller can accumulate cross-file state without re-plumbing.
+pub type ProgressFn = Arc<dyn Fn(ProgressEvent) + Send + Sync>;
 
 #[derive(Debug, Error)]
 pub enum TransferError {
@@ -65,6 +93,7 @@ pub async fn send_file<S>(
     stream: &mut S,
     src_path: &Path,
     transfer_id: u64,
+    progress: Option<ProgressFn>,
 ) -> Result<u64, TransferError>
 where
     S: ansync_transport::Stream,
@@ -142,9 +171,27 @@ where
         };
         send_msg(stream, &chunk).await?;
         offset += n as u64;
+        if let Some(ref cb) = progress {
+            cb(ProgressEvent {
+                transfer_id,
+                name: name.clone(),
+                bytes: offset,
+                total,
+                direction: Direction::Send,
+            });
+        }
     }
 
     send_msg(stream, &FileTransferMessage::Complete { transfer_id }).await?;
+    if let Some(ref cb) = progress {
+        cb(ProgressEvent {
+            transfer_id,
+            name: name.clone(),
+            bytes: total,
+            total,
+            direction: Direction::Send,
+        });
+    }
     info!(transfer_id, "transfer Complete sent");
     Ok(transfer_id)
 }
@@ -186,6 +233,7 @@ pub async fn receive_file<S>(
     permissions: &dyn PermissionsStore,
     stream: &mut S,
     policy: &dyn InboundPolicy,
+    progress: Option<ProgressFn>,
 ) -> Result<PathBuf, TransferError>
 where
     S: ansync_transport::Stream,
@@ -253,6 +301,15 @@ where
                 hasher.update(&data);
                 file.write_all(&data).await?;
                 received += data.len() as u64;
+                if let Some(ref cb) = progress {
+                    cb(ProgressEvent {
+                        transfer_id: offer.transfer_id,
+                        name: offer.name.clone(),
+                        bytes: received,
+                        total: offer.size,
+                        direction: Direction::Receive,
+                    });
+                }
             }
             FileTransferMessage::Complete { transfer_id }
                 if transfer_id == offer.transfer_id =>
@@ -281,6 +338,15 @@ where
             "size mismatch: offer said {}, received {received}",
             offer.size
         )));
+    }
+    if let Some(ref cb) = progress {
+        cb(ProgressEvent {
+            transfer_id: offer.transfer_id,
+            name: offer.name.clone(),
+            bytes: offer.size,
+            total: offer.size,
+            direction: Direction::Receive,
+        });
     }
     info!(transfer_id = offer.transfer_id, dest = %dest.display(), "transfer Complete");
     Ok(dest)

@@ -629,7 +629,7 @@ async fn streams_accept_loop(
                 let perms = permissions.clone();
                 let received_tx = received_file_tx.clone();
                 tokio::spawn(async move {
-                    match receive_file(&host_id, perms.as_ref(), &mut stream, policy.as_ref()).await
+                    match receive_file(&host_id, perms.as_ref(), &mut stream, policy.as_ref(), None).await
                     {
                         Ok(p) => {
                             info!("inbound file -> {}", p.display());
@@ -1861,6 +1861,7 @@ pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativeSendFile<'loca
             &mut stream,
             std::path::Path::new(&path_str),
             tid,
+            None,
         )
         .await
         {

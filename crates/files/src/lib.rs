@@ -6,8 +6,8 @@
 pub mod transfer;
 
 pub use transfer::{
-    AutoAcceptPolicy, CHUNK_SIZE, InboundDecision, InboundPolicy, OfferSummary, TransferError,
-    receive_file, send_file,
+    AutoAcceptPolicy, CHUNK_SIZE, Direction, InboundDecision, InboundPolicy, OfferSummary,
+    ProgressEvent, ProgressFn, TransferError, receive_file, send_file,
 };
 
 #[derive(Debug, thiserror::Error)]

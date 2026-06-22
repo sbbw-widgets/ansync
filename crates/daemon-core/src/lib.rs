@@ -2127,7 +2127,7 @@ async fn files_stream_loop(
     policy: Arc<AutoAcceptPolicy>,
     dbus_conn: Arc<zbus::Connection>,
 ) {
-    match receive_file(&peer_id, permissions.as_ref(), &mut stream, policy.as_ref()).await {
+    match receive_file(&peer_id, permissions.as_ref(), &mut stream, policy.as_ref(), None).await {
         Ok(path) => {
             info!(%peer_id, dest = %path.display(), "inbound transfer ok");
             let path_str = path.display().to_string();
@@ -2220,7 +2220,7 @@ async fn handle_send_files(
             }
         };
         let tid = next_transfer_id();
-        match send_file(device, permissions.as_ref(), &mut stream, &path, tid).await {
+        match send_file(device, permissions.as_ref(), &mut stream, &path, tid, None).await {
             Ok(_) => info!(%device, path = %path.display(), "outbound file sent"),
             Err(e) => warn!(%device, error = %e, path = %path.display(), "outbound file failed"),
         }
