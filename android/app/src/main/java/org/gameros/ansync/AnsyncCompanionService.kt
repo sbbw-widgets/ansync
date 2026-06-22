@@ -412,11 +412,101 @@ class AnsyncCompanionService : Service() {
                         try { Thread.sleep(500) } catch (_: InterruptedException) {}
                         continue
                     }
-                    Handler(mainLooper).post { postReceivedFileNotif(path) }
+                    Handler(mainLooper).post { inboundCoalescer.record(path) }
                 }
             }
         })
     }
+
+    /**
+     * Coalesce arrivals from the paired host within a 2 s TTL so a
+     * burst (5-file multi-share) collapses into a single
+     * "Received N files" notif instead of 5 stacked entries. The
+     * host is implicit — only one host is ever paired today; multi-
+     * host work (N8) will key on the sender's pubkey instead.
+     */
+    private inner class InboundCoalescer(private val windowMs: Long = 2_000L) {
+        private val main = Handler(mainLooper)
+        private val pending = ArrayList<String>()
+        private val flush = Runnable { flushNow() }
+
+        fun record(path: String) {
+            main.post {
+                pending.add(path)
+                main.removeCallbacks(flush)
+                main.postDelayed(flush, windowMs)
+            }
+        }
+
+        private fun flushNow() {
+            val paths = ArrayList(pending)
+            pending.clear()
+            if (paths.isEmpty()) return
+            try {
+                android.media.MediaScannerConnection.scanFile(
+                    this@AnsyncCompanionService,
+                    paths.toTypedArray(),
+                    null,
+                    null,
+                )
+            } catch (t: Throwable) {
+                Log.w(TAG, "MediaScanner batch scan threw", t)
+            }
+            val host = getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .getString(PairingReceiver.PREF_HOST_NAME, null) ?: "PC"
+            val mgr = getSystemService(NotificationManager::class.java) ?: return
+            val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            } else {
+                PendingIntent.FLAG_UPDATE_CURRENT
+            }
+            if (paths.size == 1) {
+                val path = paths[0]
+                val file = java.io.File(path)
+                val viewIntent = Intent(Intent.ACTION_VIEW)
+                    .setData(Uri.fromFile(file))
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                val pi = PendingIntent.getActivity(
+                    this@AnsyncCompanionService,
+                    path.hashCode(),
+                    viewIntent,
+                    flags,
+                )
+                val n = NotificationCompat.Builder(this@AnsyncCompanionService, CHANNEL_ID)
+                    .setContentTitle("File received from $host")
+                    .setContentText(file.name)
+                    .setSmallIcon(android.R.drawable.stat_sys_download_done)
+                    .setContentIntent(pi)
+                    .setAutoCancel(true)
+                    .build()
+                mgr.notify(FILE_NOTIF_ID_BASE + (path.hashCode() and 0x7fff), n)
+            } else {
+                val first = java.io.File(paths[0])
+                val parent = first.parentFile ?: first
+                val viewIntent = Intent(Intent.ACTION_VIEW)
+                    .setDataAndType(Uri.fromFile(parent), "resource/folder")
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                val pi = PendingIntent.getActivity(
+                    this@AnsyncCompanionService,
+                    parent.absolutePath.hashCode(),
+                    viewIntent,
+                    flags,
+                )
+                val sample = paths.take(3).joinToString(", ") { java.io.File(it).name } +
+                    if (paths.size > 3) ", …" else ""
+                val n = NotificationCompat.Builder(this@AnsyncCompanionService, CHANNEL_ID)
+                    .setContentTitle("Received ${paths.size} files from $host")
+                    .setContentText(sample)
+                    .setSmallIcon(android.R.drawable.stat_sys_download_done)
+                    .setContentIntent(pi)
+                    .setAutoCancel(true)
+                    .build()
+                mgr.notify(FILE_NOTIF_ID_BASE + (parent.absolutePath.hashCode() and 0x7fff), n)
+            }
+        }
+    }
+
+    private val inboundCoalescer by lazy { InboundCoalescer() }
 
     private fun postUrlConsentNotif(url: String) {
         val openIntent = Intent(Intent.ACTION_VIEW, Uri.parse(url))
@@ -437,42 +527,6 @@ class AnsyncCompanionService : Service() {
             .build()
         getSystemService(NotificationManager::class.java)
             ?.notify(URL_NOTIF_ID_BASE + (url.hashCode() and 0x7fff), n)
-    }
-
-    private fun postReceivedFileNotif(path: String) {
-        val file = java.io.File(path)
-        // FileProvider would be the production-grade path; for MVP
-        // tap-to-open just points the system at the file URI. Most
-        // file managers + galleries handle it. We register with the
-        // media scanner regardless so the file shows up everywhere.
-        try {
-            android.media.MediaScannerConnection.scanFile(
-                this,
-                arrayOf(path),
-                null,
-                null,
-            )
-        } catch (t: Throwable) {
-            Log.w(TAG, "MediaScanner scan threw", t)
-        }
-        val viewIntent = Intent(Intent.ACTION_VIEW)
-            .setData(Uri.fromFile(file))
-            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        } else {
-            PendingIntent.FLAG_UPDATE_CURRENT
-        }
-        val pi = PendingIntent.getActivity(this, path.hashCode(), viewIntent, flags)
-        val n = NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("File received")
-            .setContentText(file.name)
-            .setSmallIcon(android.R.drawable.stat_sys_download_done)
-            .setContentIntent(pi)
-            .setAutoCancel(true)
-            .build()
-        getSystemService(NotificationManager::class.java)
-            ?.notify(FILE_NOTIF_ID_BASE + (path.hashCode() and 0x7fff), n)
     }
 
     private fun startCaptureControlPoller() {
