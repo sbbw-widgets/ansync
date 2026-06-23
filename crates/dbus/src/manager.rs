@@ -2,12 +2,48 @@
 
 use std::sync::Arc;
 
+use std::sync::Mutex as StdMutex;
+
 use ansync_core::DeviceId;
+use tokio::sync::mpsc::UnboundedReceiver;
 use zbus::interface;
 
 use crate::register_device;
 use crate::state::DaemonState;
 use crate::util::parse_device_id;
+
+/// Allocate a fresh session id, build a `PairingSessionIface`, register
+/// it at `/org/gameros/Ansync1/Pair/{id}`, and return the channels the
+/// caller's worker needs to drive the session. Shared between Wi-Fi
+/// (`StartPairing`), cable (`PairOverCable`) and auto (`PairAuto`)
+/// entry points.
+async fn allocate_session(
+    conn: &zbus::Connection,
+) -> zbus::fdo::Result<(
+    zbus::zvariant::ObjectPath<'static>,
+    String,
+    std::sync::Arc<StdMutex<crate::pair::PairSessionSnapshot>>,
+    UnboundedReceiver<[u8; 6]>,
+    UnboundedReceiver<()>,
+)> {
+    let session_id = uuid::Uuid::new_v4().simple().to_string();
+    let path = crate::pair::path_pair_session(&session_id);
+    let object_path = zbus::zvariant::ObjectPath::try_from(path.as_str())
+        .map_err(|e| zbus::fdo::Error::Failed(format!("bad session path: {e}")))?;
+
+    let (snapshot, pin_tx, pin_rx, cancel_tx, cancel_rx) = crate::pair::allocate();
+    let iface = crate::pair::PairingSessionIface {
+        id: session_id.clone(),
+        snapshot: snapshot.clone(),
+        pin_tx,
+        cancel_tx,
+    };
+    conn.object_server()
+        .at(object_path.clone(), iface)
+        .await
+        .map_err(|e| zbus::fdo::Error::Failed(format!("register session: {e}")))?;
+    Ok((object_path.into_owned(), session_id, snapshot, pin_rx, cancel_rx))
+}
 
 #[derive(Clone)]
 pub struct Manager {
@@ -101,28 +137,12 @@ impl Manager {
             Some(arr)
         };
 
-        let session_id = uuid::Uuid::new_v4().simple().to_string();
-        let path = crate::pair::path_pair_session(&session_id);
-        let object_path = zbus::zvariant::ObjectPath::try_from(path.as_str())
-            .map_err(|e| zbus::fdo::Error::Failed(format!("bad session path: {e}")))?;
-
-        let (snapshot, pin_tx, pin_rx, cancel_tx, cancel_rx) =
-            crate::pair::allocate();
+        let (object_path, session_id, snapshot, pin_rx, cancel_rx) =
+            allocate_session(conn).await?;
         snapshot
             .lock()
             .expect("snapshot poisoned")
             .address = socket.to_string();
-
-        let iface = crate::pair::PairingSessionIface {
-            id: session_id.clone(),
-            snapshot: snapshot.clone(),
-            pin_tx,
-            cancel_tx,
-        };
-        conn.object_server()
-            .at(object_path.clone(), iface)
-            .await
-            .map_err(|e| zbus::fdo::Error::Failed(format!("register session: {e}")))?;
 
         crate::pair::spawn_session(
             conn.clone(),
@@ -135,7 +155,84 @@ impl Manager {
             cancel_rx,
         );
 
-        Ok(object_path.into_owned())
+        Ok(object_path)
+    }
+
+    /// Kick off a cable / ADB-bootstrapped pair. Returns the object
+    /// path of a fresh `org.gameros.Ansync1.PairingSession`. The worker
+    /// owns the APK install (env / `/usr/share/ansync/companion.apk` /
+    /// GitHub release fetch) and the `am broadcast` that wakes the
+    /// companion. State progresses `dialing → ok` (no PIN involved —
+    /// the USB cable is the security guarantee).
+    ///
+    /// * `serial` — ADB serial to target. Pass `""` to auto-pick when
+    ///   exactly one device is attached.
+    /// * `apk_path` — explicit APK to install. Pass `""` to defer to
+    ///   the daemon's resolver (env / `/usr/share` / release fetch).
+    #[zbus(name = "PairOverCable")]
+    async fn pair_over_cable(
+        &self,
+        serial: String,
+        apk_path: String,
+        #[zbus(connection)] conn: &zbus::Connection,
+    ) -> zbus::fdo::Result<zbus::zvariant::ObjectPath<'static>> {
+        let serial = if serial.is_empty() { None } else { Some(serial) };
+        let apk = if apk_path.is_empty() {
+            None
+        } else {
+            Some(std::path::PathBuf::from(apk_path))
+        };
+
+        let (object_path, session_id, snapshot, pin_rx, cancel_rx) =
+            allocate_session(conn).await?;
+
+        crate::pair::spawn_cable_session(
+            conn.clone(),
+            self.state.clone(),
+            session_id,
+            serial,
+            apk,
+            snapshot,
+            pin_rx,
+            cancel_rx,
+        );
+        Ok(object_path)
+    }
+
+    /// Kick off a transport-auto pair. Daemon probes the local ADB
+    /// server first; if exactly one device answers it runs the cable
+    /// flow. Otherwise it browses mDNS for `discover_seconds` (0 ⇒
+    /// default 5 s) — a single pair-ready companion auto-routes through
+    /// the Wi-Fi PIN flow. Ambiguity (multiple ADB devices, multiple
+    /// mDNS hits) terminates the session with `failed` so the caller
+    /// falls back to `PairOverCable(serial, …)` or `BrowseAvailable` +
+    /// `StartPairing` to disambiguate.
+    #[zbus(name = "PairAuto")]
+    async fn pair_auto(
+        &self,
+        discover_seconds: u32,
+        apk_path: String,
+        #[zbus(connection)] conn: &zbus::Connection,
+    ) -> zbus::fdo::Result<zbus::zvariant::ObjectPath<'static>> {
+        let apk = if apk_path.is_empty() {
+            None
+        } else {
+            Some(std::path::PathBuf::from(apk_path))
+        };
+        let (object_path, session_id, snapshot, pin_rx, cancel_rx) =
+            allocate_session(conn).await?;
+
+        crate::pair::spawn_auto_session(
+            conn.clone(),
+            self.state.clone(),
+            session_id,
+            discover_seconds,
+            apk,
+            snapshot,
+            pin_rx,
+            cancel_rx,
+        );
+        Ok(object_path)
     }
 
     /// Fired by `daemon-core` whenever a peer transitions through the

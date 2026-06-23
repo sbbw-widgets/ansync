@@ -84,13 +84,17 @@ impl PairSessionSnapshot {
 /// Lifecycle of a single pairing session.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum PairState {
-    /// TCP connect + Hello + Ack round in flight.
+    /// `PairAuto` is probing ADB / browsing mDNS to pick a transport.
     #[default]
+    Discovering,
+    /// TCP connect + Hello + Ack round in flight (Wi-Fi), or APK
+    /// install + reverse-forward + companion broadcast (cable).
     Dialing,
     /// Ack received, companion identity known. Waiting for the user
-    /// to type the PIN currently displayed on the device.
+    /// to type the PIN currently displayed on the device. Wi-Fi only.
     AwaitingPin,
     /// PIN submitted; computing MAC and exchanging with the peer.
+    /// Wi-Fi only.
     Verifying,
     /// Pair complete; peer persisted; Device path registered.
     Ok,
@@ -101,6 +105,7 @@ pub enum PairState {
 impl PairState {
     pub fn as_str(self) -> &'static str {
         match self {
+            PairState::Discovering => "discovering",
             PairState::Dialing => "dialing",
             PairState::AwaitingPin => "awaiting_pin",
             PairState::Verifying => "verifying",
@@ -509,6 +514,334 @@ async fn finalize_linger(conn: Connection, path: String) {
             warn!(%path, error = %e, "auto-remove of stale pair session failed");
         }
     });
+}
+
+/// Spawn the worker for a cable / ADB-bootstrapped pair. Caller has
+/// already registered [`PairingSessionIface`] at
+/// [`path_pair_session`].
+///
+/// `serial = None` lets the worker auto-pick when exactly one device is
+/// attached (errors otherwise). `apk_override = None` triggers the
+/// release-fetch + install fallback when the companion is missing or
+/// version-mismatched.
+pub fn spawn_cable_session(
+    conn: Connection,
+    state: Arc<DaemonState>,
+    session_id: String,
+    serial: Option<String>,
+    apk_override: Option<std::path::PathBuf>,
+    snapshot: Arc<StdMutex<PairSessionSnapshot>>,
+    pin_rx: UnboundedReceiver<[u8; 6]>,
+    cancel_rx: UnboundedReceiver<()>,
+) {
+    tokio::spawn(drive_cable_session(
+        conn,
+        state,
+        session_id,
+        serial,
+        apk_override,
+        snapshot,
+        cancel_rx,
+        pin_rx,
+    ));
+}
+
+/// Spawn the auto-dispatching worker. Probes ADB; if a single device
+/// is attached, runs the cable flow. Otherwise browses mDNS for
+/// `discover_seconds` (defaults to 5) — exactly one pair-ready
+/// companion auto-routes through the Wi-Fi PIN flow, anything else
+/// terminates with `failed`.
+pub fn spawn_auto_session(
+    conn: Connection,
+    state: Arc<DaemonState>,
+    session_id: String,
+    discover_seconds: u32,
+    apk_override: Option<std::path::PathBuf>,
+    snapshot: Arc<StdMutex<PairSessionSnapshot>>,
+    pin_rx: UnboundedReceiver<[u8; 6]>,
+    cancel_rx: UnboundedReceiver<()>,
+) {
+    tokio::spawn(drive_auto_session(
+        conn,
+        state,
+        session_id,
+        discover_seconds,
+        apk_override,
+        snapshot,
+        pin_rx,
+        cancel_rx,
+    ));
+}
+
+async fn drive_cable_session(
+    conn: Connection,
+    state: Arc<DaemonState>,
+    session_id: String,
+    serial_hint: Option<String>,
+    apk_override: Option<std::path::PathBuf>,
+    snapshot: Arc<StdMutex<PairSessionSnapshot>>,
+    mut cancel_rx: UnboundedReceiver<()>,
+    _pin_rx: UnboundedReceiver<[u8; 6]>,
+) {
+    let path = path_pair_session(&session_id);
+
+    let serial = match resolve_serial(serial_hint).await {
+        Ok(s) => s,
+        Err(e) => return finalize_failed(&conn, &path, &snapshot, e).await,
+    };
+    {
+        let mut g = snapshot.lock().expect("snapshot poisoned");
+        g.state = PairState::Dialing;
+        g.address = format!("cable://{serial}");
+    }
+    emit_property_changes(&conn, &path, &["State", "Address"]).await;
+
+    let apk_path = match resolve_apk(&serial, apk_override).await {
+        Ok(p) => p,
+        Err(e) => return finalize_failed(&conn, &path, &snapshot, e).await,
+    };
+
+    let local_name = state.device_name.clone();
+    let lan_endpoints = state
+        .listen_endpoints
+        .lock()
+        .map(|g| g.clone())
+        .unwrap_or_default();
+
+    let result = tokio::select! {
+        biased;
+        _ = cancel_rx.recv() => {
+            return finalize_failed(&conn, &path, &snapshot, "cancelled".into()).await;
+        }
+        r = ansync_pairing::pair_host_via_adb(
+            &serial,
+            &state.identity,
+            &local_name,
+            apk_path.as_deref(),
+            lan_endpoints,
+        ) => r,
+    };
+
+    let peer = match result {
+        Ok(p) => p,
+        Err(e) => {
+            return finalize_failed(
+                &conn,
+                &path,
+                &snapshot,
+                format!("cable bootstrap: {e}"),
+            )
+            .await;
+        }
+    };
+
+    complete_pair(&conn, &state, &snapshot, &path, peer).await;
+}
+
+async fn drive_auto_session(
+    conn: Connection,
+    state: Arc<DaemonState>,
+    session_id: String,
+    discover_seconds: u32,
+    apk_override: Option<std::path::PathBuf>,
+    snapshot: Arc<StdMutex<PairSessionSnapshot>>,
+    pin_rx: UnboundedReceiver<[u8; 6]>,
+    cancel_rx: UnboundedReceiver<()>,
+) {
+    let path = path_pair_session(&session_id);
+    {
+        let mut g = snapshot.lock().expect("snapshot poisoned");
+        g.state = PairState::Discovering;
+    }
+    emit_property_changes(&conn, &path, &["State"]).await;
+
+    let adb = ansync_pairing::list_adb_devices().await.unwrap_or_default();
+    if !adb.is_empty() {
+        drive_cable_session(
+            conn,
+            state,
+            session_id,
+            None,
+            apk_override,
+            snapshot,
+            cancel_rx,
+            pin_rx,
+        )
+        .await;
+        return;
+    }
+
+    let secs = if discover_seconds == 0 {
+        5
+    } else {
+        discover_seconds as u64
+    };
+    let cands = match ansync_pairing::browse_pair_candidates(Duration::from_secs(secs))
+        .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            return finalize_failed(&conn, &path, &snapshot, format!("mdns browse: {e}"))
+                .await;
+        }
+    };
+    let picked = match cands.len() {
+        0 => {
+            return finalize_failed(
+                &conn,
+                &path,
+                &snapshot,
+                "no ADB device and no pair-ready companion on the LAN".into(),
+            )
+            .await;
+        }
+        1 => cands.into_iter().next().expect("len==1"),
+        n => {
+            return finalize_failed(
+                &conn,
+                &path,
+                &snapshot,
+                format!(
+                    "{n} pair-ready devices on the LAN — call BrowseAvailable + StartPairing to pick one"
+                ),
+            )
+            .await;
+        }
+    };
+
+    {
+        let mut g = snapshot.lock().expect("snapshot poisoned");
+        g.state = PairState::Dialing;
+        g.address = picked.addr.to_string();
+    }
+    emit_property_changes(&conn, &path, &["State", "Address"]).await;
+
+    drive_session(
+        conn,
+        state,
+        session_id,
+        picked.addr,
+        Some(picked.pubkey),
+        snapshot,
+        pin_rx,
+        cancel_rx,
+    )
+    .await;
+}
+
+/// Auto-pick a serial from the local ADB server. `None` hint = require
+/// exactly one device. Empty string is normalised to `None` by the
+/// D-Bus surface before this is called.
+async fn resolve_serial(hint: Option<String>) -> Result<String, String> {
+    if let Some(s) = hint.filter(|s| !s.is_empty()) {
+        return Ok(s);
+    }
+    let devices = ansync_pairing::list_adb_devices()
+        .await
+        .map_err(|e| format!("adb list: {e}"))?;
+    match devices.len() {
+        0 => Err("no ADB devices attached".into()),
+        1 => Ok(devices.into_iter().next().expect("len==1").serial),
+        n => Err(format!(
+            "{n} ADB devices attached — pass an explicit serial"
+        )),
+    }
+}
+
+/// Locate the companion APK to install, or `None` when the already-
+/// installed `versionName` matches `expected_version_bare()` (in which
+/// case the pair broadcast just re-wakes the running service).
+///
+/// Order: explicit override → `ANSYNC_COMPANION_APK` env →
+/// `/usr/share/ansync/companion.apk` → release fetch.
+async fn resolve_apk(
+    serial: &str,
+    override_path: Option<std::path::PathBuf>,
+) -> Result<Option<std::path::PathBuf>, String> {
+    use std::path::PathBuf;
+    if let Some(p) = override_path {
+        if !p.exists() {
+            return Err(format!("APK override not found: {}", p.display()));
+        }
+        return Ok(Some(p));
+    }
+    if let Some(env) = std::env::var_os("ANSYNC_COMPANION_APK") {
+        let p = PathBuf::from(env);
+        if p.exists() {
+            return Ok(Some(p));
+        }
+    }
+    let std_path = PathBuf::from("/usr/share/ansync/companion.apk");
+    if std_path.exists() {
+        return Ok(Some(std_path));
+    }
+    let expected = ansync_pairing::expected_version_bare();
+    let installed = ansync_pairing::query_installed_version(
+        serial,
+        ansync_pairing::COMPANION_PACKAGE,
+    )
+    .await
+    .unwrap_or(None);
+    if installed
+        .as_deref()
+        .map(|v| v.trim().eq_ignore_ascii_case(expected))
+        .unwrap_or(false)
+    {
+        return Ok(None);
+    }
+    match ansync_pairing::fetch_companion(expected).await {
+        Ok(f) => Ok(Some(f.path)),
+        Err(e) => Err(format!("APK fetch failed for {expected}: {e}")),
+    }
+}
+
+/// Shared completion path between the cable + Wi-Fi workers: persist,
+/// register the Device path, flip the session to `ok`, fire the
+/// `Completed` + `DeviceConnectivityChanged("pairing")` signals,
+/// schedule auto-removal.
+async fn complete_pair(
+    conn: &Connection,
+    state: &Arc<DaemonState>,
+    snapshot: &Arc<StdMutex<PairSessionSnapshot>>,
+    path: &str,
+    peer: StoredPeer,
+) {
+    let device_id = peer.id.to_string();
+    let companion_name = peer.name.0.clone();
+
+    if let Err(e) = state.peers.put(&peer) {
+        finalize_failed(conn, path, snapshot, format!("persist: {e}")).await;
+        return;
+    }
+    if let Err(e) = register_device(conn, state, peer.id.clone()).await {
+        warn!(error = %e, "register_device after pair failed");
+    }
+
+    snapshot.lock().expect("snapshot poisoned").state = PairState::Ok;
+    emit_property_changes(conn, path, &["State"]).await;
+
+    let signal_path = match zbus::zvariant::ObjectPath::try_from(path) {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(error = %e, %path, "build SignalEmitter path failed");
+            finalize_linger(conn.clone(), path.to_string()).await;
+            return;
+        }
+    };
+    if let Ok(emitter) = SignalEmitter::new(conn, signal_path) {
+        let _ =
+            PairingSessionIface::completed(&emitter, &device_id, &companion_name).await;
+        if let Ok(mgr_emitter) = SignalEmitter::new(conn, crate::PATH_MANAGER) {
+            let _ = crate::manager::Manager::device_connectivity_changed(
+                &mgr_emitter,
+                &device_id,
+                "pairing",
+            )
+            .await;
+        }
+    }
+    info!(%device_id, name = %companion_name, "pair session completed");
+    finalize_linger(conn.clone(), path.to_string()).await;
 }
 
 async fn emit_property_changes(conn: &Connection, path: &str, names: &[&str]) {

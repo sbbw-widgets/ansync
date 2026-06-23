@@ -24,8 +24,10 @@ mod util;
 pub use device::Device;
 pub use manager::Manager;
 pub use pair::{
-    allocate as allocate_pair_session, path_pair_session, spawn_session as spawn_pair_session,
-    PairSessionSnapshot, PairState, PairingSessionIface,
+    allocate as allocate_pair_session, path_pair_session,
+    spawn_auto_session as spawn_pair_auto_session,
+    spawn_cable_session as spawn_pair_cable_session,
+    spawn_session as spawn_pair_session, PairSessionSnapshot, PairState, PairingSessionIface,
 };
 pub use permissions::PermissionsIface;
 pub use state::{ConnState, DaemonAction, DaemonState};
