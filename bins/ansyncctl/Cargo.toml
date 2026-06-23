@@ -12,19 +12,13 @@ name = "ansyncctl"
 path = "src/main.rs"
 
 [dependencies]
-ansync-core.workspace = true
 ansync-crypto.workspace = true
 ansync-dbus.workspace = true
-ansync-discovery.workspace = true
-ansync-files.workspace = true
 ansync-pairing.workspace = true
-ansync-permissions.workspace = true
-ansync-transport.workspace = true
 clap.workspace = true
 zbus.workspace = true
 directories.workspace = true
 futures.workspace = true
 hex.workspace = true
 tokio.workspace = true
-tracing.workspace = true
 tracing-subscriber.workspace = true
