@@ -88,7 +88,7 @@
 
           bundleInfo = {
             name = "ansync";
-            version = "0.1.0";
+            version = ansyncPkg.version;
             summary = "Android ↔ Linux integration daemon (mirror, input, files, camera, audio, clipboard)";
             longDescription = ''
               ansync is a Rust rewrite of scrcpy with extended scope: screen

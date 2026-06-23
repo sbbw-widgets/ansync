@@ -102,13 +102,17 @@ jobs:
 
       - name: Build companion APK
         working-directory: android
+        env:
+          ANSYNC_VERSION: ${{ needs.resolve.outputs.version }}
         run: |
           set -euo pipefail
           # Image entrypoint is gradle; invoking it directly with the
           # android dir as `-p` matches the local dev recipe. Release
           # build is signed with the debug keystore (see app/build.gradle.kts)
           # so the APK is installable without provisioning a Play keystore.
-          gradle -p . assembleRelease
+          # `-PansyncVersion` pins the APK's `versionName` to the release
+          # tag so the daemon's `query_installed_version` check matches.
+          gradle -p . -PansyncVersion="$ANSYNC_VERSION" assembleRelease
 
       - name: Rename + collect APK
         run: |

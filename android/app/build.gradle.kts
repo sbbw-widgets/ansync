@@ -16,8 +16,13 @@ android {
         // and MediaProjection's persistent foreground service contract.
         minSdk = libs.versions.minSdk.get().toInt()
         targetSdk = libs.versions.targetSdk.get().toInt()
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = (project.findProperty("ansyncVersionCode") as String?)?.toInt() ?: 1
+        // CI passes `-PansyncVersion=<tag>` so the APK's `versionName`
+        // matches the host daemon's `CARGO_PKG_VERSION`. The daemon
+        // uses this string in `query_installed_version` to decide
+        // whether to re-fetch the companion at pair time — keeping
+        // them in lockstep is what enforces protocol compatibility.
+        versionName = (project.findProperty("ansyncVersion") as String?) ?: "0.1.0"
         ndk {
             // Single ABI for Step 7d initial bring-up; CI expands to
             // armeabi-v7a + x86_64 once the release pipeline lands.

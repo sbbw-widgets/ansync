@@ -30,10 +30,17 @@ let
     name = "ansync-source";
   };
 
+  # Pull the version straight from `Cargo.toml` so the derivation
+  # metadata, bundle filenames, and the runtime `CARGO_PKG_VERSION` the
+  # daemon embeds all stay in lockstep. Release tagging only needs to
+  # bump the manifest — CI's "Verify Cargo.toml version matches tag"
+  # step then guarantees tag == derivation == daemon.
+  cargoToml = builtins.fromTOML (builtins.readFile ../Cargo.toml);
+
   commonArgs = {
     inherit src;
     pname = "ansync";
-    version = "0.1.0";
+    version = cargoToml.workspace.package.version or cargoToml.package.version;
     strictDeps = true;
 
     nativeBuildInputs = with pkgs; [
