@@ -471,20 +471,13 @@ dependencies = [
 name = "ansyncctl"
 version = "0.1.0"
 dependencies = [
- "ansync-core",
  "ansync-crypto",
  "ansync-dbus",
- "ansync-discovery",
- "ansync-files",
- "ansync-pairing",
- "ansync-permissions",
- "ansync-transport",
  "clap",
  "directories",
  "futures",
  "hex",
  "tokio",
- "tracing",
  "tracing-subscriber",
  "zbus",
 ]
