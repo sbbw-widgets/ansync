@@ -1,0 +1,171 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release (e.g. v0.1.0)."
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # Normalise the tag once so every downstream checkout uses an explicit
+  # `refs/tags/vX.Y.Z`. Manual dispatch accepts either `v0.1.9` or
+  # `0.1.9`.
+  resolve:
+    name: Resolve tag
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.r.outputs.tag }}
+      version: ${{ steps.r.outputs.version }}
+    steps:
+      - id: r
+        run: |
+          raw="${{ github.event.inputs.tag || github.ref_name }}"
+          ver="${raw#v}"
+          tag="v${ver}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+
+  bundles:
+    name: Build host bundles (deb/rpm/arch/appimage/flatpak/tar.zst)
+    runs-on: ubuntu-latest
+    needs: resolve
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ needs.resolve.outputs.tag }}
+
+      - id: nix
+        uses: ./.github/actions/setup-nix
+        with:
+          attic-token: ${{ secrets.ATTIC_TOKEN }}
+
+      - name: Verify Cargo.toml version matches tag
+        run: |
+          crate_ver=$(awk -F\" '/^version = /{print $2; exit}' Cargo.toml)
+          if [ "$crate_ver" != "${{ needs.resolve.outputs.version }}" ]; then
+            echo "::error::Cargo.toml version ($crate_ver) does not match tag (${{ needs.resolve.outputs.version }})"
+            exit 1
+          fi
+
+      - name: Build release matrix
+        run: nix build .#release -L -o result-release
+
+      - name: Stage artifacts
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp -RL --no-preserve=mode,ownership result-release/. dist/
+          ls -la dist
+
+      - name: Upload bundles artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bundles
+          path: dist/
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Push closures to attic
+        uses: ./.github/actions/attic-push
+        if: always()
+        with:
+          push-enabled: ${{ steps.nix.outputs.push-enabled }}
+          paths: result-release
+
+  companion-apk:
+    name: Build companion APK
+    runs-on: ubuntu-latest
+    needs: resolve
+    timeout-minutes: 45
+    container:
+      image: sergioribera/rust-android:1.90-sdk-36
+      options: --user root
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ needs.resolve.outputs.tag }}
+
+      - name: Build companion APK
+        working-directory: android
+        run: |
+          set -euo pipefail
+          # Image entrypoint is gradle; invoking it directly with the
+          # android dir as `-p` matches the local dev recipe.
+          gradle -p . assembleDebug
+
+      - name: Rename + collect APK
+        run: |
+          set -euo pipefail
+          mkdir -p apk-dist
+          src=$(find android/app/build/outputs/apk/debug -name '*.apk' | head -n1)
+          if [ -z "$src" ]; then
+            echo "::error::no APK produced under android/app/build/outputs/apk/debug"
+            exit 1
+          fi
+          cp "$src" "apk-dist/companion-${{ needs.resolve.outputs.tag }}.apk"
+          ls -la apk-dist
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: companion-apk
+          path: apk-dist/
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Publish GitHub Release
+    runs-on: ubuntu-latest
+    needs: [resolve, bundles, companion-apk]
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ needs.resolve.outputs.tag }}
+          fetch-depth: 0
+
+      - name: Download bundles
+        uses: actions/download-artifact@v4
+        with:
+          name: bundles
+          path: dist
+
+      - name: Download companion APK
+        uses: actions/download-artifact@v4
+        with:
+          name: companion-apk
+          path: dist
+
+      - name: Refresh SHA256SUMS
+        run: |
+          cd dist
+          find . -type f ! -name SHA256SUMS -printf '%P\n' \
+            | LC_ALL=C sort \
+            | xargs sha256sum -- > SHA256SUMS
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.resolve.outputs.tag }}
+          name: ansync ${{ needs.resolve.outputs.tag }}
+          draft: false
+          prerelease: ${{ contains(needs.resolve.outputs.tag, '-') }}
+          fail_on_unmatched_files: true
+          files: |
+            dist/*

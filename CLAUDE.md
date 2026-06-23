@@ -120,6 +120,16 @@ El `flake.nix` pinea `nixpkgs` a `549bd84d6279f9852cae6225e372cc67fb91a4c1` para
   - `ansyncctl pair` ahora: si no hay --apk/env/path Y companion missing → auto-fetch + install. Override sigue funcionando.
 - **Roadmap completo.** Ver `PLAN.md` para tabla final.
 
+**Build & distribución (sesión 2026-06-23)**:
+- **Bundling cerrado** — `nix/package.nix` ahora paramétrico (`portable ? false`). Default emite wrapped (postInstall instala contrib + `wrapProgram` con `LD_LIBRARY_PATH=/run/opengl-driver/lib:...`) — lo que la NixOS module consume. `portable = true` skipea ambos: el bundler patchelf-ea su propio RPATH y stagea contrib via `info.extraFiles`.
+- **`flake.nix`** suma input `nix-bundle-app = github:SergioRibera/nix-bundle-app` + outputs `packages.{ansync-portable, bundle-all, release}`. `bundle-all` corre `bundler.bundleAll` con formatos `[deb rpm archlinux appimage flatpak tar.zst]`. `release` corre `bundler.release` con matrix `x86_64-linux` + install scripts. `info.extraFiles` apunta a los 3 contrib (`60-ansync-uinput.rules`, `61-ansync-v4l2loopback.rules`, `ansync-v4l2loopback.conf`, `ansync-modules-load.conf`) + inline systemd user unit con `ExecStart=/usr/bin/ansyncd` (el contrib `ansyncd.service` original usa `%h/.cargo/bin/ansyncd` — solo apto para `cargo install`).
+- **CI/CD** (`.github/`):
+  - `actions/setup-nix` — composite con `cachix/install-nix-action@v30`, substituter hardcoded `cache.sergioribera.rs/main` + key `main:vFI3N1JP9edRFwBwdk9ebUKTIPWK9R1ECbkdA7Q593M=`. Login a attic si `ATTIC_TOKEN` está.
+  - `actions/attic-push` — push best-effort (warning si falla, no red-X).
+  - `workflows/ci.yml` — push/PR → fmt + clippy + cargo test + `nix build .#default` + `.#ansync-portable`. Push devshell + binarios a attic.
+  - `workflows/release.yml` — tag `v*` → `nix build .#release` (bundles linux) + container `sergioribera/rust-android:1.90-sdk-36` corre `gradle -p . assembleDebug` en `android/` → APK. Publica todo via `softprops/action-gh-release@v2`.
+- Todos los CI jobs en `ubuntu-latest` (no self-hosted).
+
 **Triaje UX post-v1 (sesión 2026-06-15)**:
 - **U1 cerrado** — `StreamKind::Hello` (tag 0x0a) one-shot bidi post-handshake. Host envía `gethostname(2)` + caps; companion envía `Build.MANUFACTURER + " " + Build.MODEL` via `nativeSetDeviceName`. Daemon `hello_inbound_loop` refresca `StoredPeer.name`; companion stash en `last_host_name` + `nativePollHostName` + MainActivity LaunchedEffect persiste `PREF_HOST_NAME`. `Device.Name` D-Bus surface hostname real.
 - **U2 cerrado** — `ConnState{Disconnected,Pairing,Authenticated,Active}` en `ansync_dbus::state` + registry per-device en `DaemonState`. `Device::emit_state_changed` helper dispara auto-generated `PropertiesChanged(State)` + custom `Manager.DeviceConnectivityChanged(id,state)`. `handle_connection` transiciona Authenticated → Active (post-Hello) → Disconnected.

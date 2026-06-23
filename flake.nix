@@ -15,6 +15,11 @@
       url = "github:oxalica/rust-overlay/4852a8aa041c94af55e136cde5b8b6d42c3563e8";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+
+    nix-bundle-app = {
+      url = "github:SergioRibera/nix-bundle-app";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
   outputs = inputs @ { flake-parts, ... }:
@@ -40,6 +45,118 @@
             inherit rustToolchain;
             crane = inputs.crane;
           };
+
+          # Unwrapped variant for the bundler: no `wrapProgram` (the
+          # bundler patchelfs RPATH itself), no contrib install (the
+          # bundler stages those via `info.extraFiles`).
+          ansyncPkgPortable = pkgs.callPackage ./nix/package.nix {
+            inherit rustToolchain;
+            crane = inputs.crane;
+            portable = true;
+          };
+
+          bundler = inputs.nix-bundle-app.lib.mkLib pkgs;
+
+          # System-wide systemd user unit shipped via extraFiles. The
+          # in-tree `contrib/ansyncd.service` uses `%h/.cargo/bin/ansyncd`
+          # which only makes sense for `cargo install`; bundler-installed
+          # binaries land at `/usr/bin/ansyncd` (symlink to /opt/ansync).
+          ansyncdSystemUnit = ''
+            [Unit]
+            Description=ansync daemon (Android ↔ Linux integration)
+            Documentation=https://github.com/SergioRibera/ansync
+            After=dbus.socket pipewire.socket
+            Wants=dbus.socket
+
+            [Service]
+            Type=simple
+            ExecStart=/usr/bin/ansyncd
+            Restart=on-failure
+            RestartSec=3
+            Environment=RUST_LOG=info
+            StandardOutput=journal
+            StandardError=journal
+            ProtectSystem=strict
+            ProtectHome=read-only
+            PrivateTmp=true
+            NoNewPrivileges=true
+            ReadWritePaths=%h/.local/share/ansync %h/.config/ansync %t/ansync
+
+            [Install]
+            WantedBy=default.target
+          '';
+
+          bundleInfo = {
+            name = "ansync";
+            version = "0.1.0";
+            summary = "Android ↔ Linux integration daemon (mirror, input, files, camera, audio, clipboard)";
+            longDescription = ''
+              ansync is a Rust rewrite of scrcpy with extended scope: screen
+              mirroring, bidirectional input, file transfer, virtual camera
+              + microphone, bidirectional audio, clipboard sync, mDNS discovery,
+              Ed25519 pairing over QUIC. Daemon (`ansyncd`) + CLI (`ansyncctl`).
+            '';
+            license = "MIT";
+            maintainer = "Sergio Ribera <sergioalejandroriberacosta@gmail.com>";
+            homepage = "https://github.com/SergioRibera/ansync";
+            bundleId = "com.sergioribera.ansync";
+
+            # `autoDepends` scans the staged ELFs and resolves SONAMEs
+            # against the curated lib-map. Manual lists below cover what
+            # the scanner misses (kernel modules, runtime tools).
+            depends = {
+              deb = [ "v4l2loopback-dkms" ];
+              rpm = [ "v4l2loopback" ];
+              archlinux = [ "v4l2loopback-dkms" ];
+            };
+
+            # Daemon-only: no desktop entries.
+            desktopEntries = [ ];
+
+            # System-wide user units + kernel module config + udev rules.
+            # `/usr/lib/systemd/user/` is the per-package user-unit dir
+            # systemd auto-discovers; users `systemctl --user enable
+            # ansyncd` post-install.
+            extraFiles = {
+              "/usr/lib/systemd/user/ansyncd.service" = ansyncdSystemUnit;
+              "/lib/udev/rules.d/60-ansync-uinput.rules" =
+                ./bins/ansyncd/contrib/60-ansync-uinput.rules;
+              "/lib/udev/rules.d/61-ansync-v4l2loopback.rules" =
+                ./bins/ansyncd/contrib/61-ansync-v4l2loopback.rules;
+              "/etc/modprobe.d/ansync-v4l2loopback.conf" =
+                ./bins/ansyncd/contrib/ansync-v4l2loopback.conf;
+              "/etc/modules-load.d/ansync.conf" =
+                ./bins/ansyncd/contrib/ansync-modules-load.conf;
+            };
+
+            flatpak = {
+              # Assume host has v4l2loopback preloaded (the module + its
+              # /dev/video* nodes live outside the sandbox; sharing the
+              # device node into the flatpak is the user's call).
+              finishArgs = [
+                "--share=network"
+                "--share=ipc"
+                "--socket=wayland"
+                "--socket=pulseaudio"
+                "--device=all"
+                "--filesystem=xdg-config/ansync:create"
+                "--filesystem=xdg-data/ansync:create"
+                "--filesystem=xdg-cache/ansync:create"
+                "--filesystem=xdg-download"
+                "--talk-name=org.freedesktop.DBus"
+                "--system-talk-name=org.freedesktop.Avahi"
+              ];
+            };
+          };
+
+          bundleFormats = [
+            "deb"
+            "rpm"
+            "archlinux"
+            "appimage"
+            "flatpak"
+            "tar.zst"
+          ];
 
           # Native build deps required at link / build time.
           nativeBuildDeps = with pkgs; [
@@ -78,9 +195,6 @@
             libGL
             libxkbcommon
             vulkan-loader
-
-            # Clipboard
-            wl-clipboard
           ];
         in
         {
@@ -105,6 +219,33 @@
           packages = {
             default = ansyncPkg;
             ansync = ansyncPkg;
+            ansync-portable = ansyncPkgPortable;
+
+            # All distro bundles in one drv (`result/` ends up with
+            # `.deb`, `.rpm`, `.pkg.tar.zst`, `.AppImage`, flatpak src
+            # tree, `tar.zst`).
+            bundle-all = bundler.bundleAll {
+              drv = ansyncPkgPortable;
+              formats = bundleFormats;
+              info = bundleInfo;
+            };
+
+            # Release matrix: every format per supported arch + install
+            # scripts + SHA256SUMS. release.yml uploads the contents
+            # verbatim to the GitHub Release.
+            release = bundler.release {
+              info = bundleInfo;
+              releaseUrl = "https://github.com/SergioRibera/ansync/releases/download/v\${VERSION}";
+
+              matrix = {
+                "x86_64-linux" = {
+                  drv = ansyncPkgPortable;
+                  formats = bundleFormats;
+                };
+              };
+
+              installScripts = true;
+            };
           };
 
           apps = {

@@ -1,0 +1,15 @@
+# ansync — v4l2loopback control + per-peer device permissions.
+#
+# 1. /dev/v4l2loopback control char dev — ansyncd issues
+#    V4L2LOOPBACK_CTL_ADD / REMOVE here to allocate one /dev/videoN
+#    per connected peer. Exposed to the `video` group so the daemon
+#    can manage nodes without root.
+KERNEL=="v4l2loopback", GROUP="video", MODE="0660"
+
+# 2. Per-peer video nodes created via the ADD ioctl. The driver
+#    reports `v4l2 loopback ...` in ATTRS{name}; per-peer label lives
+#    in the card_label suffix `(Ansync)`. Both rules below catch the
+#    same nodes via different attribute paths so we work across
+#    v4l2loopback versions.
+SUBSYSTEM=="video4linux", ATTRS{name}=="v4l2 loopback*", GROUP="video", MODE="0660"
+SUBSYSTEM=="video4linux", ATTR{name}=="*(Ansync)*", GROUP="video", MODE="0660"

@@ -1,0 +1,92 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # When a release tag is pushed alongside main, CI would double-run
+  # with release.yml. release.yml already builds the same nix outputs,
+  # so back off here.
+  gate:
+    runs-on: ubuntu-latest
+    outputs:
+      proceed: ${{ steps.check.outputs.proceed }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: check
+        run: |
+          if git tag --points-at HEAD | grep -q '^v'; then
+            echo "HEAD has a release tag — deferring to release.yml"
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  check:
+    name: cargo fmt + clippy + test
+    needs: gate
+    if: needs.gate.outputs.proceed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - id: nix
+        uses: ./.github/actions/setup-nix
+        with:
+          attic-token: ${{ secrets.ATTIC_TOKEN }}
+
+      - name: Build devShell
+        run: nix build .#devShells.x86_64-linux.default -L -o result-devshell
+
+      - name: fmt
+        run: nix develop --command cargo fmt --check
+
+      - name: clippy
+        run: |
+          nix develop --command cargo clippy --locked --workspace --all-targets \
+            -- -D warnings
+
+      - name: cargo test
+        run: nix develop --command cargo test --locked --workspace
+
+      - name: Push devShell to attic
+        uses: ./.github/actions/attic-push
+        if: always()
+        with:
+          push-enabled: ${{ steps.nix.outputs.push-enabled }}
+          paths: result-devshell
+
+  nix-build:
+    name: nix build (wrapped + portable)
+    needs: gate
+    if: needs.gate.outputs.proceed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - id: nix
+        uses: ./.github/actions/setup-nix
+        with:
+          attic-token: ${{ secrets.ATTIC_TOKEN }}
+
+      - name: Build default (wrapped, NixOS module)
+        run: nix build .#default -L -o result
+
+      - name: Build portable (bundler source)
+        run: nix build .#ansync-portable -L -o result-portable
+
+      - name: Push to attic
+        uses: ./.github/actions/attic-push
+        if: always()
+        with:
+          push-enabled: ${{ steps.nix.outputs.push-enabled }}
+          paths: result result-portable
