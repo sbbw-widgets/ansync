@@ -61,8 +61,9 @@ notifications
 
 Defaults al pairing:
 
-- `screen_mirror`, `files_send`, `files_receive`, `notifications` → **on**
-- `clipboard_in`, `clipboard_out` → **prompt**
+- `screen_mirror`, `files_send`, `files_receive`, `notifications`,
+  `clipboard_in`, `clipboard_out`, `audio_in`, `audio_out`,
+  `share_receive` → **on**
 - resto → **off** (usuario habilita explícito vía D-Bus / `ansyncctl perm`)
 
 Cada syscall del daemon chequea el flag relevante antes de proceder. Sin flag → `Error::PermissionDenied(Permission::*)`.
