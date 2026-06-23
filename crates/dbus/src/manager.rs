@@ -268,6 +268,23 @@ impl Manager {
         id: &str,
     ) -> zbus::Result<()>;
 
+    /// List ADB devices currently visible to the daemon's local adbd.
+    /// Pure-Rust passthrough to [`ansync_pairing::list_adb_devices`] —
+    /// no `adb` CLI shell-out. Returns `(serial, state)` for every
+    /// device in the `device` (authorized) state; unauthorized /
+    /// offline devices are filtered server-side.
+    ///
+    /// Widgets and `ansyncctl` use this to disambiguate which serial
+    /// to feed `PairOverCable` when the user has multiple devices
+    /// plugged in.
+    #[zbus(name = "ListAdbDevices")]
+    async fn list_adb_devices(&self) -> Vec<(String, String)> {
+        ansync_pairing::list_adb_devices()
+            .await
+            .map(|v| v.into_iter().map(|d| (d.serial, d.state)).collect())
+            .unwrap_or_default()
+    }
+
     /// Snapshot of currently-reachable paired companions. Each entry
     /// is `(device_id, "ip:port")`. Suitable for first-paint state
     /// before any signals fire.

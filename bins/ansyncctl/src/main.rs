@@ -36,6 +36,10 @@ enum Command {
     /// Snapshot of paired devices currently observed on the LAN.
     /// Backed by `Manager.ReachableDevices`.
     Reachable,
+    /// List ADB devices the daemon's local adbd sees
+    /// (`Manager.ListAdbDevices`). Pure-Rust passthrough, no `adb`
+    /// CLI shell-out.
+    AdbDevices,
     /// Print the QUIC listen endpoints the daemon advertises
     /// (`Manager.ListenEndpoints`). Useful for direct-dial debugging.
     Endpoints,
@@ -185,6 +189,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Identity { action } => identity(action)?,
         Command::Devices => list_devices().await?,
         Command::Reachable => reachable().await?,
+        Command::AdbDevices => adb_devices().await?,
         Command::Endpoints => endpoints().await?,
         Command::Refresh => refresh().await?,
         Command::Discover { seconds } => discover(seconds).await?,
@@ -312,6 +317,20 @@ async fn reachable() -> Result<(), Box<dyn std::error::Error>> {
     }
     for (id, addr) in pairs {
         println!("{id}  {addr}");
+    }
+    Ok(())
+}
+
+async fn adb_devices() -> Result<(), Box<dyn std::error::Error>> {
+    let conn = zbus::Connection::session().await?;
+    let mgr = manager_proxy(&conn).await?;
+    let pairs: Vec<(String, String)> = mgr.call("ListAdbDevices", &()).await?;
+    if pairs.is_empty() {
+        println!("(no authorized ADB devices visible to the daemon)");
+        return Ok(());
+    }
+    for (serial, state) in pairs {
+        println!("{serial}  {state}");
     }
     Ok(())
 }
