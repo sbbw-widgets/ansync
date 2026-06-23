@@ -32,6 +32,13 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
+            // Sign release builds with the auto-generated debug keystore
+            // so CI artifacts are installable without provisioning a
+            // separate release keystore. The companion is not distributed
+            // via Play; cable / mDNS pair is the trust root regardless of
+            // the signing certificate. Swap for a real `signingConfigs`
+            // block when / if a Play track opens.
+            signingConfig = signingConfigs.getByName("debug")
         }
     }
 

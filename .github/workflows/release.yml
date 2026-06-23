@@ -105,16 +105,18 @@ jobs:
         run: |
           set -euo pipefail
           # Image entrypoint is gradle; invoking it directly with the
-          # android dir as `-p` matches the local dev recipe.
-          gradle -p . assembleDebug
+          # android dir as `-p` matches the local dev recipe. Release
+          # build is signed with the debug keystore (see app/build.gradle.kts)
+          # so the APK is installable without provisioning a Play keystore.
+          gradle -p . assembleRelease
 
       - name: Rename + collect APK
         run: |
           set -euo pipefail
           mkdir -p apk-dist
-          src=$(find android/app/build/outputs/apk/debug -name '*.apk' | head -n1)
+          src=$(find android/app/build/outputs/apk/release -name '*.apk' | head -n1)
           if [ -z "$src" ]; then
-            echo "::error::no APK produced under android/app/build/outputs/apk/debug"
+            echo "::error::no APK produced under android/app/build/outputs/apk/release"
             exit 1
           fi
           cp "$src" "apk-dist/companion-${{ needs.resolve.outputs.tag }}.apk"
