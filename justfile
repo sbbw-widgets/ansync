@@ -43,36 +43,119 @@ install:
 
 run: (build) (sign) (install)
 
-# Cut a release. Usage: just publish 0.2.0
+# Cut a release. Usage: just publish <bump>
 #
-# Bumps `[workspace.package].version` in Cargo.toml, refreshes the
-# lockfile, commits the bump, pushes to origin, then tags + pushes the
-# tag. `release.yml` fires on the tag and builds host bundles + the
-# companion APK from the matching commit so `CARGO_PKG_VERSION` (host)
-# and `versionName` (APK) line up.
-publish version:
+# `<bump>` is one of:
+#   major     1.2.3       -> 2.0.0
+#   minor     1.2.3       -> 1.3.0
+#   patch     1.2.3       -> 1.2.4
+#   rc        1.2.3       -> 1.2.4-rc.1
+#             1.2.4-rc.1  -> 1.2.4-rc.2
+#             1.2.4-beta.3-> 1.2.4-rc.1  (stream switch)
+#   beta      same shape, with -beta.N
+#   alpha     same shape, with -alpha.N
+#   release   1.2.4-rc.2  -> 1.2.4       (strip pre-release)
+#
+# Reads the current version from `[workspace.package].version`, bumps
+# it, refreshes the lockfile, commits the bump, pushes to origin,
+# tags + pushes the tag. `release.yml` fires on the tag and builds
+# host bundles + the companion APK so `CARGO_PKG_VERSION` (host) and
+# `versionName` (APK) line up.
+publish bump:
     #!/usr/bin/env bash
     set -euo pipefail
+
+    case "{{bump}}" in
+        major|minor|patch|release|rc|beta|alpha) ;;
+        *)
+            echo "error: bump must be major|minor|patch|release|rc|beta|alpha" >&2
+            exit 1
+            ;;
+    esac
+
     if [ -n "$(git status --porcelain)" ]; then
         echo "error: working tree is dirty; commit or stash first" >&2
         exit 1
     fi
-    if ! echo "{{version}}" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?$'; then
-        echo "error: '{{version}}' is not semver (expected X.Y.Z[-pre])" >&2
+
+    # Pull the version out of the [workspace.package] block. Pure awk
+    # so the recipe stays free of jq / cargo metadata dependencies.
+    current=$(awk '
+        /^\[workspace\.package\]/{f=1; next}
+        f && /^\[/{exit}
+        f && /^version[[:space:]]*=/{
+            gsub(/[" ]/, "")
+            split($0, a, "=")
+            print a[2]
+            exit
+        }
+    ' Cargo.toml)
+
+    if [ -z "${current:-}" ]; then
+        echo "error: could not read version from [workspace.package]" >&2
         exit 1
     fi
-    if git rev-parse "v{{version}}" >/dev/null 2>&1; then
-        echo "error: tag v{{version}} already exists" >&2
+    if ! echo "$current" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?$'; then
+        echo "error: current version '$current' is not semver" >&2
         exit 1
     fi
+
+    kind="{{bump}}"
+    case "$kind" in
+        major)
+            base=${current%%-*}
+            IFS=. read -r maj _min _pat <<<"$base"
+            new="$((maj+1)).0.0"
+            ;;
+        minor)
+            base=${current%%-*}
+            IFS=. read -r maj min _pat <<<"$base"
+            new="${maj}.$((min+1)).0"
+            ;;
+        patch)
+            base=${current%%-*}
+            IFS=. read -r maj min pat <<<"$base"
+            new="${maj}.${min}.$((pat+1))"
+            ;;
+        release)
+            if [[ "$current" != *-* ]]; then
+                echo "error: '$current' is already a stable release" >&2
+                exit 1
+            fi
+            new=${current%%-*}
+            ;;
+        rc|beta|alpha)
+            if [[ "$current" =~ ^([0-9]+\.[0-9]+\.[0-9]+)-${kind}\.([0-9]+)$ ]]; then
+                # Same stream: bump the counter.
+                new="${BASH_REMATCH[1]}-${kind}.$((BASH_REMATCH[2]+1))"
+            elif [[ "$current" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                # Stable -> first pre-release of next patch.
+                IFS=. read -r maj min pat <<<"$current"
+                new="${maj}.${min}.$((pat+1))-${kind}.1"
+            elif [[ "$current" =~ ^([0-9]+\.[0-9]+\.[0-9]+)-(rc|beta|alpha)\.[0-9]+$ ]]; then
+                # Different pre-release stream — keep base, reset to .1.
+                new="${BASH_REMATCH[1]}-${kind}.1"
+            else
+                echo "error: cannot bump ${kind} from '$current'" >&2
+                exit 1
+            fi
+            ;;
+    esac
+
+    if git rev-parse "v${new}" >/dev/null 2>&1; then
+        echo "error: tag v${new} already exists" >&2
+        exit 1
+    fi
+
+    echo "bumping: ${current} -> ${new}"
     # Patch only the [workspace.package] block so per-dep `version = ...`
     # entries downstream stay untouched.
-    sed -i '/^\[workspace\.package\]/,/^\[/{ s/^version = .*/version = "{{version}}"/ }' Cargo.toml
+    sed -i '/^\[workspace\.package\]/,/^\[/{ s/^version = .*/version = "'"$new"'"/ }' Cargo.toml
     # Refresh lockfile workspace-member entries (skips dep churn).
     cargo update --workspace
     git add Cargo.toml Cargo.lock
-    git commit -m "chore(release): {{version}}"
+    git commit -m "chore(release): ${new}"
     git push origin HEAD
-    git tag "v{{version}}"
-    git push origin "v{{version}}"
-    echo "pushed v{{version}} — release.yml will build bundles + APK"
+    git tag "v${new}"
+    git push origin "v${new}"
+    echo "pushed v${new} — release.yml will build bundles + APK"
