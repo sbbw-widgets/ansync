@@ -42,3 +42,37 @@ install:
     adb install android/app/build/outputs/apk/release/app-release-signed.apk
 
 run: (build) (sign) (install)
+
+# Cut a release. Usage: just publish 0.2.0
+#
+# Bumps `[workspace.package].version` in Cargo.toml, refreshes the
+# lockfile, commits the bump, pushes to origin, then tags + pushes the
+# tag. `release.yml` fires on the tag and builds host bundles + the
+# companion APK from the matching commit so `CARGO_PKG_VERSION` (host)
+# and `versionName` (APK) line up.
+publish version:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ -n "$(git status --porcelain)" ]; then
+        echo "error: working tree is dirty; commit or stash first" >&2
+        exit 1
+    fi
+    if ! echo "{{version}}" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?$'; then
+        echo "error: '{{version}}' is not semver (expected X.Y.Z[-pre])" >&2
+        exit 1
+    fi
+    if git rev-parse "v{{version}}" >/dev/null 2>&1; then
+        echo "error: tag v{{version}} already exists" >&2
+        exit 1
+    fi
+    # Patch only the [workspace.package] block so per-dep `version = ...`
+    # entries downstream stay untouched.
+    sed -i '/^\[workspace\.package\]/,/^\[/{ s/^version = .*/version = "{{version}}"/ }' Cargo.toml
+    # Refresh lockfile workspace-member entries (skips dep churn).
+    cargo update --workspace
+    git add Cargo.toml Cargo.lock
+    git commit -m "chore(release): {{version}}"
+    git push origin HEAD
+    git tag "v{{version}}"
+    git push origin "v{{version}}"
+    echo "pushed v{{version}} — release.yml will build bundles + APK"
