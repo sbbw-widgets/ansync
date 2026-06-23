@@ -1,19 +1,21 @@
 //! `ansyncctl` — CLI front-end for the ansync daemon over D-Bus.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::time::Duration;
 
 use ansync_crypto::IdentityKeypair;
-use ansync_discovery::{Discovery, MdnsDiscovery};
 use ansync_pairing::{PeerStore, list_adb_devices, pair_host_via_adb};
 use clap::{Parser, Subcommand};
 use directories::BaseDirs;
 use futures::StreamExt;
-use tokio::time::timeout;
 use tracing_subscriber::EnvFilter;
+use zbus::zvariant::OwnedValue;
 
 const IDENTITY_FILENAME: &str = "identity.key";
 const PEERS_DIRNAME: &str = "peers";
+
+const DEVICE_IFACE: &str = "org.gameros.Ansync1.Device";
+const PERMS_IFACE: &str = "org.gameros.Ansync1.Permissions";
 
 #[derive(Debug, Parser)]
 #[command(name = "ansyncctl", version, about = "ansync CLI")]
@@ -29,13 +31,25 @@ enum Command {
         #[command(subcommand)]
         action: IdentityAction,
     },
-    /// List paired devices known to the daemon.
+    /// List paired devices known to the daemon. Goes through
+    /// `Manager.ListDevices` + the `Device` interface properties so the
+    /// output reflects live state (capabilities, connectivity, address).
     Devices,
-    /// Browse the LAN for ansync peers advertising over mDNS.
+    /// Snapshot of paired devices currently observed on the LAN.
+    /// Backed by `Manager.ReachableDevices`.
+    Reachable,
+    /// Print the QUIC listen endpoints the daemon advertises
+    /// (`Manager.ListenEndpoints`). Useful for direct-dial debugging.
+    Endpoints,
+    /// Ask the daemon to re-scan the peer store and register D-Bus
+    /// paths for any newly persisted peer (`Manager.RefreshPeers`).
+    Refresh,
+    /// Browse the LAN for pair-ready companions via the daemon's mDNS
+    /// browser (`Manager.BrowseAvailable`).
     Discover {
-        /// How long to listen for replies before printing the table.
+        /// How long the daemon listens for replies before returning.
         #[arg(long, default_value_t = 5)]
-        seconds: u64,
+        seconds: u32,
     },
     /// Pair with an Android device. Tries cable / ADB first; if no
     /// device is attached, browses mDNS for pair-ready companions on
@@ -74,10 +88,52 @@ enum Command {
         #[arg(long, default_value_t = 5)]
         discover_seconds: u64,
     },
-    /// Forget a previously paired device.
+    /// Forget a previously paired device (`Manager.ForgetDevice`).
     Forget { id: String },
-    /// Open the mirror screen for a device.
+    /// Open the mirror window for a device (`Device.ShowScreen`).
     Show { id: String },
+    /// Close an open mirror window (`Device.HideScreen`).
+    Hide { id: String },
+    /// Start a camera capture session on the peer's lens
+    /// (`Device.StartCamera`).
+    CameraStart {
+        id: String,
+        /// Android `cameraId` string (`0` = back, `1` = front).
+        #[arg(long, default_value = "0")]
+        camera_id: String,
+        #[arg(long, default_value_t = 1920)]
+        width: u32,
+        #[arg(long, default_value_t = 1080)]
+        height: u32,
+        #[arg(long, default_value_t = 60)]
+        fps: u8,
+        #[arg(long, default_value_t = 8000)]
+        bitrate_kbps: u32,
+        #[arg(long, default_value = "h264", value_parser = ["h264", "h265"])]
+        codec: String,
+        #[arg(long, default_value = "crop", value_parser = ["crop", "letterbox", "stretch"])]
+        aspect: String,
+        #[arg(long)]
+        stabilization: bool,
+    },
+    /// Stop a running camera capture (`Device.StopCamera`).
+    CameraStop { id: String },
+    /// Share the peer's microphone to host audio
+    /// (`Device.StartMicrophone`).
+    MicStart { id: String },
+    /// Stop microphone sharing (`Device.StopMicrophone`).
+    MicStop { id: String },
+    /// Start an audio route in either direction
+    /// (`Device.StartAudioRoute`).
+    AudioStart {
+        id: String,
+        #[arg(value_parser = ["host-to-device", "device-to-host", "both"])]
+        direction: String,
+    },
+    /// Stop the active audio route (`Device.StopAudioRoute`).
+    AudioStop { id: String },
+    /// One-shot clipboard push host → peer (`Device.SyncClipboard`).
+    ClipboardSync { id: String },
     /// Push one or more files to a paired device. Routes through the
     /// daemon's D-Bus `Device.SendFiles` — the daemon owns the
     /// outbound transfer (mirror window, accounting, signals).
@@ -92,11 +148,25 @@ enum Command {
     /// Ask a paired device to open `url`. Linux peers shell out to
     /// `xdg-open`; Android peers prompt before firing `ACTION_VIEW`.
     Url { id: String, url: String },
-    /// Get or set a per-device permission flag.
+    /// Get or set a per-device permission flag (`Permissions.Get` /
+    /// `Permissions.Set`).
     Perm {
         id: String,
         flag: String,
         value: Option<bool>,
+    },
+    /// Reset all per-device permissions to defaults
+    /// (`Permissions.Reset`).
+    PermReset { id: String },
+    /// Subscribe to daemon signals and print them line-by-line until
+    /// Ctrl-C. Covers `Manager.DeviceConnectivityChanged` /
+    /// `DeviceReachable` / `DeviceUnreachable` and per-device
+    /// `StreamStateChanged` / `FileReceived` / `FileTransferProgress` /
+    /// `NotificationPosted` / `NotificationRemoved`.
+    Monitor {
+        /// Restrict to a single device id. Omit for all devices.
+        #[arg(long)]
+        id: Option<String>,
     },
 }
 
@@ -124,7 +194,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     match cli.command {
         Command::Identity { action } => identity(action)?,
-        Command::Devices => list_devices()?,
+        Command::Devices => list_devices().await?,
+        Command::Reachable => reachable().await?,
+        Command::Endpoints => endpoints().await?,
+        Command::Refresh => refresh().await?,
         Command::Discover { seconds } => discover(seconds).await?,
         Command::Pair {
             serial,
@@ -146,11 +219,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
             .await?;
         }
-        Command::Forget { id } => println!("(skeleton) forget {id}"),
-        Command::Show { id } => println!("(skeleton) show {id}"),
+        Command::Forget { id } => forget(id).await?,
+        Command::Show { id } => show_screen(id).await?,
+        Command::Hide { id } => hide_screen(id).await?,
+        Command::CameraStart {
+            id,
+            camera_id,
+            width,
+            height,
+            fps,
+            bitrate_kbps,
+            codec,
+            aspect,
+            stabilization,
+        } => {
+            camera_start(
+                id,
+                camera_id,
+                width,
+                height,
+                fps,
+                bitrate_kbps,
+                codec,
+                aspect,
+                stabilization,
+            )
+            .await?
+        }
+        Command::CameraStop { id } => camera_stop(id).await?,
+        Command::MicStart { id } => mic_start(id).await?,
+        Command::MicStop { id } => mic_stop(id).await?,
+        Command::AudioStart { id, direction } => audio_start(id, direction).await?,
+        Command::AudioStop { id } => audio_stop(id).await?,
+        Command::ClipboardSync { id } => clipboard_sync(id).await?,
         Command::Push { id, paths } => push(id, paths).await?,
         Command::Url { id, url } => send_url(id, url).await?,
-        Command::Perm { id, flag, value } => println!("(skeleton) perm {id} {flag} {value:?}"),
+        Command::Perm { id, flag, value } => perm(id, flag, value).await?,
+        Command::PermReset { id } => perm_reset(id).await?,
+        Command::Monitor { id } => monitor(id).await?,
     }
 
     Ok(())
@@ -207,54 +313,187 @@ fn identity(action: IdentityAction) -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-fn list_devices() -> Result<(), Box<dyn std::error::Error>> {
-    let store = PeerStore::open(default_peers_dir()?)?;
-    let peers = store.list()?;
-    if peers.is_empty() {
+async fn list_devices() -> Result<(), Box<dyn std::error::Error>> {
+    let conn = zbus::Connection::session().await?;
+    let mgr = manager_proxy(&conn).await?;
+    let ids: Vec<String> = mgr.call("ListDevices", &()).await?;
+    if ids.is_empty() {
         println!("(no paired devices — run `ansyncctl pair`)");
         return Ok(());
     }
-    for peer in peers {
+    for id in ids {
+        let props = device_props(&conn, &id).await?;
+        let name = take_string(&props, "Name").unwrap_or_default();
+        let state = take_string(&props, "State").unwrap_or_else(|| "unknown".into());
+        let address = take_string(&props, "Address").unwrap_or_default();
+        let caps = take_string_vec(&props, "Capabilities").unwrap_or_default();
+        let battery = take_u8(&props, "BatteryLevel").unwrap_or(0);
         println!(
-            "{id}  {name:<24}  caps={caps:#010x}  paired_at={paired_at}",
-            id = peer.id,
-            name = peer.name,
-            caps = peer.capabilities.bits(),
-            paired_at = peer.paired_at,
+            "{id}  {name:<24}  state={state:<14}  battery={battery:>3}  addr={address:<22}  caps=[{caps}]",
+            caps = caps.join(",")
         );
     }
     Ok(())
 }
 
-async fn discover(seconds: u64) -> Result<(), Box<dyn std::error::Error>> {
-    let identity = load_identity()?;
-    let mdns = MdnsDiscovery::new(identity.public().as_bytes())?;
-    let mut stream = mdns.browse()?;
-
-    let deadline = Duration::from_secs(seconds);
-    println!("browsing for {seconds}s …");
-    let mut seen = std::collections::HashMap::new();
-    let _ = timeout(deadline, async {
-        while let Some(dev) = stream.next().await {
-            seen.insert(dev.id.clone(), dev);
-        }
-    })
-    .await;
-
-    if seen.is_empty() {
-        println!("(no peers found)");
+async fn reachable() -> Result<(), Box<dyn std::error::Error>> {
+    let conn = zbus::Connection::session().await?;
+    let mgr = manager_proxy(&conn).await?;
+    let pairs: Vec<(String, String)> = mgr.call("ReachableDevices", &()).await?;
+    if pairs.is_empty() {
+        println!("(no reachable peers on the LAN right now)");
         return Ok(());
     }
-    for dev in seen.values() {
-        println!(
-            "{id}  {name:<24}  {addr}  caps={caps:#010x}",
-            id = dev.id,
-            name = dev.name,
-            addr = dev.addr,
-            caps = dev.capabilities.bits(),
-        );
+    for (id, addr) in pairs {
+        println!("{id}  {addr}");
     }
     Ok(())
+}
+
+async fn endpoints() -> Result<(), Box<dyn std::error::Error>> {
+    let conn = zbus::Connection::session().await?;
+    let mgr = manager_proxy(&conn).await?;
+    let pairs: Vec<(String, u16)> = mgr.call("ListenEndpoints", &()).await?;
+    if pairs.is_empty() {
+        println!("(daemon reports no listen endpoints)");
+        return Ok(());
+    }
+    for (ip, port) in pairs {
+        println!("{ip}:{port}");
+    }
+    Ok(())
+}
+
+async fn refresh() -> Result<(), Box<dyn std::error::Error>> {
+    let conn = zbus::Connection::session().await?;
+    let mgr = manager_proxy(&conn).await?;
+    let added: Vec<String> = mgr.call("RefreshPeers", &()).await?;
+    if added.is_empty() {
+        println!("(daemon already had every peer registered)");
+    } else {
+        for id in added {
+            println!("registered {id}");
+        }
+    }
+    Ok(())
+}
+
+async fn discover(seconds: u32) -> Result<(), Box<dyn std::error::Error>> {
+    let conn = zbus::Connection::session().await?;
+    let mgr = manager_proxy(&conn).await?;
+    println!("browsing for {seconds}s via daemon mDNS …");
+    let found: Vec<(String, String, String)> =
+        mgr.call("BrowseAvailable", &seconds).await?;
+    if found.is_empty() {
+        println!("(no pair-ready peers found)");
+        return Ok(());
+    }
+    for (name, addr, pubkey) in found {
+        println!("{name:<24}  {addr:<22}  {pubkey}");
+    }
+    Ok(())
+}
+
+async fn forget(id: String) -> Result<(), Box<dyn std::error::Error>> {
+    let conn = zbus::Connection::session().await?;
+    let mgr = manager_proxy(&conn).await?;
+    mgr.call::<_, _, ()>("ForgetDevice", &id).await?;
+    println!("forgot {id}");
+    Ok(())
+}
+
+async fn show_screen(id: String) -> Result<(), Box<dyn std::error::Error>> {
+    let proxy = device_proxy(&id).await?;
+    proxy.call::<_, _, ()>("ShowScreen", &()).await?;
+    println!("daemon opened mirror for {id}");
+    Ok(())
+}
+
+async fn hide_screen(id: String) -> Result<(), Box<dyn std::error::Error>> {
+    let proxy = device_proxy(&id).await?;
+    proxy.call::<_, _, ()>("HideScreen", &()).await?;
+    println!("daemon closed mirror for {id}");
+    Ok(())
+}
+
+async fn perm(
+    id: String,
+    flag: String,
+    value: Option<bool>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let proxy = permissions_proxy(&id).await?;
+    match value {
+        Some(v) => {
+            proxy.call::<_, _, ()>("Set", &(&flag, v)).await?;
+            println!("{id}.{flag} = {v}");
+        }
+        None => {
+            let current: bool = proxy.call("Get", &flag).await?;
+            println!("{id}.{flag} = {current}");
+        }
+    }
+    Ok(())
+}
+
+async fn perm_reset(id: String) -> Result<(), Box<dyn std::error::Error>> {
+    let proxy = permissions_proxy(&id).await?;
+    proxy.call::<_, _, ()>("Reset", &()).await?;
+    println!("permissions for {id} reset to defaults");
+    Ok(())
+}
+
+async fn manager_proxy(
+    conn: &zbus::Connection,
+) -> Result<zbus::Proxy<'static>, Box<dyn std::error::Error>> {
+    let proxy = zbus::Proxy::new(
+        conn,
+        ansync_dbus::SERVICE_NAME,
+        ansync_dbus::PATH_MANAGER,
+        "org.gameros.Ansync1.Manager",
+    )
+    .await?;
+    Ok(proxy)
+}
+
+async fn permissions_proxy(
+    id: &str,
+) -> Result<zbus::Proxy<'static>, Box<dyn std::error::Error>> {
+    let conn = zbus::Connection::session().await?;
+    let path = format!("/org/gameros/Ansync1/Permissions/{id}");
+    let proxy = zbus::Proxy::new(
+        &conn,
+        ansync_dbus::SERVICE_NAME,
+        zbus::zvariant::ObjectPath::try_from(path)?.into_owned(),
+        PERMS_IFACE,
+    )
+    .await?;
+    Ok(proxy)
+}
+
+async fn device_props(
+    conn: &zbus::Connection,
+    id: &str,
+) -> Result<HashMap<String, OwnedValue>, Box<dyn std::error::Error>> {
+    let path = format!("/org/gameros/Ansync1/Device/{id}");
+    let props = zbus::fdo::PropertiesProxy::builder(conn)
+        .destination(ansync_dbus::SERVICE_NAME)?
+        .path(zbus::zvariant::ObjectPath::try_from(path)?.into_owned())?
+        .build()
+        .await?;
+    let dict = props.get_all(DEVICE_IFACE.try_into()?).await?;
+    Ok(dict.into_iter().collect())
+}
+
+fn take_string(map: &HashMap<String, OwnedValue>, key: &str) -> Option<String> {
+    map.get(key).and_then(|v| v.try_clone().ok()?.try_into().ok())
+}
+
+fn take_string_vec(map: &HashMap<String, OwnedValue>, key: &str) -> Option<Vec<String>> {
+    map.get(key).and_then(|v| v.try_clone().ok()?.try_into().ok())
+}
+
+fn take_u8(map: &HashMap<String, OwnedValue>, key: &str) -> Option<u8> {
+    map.get(key).and_then(|v| v.try_clone().ok()?.try_into().ok())
 }
 
 async fn pair(
@@ -762,6 +1001,207 @@ async fn send_url(id_hex: String, url: String) -> Result<(), Box<dyn std::error:
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn camera_start(
+    id: String,
+    camera_id: String,
+    width: u32,
+    height: u32,
+    fps: u8,
+    bitrate_kbps: u32,
+    codec: String,
+    aspect: String,
+    stabilization: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let proxy = device_proxy(&id).await?;
+    proxy
+        .call::<_, _, ()>(
+            "StartCamera",
+            &(
+                camera_id,
+                width,
+                height,
+                fps,
+                bitrate_kbps,
+                codec,
+                aspect,
+                stabilization,
+            ),
+        )
+        .await?;
+    println!("camera start queued for {id}");
+    Ok(())
+}
+
+async fn camera_stop(id: String) -> Result<(), Box<dyn std::error::Error>> {
+    let proxy = device_proxy(&id).await?;
+    proxy.call::<_, _, ()>("StopCamera", &()).await?;
+    println!("camera stop queued for {id}");
+    Ok(())
+}
+
+async fn mic_start(id: String) -> Result<(), Box<dyn std::error::Error>> {
+    let proxy = device_proxy(&id).await?;
+    proxy.call::<_, _, ()>("StartMicrophone", &()).await?;
+    println!("microphone share started for {id}");
+    Ok(())
+}
+
+async fn mic_stop(id: String) -> Result<(), Box<dyn std::error::Error>> {
+    let proxy = device_proxy(&id).await?;
+    proxy.call::<_, _, ()>("StopMicrophone", &()).await?;
+    println!("microphone share stopped for {id}");
+    Ok(())
+}
+
+async fn audio_start(
+    id: String,
+    direction: String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let proxy = device_proxy(&id).await?;
+    proxy
+        .call::<_, _, ()>("StartAudioRoute", &direction)
+        .await?;
+    println!("audio route ({direction}) started for {id}");
+    Ok(())
+}
+
+async fn audio_stop(id: String) -> Result<(), Box<dyn std::error::Error>> {
+    let proxy = device_proxy(&id).await?;
+    proxy.call::<_, _, ()>("StopAudioRoute", &()).await?;
+    println!("audio route stopped for {id}");
+    Ok(())
+}
+
+async fn clipboard_sync(id: String) -> Result<(), Box<dyn std::error::Error>> {
+    let proxy = device_proxy(&id).await?;
+    proxy.call::<_, _, ()>("SyncClipboard", &()).await?;
+    println!("clipboard sync requested for {id}");
+    Ok(())
+}
+
+/// Subscribe to every daemon signal we care about and print one line
+/// per delivery. Two flavours of subscription:
+///   * `Manager.{DeviceConnectivityChanged, DeviceReachable, DeviceUnreachable}`
+///     — single emitter at `/org/gameros/Ansync1/Manager`.
+///   * Per-device `Device.*` signals — uses an interface match without a
+///     path constraint so every paired peer fans in. When `--id` is set
+///     the match adds the device path so noise from other peers stays
+///     filtered out.
+async fn monitor(id: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
+    use zbus::MatchRule;
+
+    let conn = zbus::Connection::session().await?;
+    let dbus = zbus::fdo::DBusProxy::new(&conn).await?;
+
+    let manager_rule = MatchRule::builder()
+        .msg_type(zbus::message::Type::Signal)
+        .sender(ansync_dbus::SERVICE_NAME)?
+        .interface("org.gameros.Ansync1.Manager")?
+        .path(ansync_dbus::PATH_MANAGER)?
+        .build();
+    dbus.add_match_rule(manager_rule).await?;
+
+    let mut device_rule = MatchRule::builder()
+        .msg_type(zbus::message::Type::Signal)
+        .sender(ansync_dbus::SERVICE_NAME)?
+        .interface(DEVICE_IFACE)?;
+    let device_path_owned: zbus::zvariant::OwnedObjectPath;
+    if let Some(ref id) = id {
+        device_path_owned = zbus::zvariant::ObjectPath::try_from(format!(
+            "/org/gameros/Ansync1/Device/{id}"
+        ))?
+        .into();
+        device_rule = device_rule.path(&device_path_owned)?;
+    }
+    dbus.add_match_rule(device_rule.build()).await?;
+
+    println!("watching daemon signals (Ctrl-C to exit)…");
+    let mut stream = zbus::MessageStream::from(conn.clone());
+    while let Some(msg) = stream.next().await {
+        let msg = match msg {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("(stream error: {e})");
+                continue;
+            }
+        };
+        let hdr = msg.header();
+        let Some(iface) = hdr.interface() else { continue };
+        let Some(member) = hdr.member() else { continue };
+        if iface.as_str() == "org.gameros.Ansync1.Manager" {
+            print_manager_signal(&msg, member.as_str());
+        } else if iface.as_str() == DEVICE_IFACE {
+            let device_id = hdr
+                .path()
+                .and_then(|p| p.as_str().rsplit('/').next())
+                .unwrap_or("?")
+                .to_string();
+            print_device_signal(&msg, &device_id, member.as_str());
+        }
+    }
+    Ok(())
+}
+
+fn print_manager_signal(msg: &zbus::Message, member: &str) {
+    match member {
+        "DeviceConnectivityChanged" => {
+            if let Ok((id, state)) = msg.body().deserialize::<(String, String)>() {
+                println!("conn  {id}  {state}");
+            }
+        }
+        "DeviceReachable" => {
+            if let Ok((id, addr)) = msg.body().deserialize::<(String, String)>() {
+                println!("up    {id}  {addr}");
+            }
+        }
+        "DeviceUnreachable" => {
+            if let Ok((id,)) = msg.body().deserialize::<(String,)>() {
+                println!("down  {id}");
+            }
+        }
+        _ => {}
+    }
+}
+
+fn print_device_signal(msg: &zbus::Message, device: &str, member: &str) {
+    match member {
+        "StreamStateChanged" => {
+            if let Ok((kind, active)) = msg.body().deserialize::<(String, bool)>() {
+                println!("stream {device}  {kind}={active}");
+            }
+        }
+        "FileReceived" => {
+            if let Ok((path,)) = msg.body().deserialize::<(String,)>() {
+                println!("file  {device}  {path}");
+            }
+        }
+        "FileTransferProgress" => {
+            if let Ok((batch_id, transfer_id, name, bytes, total, _bf, _bfd, _bbd, _btb, dir)) =
+                msg.body()
+                    .deserialize::<(u64, u64, String, u64, u64, u32, u32, u64, u64, String)>()
+            {
+                println!(
+                    "xfer  {device}  {dir} {name} {bytes}/{total}  (batch={batch_id} id={transfer_id})"
+                );
+            }
+        }
+        "NotificationPosted" => {
+            if let Ok((id, app, title, body)) =
+                msg.body().deserialize::<(u64, String, String, String)>()
+            {
+                println!("notif {device}  [{id}] {app} · {title} — {body}");
+            }
+        }
+        "NotificationRemoved" => {
+            if let Ok((id,)) = msg.body().deserialize::<(u64,)>() {
+                println!("notif {device}  [{id}] removed");
+            }
+        }
+        _ => {}
+    }
+}
+
 async fn device_proxy(
     id_hex: &str,
 ) -> Result<zbus::Proxy<'static>, Box<dyn std::error::Error>> {
@@ -771,7 +1211,7 @@ async fn device_proxy(
         &conn,
         "org.gameros.Ansync1",
         zbus::zvariant::ObjectPath::try_from(path)?.into_owned(),
-        "org.gameros.Ansync1.Device",
+        DEVICE_IFACE,
     )
     .await?;
     Ok(proxy)
