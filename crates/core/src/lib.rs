@@ -88,7 +88,7 @@ bitflags::bitflags! {
 
 /// Persistable per-device permission set. Defaults are tuned for a safe
 /// first connection: mirror + file send/recv on, hardware access off,
-/// clipboard requires a prompt.
+/// clipboard sync on (mirrors device defaults for the share workflow).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DevicePermissions {
     pub screen_mirror: bool,
@@ -99,8 +99,8 @@ pub struct DevicePermissions {
     pub audio_out: bool,
     pub files_send: bool,
     pub files_receive: bool,
-    pub clipboard_in: ClipboardPolicy,
-    pub clipboard_out: ClipboardPolicy,
+    pub clipboard_in: bool,
+    pub clipboard_out: bool,
     pub input_from_device: bool,
     pub input_to_device: bool,
     pub notifications: bool,
@@ -136,21 +136,14 @@ impl Default for DevicePermissions {
             audio_out: true,
             files_send: true,
             files_receive: true,
-            clipboard_in: ClipboardPolicy::Allow,
-            clipboard_out: ClipboardPolicy::Allow,
+            clipboard_in: true,
+            clipboard_out: true,
             input_from_device: false,
             input_to_device: false,
             notifications: true,
             share_receive: true,
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ClipboardPolicy {
-    Off,
-    Prompt,
-    Allow,
 }
 
 /// Permission keys used for error reporting and D-Bus surface.

@@ -9,7 +9,7 @@ use std::io::ErrorKind;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
-use ansync_core::{ClipboardPolicy, DeviceId, DevicePermissions, Permission};
+use ansync_core::{DeviceId, DevicePermissions, Permission};
 use async_trait::async_trait;
 
 use crate::{PermissionsError, PermissionsStore};
@@ -85,9 +85,7 @@ impl PermissionsStore for FilePermissionsStore {
 }
 
 /// Read the boolean projection of a [`Permission`] from a
-/// [`DevicePermissions`] snapshot. `ClipboardPolicy` is collapsed to
-/// `true` only when the flag is explicitly `Allow` — both `Off` and
-/// `Prompt` deny silent transfer.
+/// [`DevicePermissions`] snapshot.
 pub fn permission_value(perms: &DevicePermissions, permission: Permission) -> bool {
     match permission {
         Permission::ScreenMirror => perms.screen_mirror,
@@ -98,8 +96,8 @@ pub fn permission_value(perms: &DevicePermissions, permission: Permission) -> bo
         Permission::AudioOut => perms.audio_out,
         Permission::FilesSend => perms.files_send,
         Permission::FilesReceive => perms.files_receive,
-        Permission::ClipboardIn => matches!(perms.clipboard_in, ClipboardPolicy::Allow),
-        Permission::ClipboardOut => matches!(perms.clipboard_out, ClipboardPolicy::Allow),
+        Permission::ClipboardIn => perms.clipboard_in,
+        Permission::ClipboardOut => perms.clipboard_out,
         Permission::InputFromDevice => perms.input_from_device,
         Permission::InputToDevice => perms.input_to_device,
         Permission::Notifications => perms.notifications,
@@ -107,9 +105,7 @@ pub fn permission_value(perms: &DevicePermissions, permission: Permission) -> bo
     }
 }
 
-/// Apply a boolean write coming from the D-Bus surface. For clipboard
-/// flags `true` maps to `Allow` and `false` to `Off`; the `Prompt`
-/// state has to be set via a dedicated RPC (TODO Step 12).
+/// Apply a boolean write coming from the D-Bus surface.
 pub fn apply_permission(perms: &mut DevicePermissions, permission: Permission, value: bool) {
     match permission {
         Permission::ScreenMirror => perms.screen_mirror = value,
@@ -120,13 +116,8 @@ pub fn apply_permission(perms: &mut DevicePermissions, permission: Permission, v
         Permission::AudioOut => perms.audio_out = value,
         Permission::FilesSend => perms.files_send = value,
         Permission::FilesReceive => perms.files_receive = value,
-        Permission::ClipboardIn => {
-            perms.clipboard_in = if value { ClipboardPolicy::Allow } else { ClipboardPolicy::Off };
-        }
-        Permission::ClipboardOut => {
-            perms.clipboard_out =
-                if value { ClipboardPolicy::Allow } else { ClipboardPolicy::Off };
-        }
+        Permission::ClipboardIn => perms.clipboard_in = value,
+        Permission::ClipboardOut => perms.clipboard_out = value,
         Permission::InputFromDevice => perms.input_from_device = value,
         Permission::InputToDevice => perms.input_to_device = value,
         Permission::Notifications => perms.notifications = value,
@@ -223,7 +214,7 @@ mod tests {
 
         let loaded = store.load(&id).await.unwrap();
         assert!(loaded.mic);
-        assert!(matches!(loaded.clipboard_in, ClipboardPolicy::Allow));
+        assert!(loaded.clipboard_in);
 
         assert!(store.check(&id, Permission::Mic).await.unwrap());
         assert!(!store.check(&id, Permission::CameraVideo).await.unwrap());
