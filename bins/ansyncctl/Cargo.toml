@@ -14,7 +14,6 @@ path = "src/main.rs"
 [dependencies]
 ansync-crypto.workspace = true
 ansync-dbus.workspace = true
-ansync-pairing.workspace = true
 clap.workspace = true
 zbus.workspace = true
 directories.workspace = true
