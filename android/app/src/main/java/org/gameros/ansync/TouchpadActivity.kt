@@ -37,7 +37,10 @@ import androidx.compose.ui.ExperimentalComposeUiApi
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInteropFilter
+import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.layout.positionInWindow
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
@@ -69,6 +72,26 @@ import androidx.compose.ui.unit.dp
  *  └────────────────────────────────────────────────────────────────┘
  */
 class TouchpadActivity : ComponentActivity() {
+
+    /// Canvas rect in window coords. Set from the composable via
+    /// `onGloballyPositioned`; read from `dispatchGenericMotionEvent`
+    /// to translate stylus-hover events (which arrive at the activity
+    /// before the View tree, *not* through `pointerInteropFilter`)
+    /// back into canvas-local coords.
+    @Volatile var canvasLeft: Float = 0f
+    @Volatile var canvasTop: Float = 0f
+    @Volatile var canvasWidth: Int = 0
+    @Volatile var canvasHeight: Int = 0
+
+    /// Palm rejection state. While `penActive == true` (pen in
+    /// contact OR in proximity) every finger pointer in every
+    /// MotionEvent is dropped — only the pen pointer in the event
+    /// is forwarded to the host. After the pen leaves proximity we
+    /// also latch finger rejection for [PEN_LIFT_LATCH_MS] so the
+    /// palm settling on the screen as the user pulls the pen away
+    /// doesn't immediately fire a cursor jump or click.
+    @Volatile var penActive: Boolean = false
+    @Volatile var penReleasedAt: Long = 0L
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -104,8 +127,62 @@ class TouchpadActivity : ComponentActivity() {
         }
         return super.dispatchKeyEvent(event)
     }
+
+    /**
+     * Stylus *hover* events (`ACTION_HOVER_*`) are delivered through
+     * `dispatchGenericMotionEvent`, not the touch dispatch path that
+     * `pointerInteropFilter` taps into — so they would otherwise be
+     * silently dropped. Forward them to the same `handleStylus`
+     * pipeline so the host's uinput pen tracks pen position even
+     * before the tip touches the screen (matches Wacom / Surface UX:
+     * cursor follows pen mid-air, click happens on contact).
+     */
+    override fun dispatchGenericMotionEvent(event: MotionEvent): Boolean {
+        val tool = if (event.pointerCount > 0) event.getToolType(0) else MotionEvent.TOOL_TYPE_UNKNOWN
+        val isPen = tool == MotionEvent.TOOL_TYPE_STYLUS || tool == MotionEvent.TOOL_TYPE_ERASER
+        if (!isPen) return super.dispatchGenericMotionEvent(event)
+        if (canvasWidth <= 0 || canvasHeight <= 0) return super.dispatchGenericMotionEvent(event)
+        when (event.actionMasked) {
+            MotionEvent.ACTION_HOVER_ENTER,
+            MotionEvent.ACTION_HOVER_MOVE,
+            MotionEvent.ACTION_HOVER_EXIT,
+            -> {
+                val localX = event.x - canvasLeft
+                val localY = event.y - canvasTop
+                if (localX < 0f || localY < 0f ||
+                    localX > canvasWidth || localY > canvasHeight
+                ) {
+                    // Outside the canvas (toolbar area, etc.) — let
+                    // the system handle it normally.
+                    return super.dispatchGenericMotionEvent(event)
+                }
+                val proximityOut = event.actionMasked == MotionEvent.ACTION_HOVER_EXIT
+                if (proximityOut) {
+                    penActive = false
+                    penReleasedAt = SystemClock.uptimeMillis()
+                } else {
+                    penActive = true
+                }
+                emitStylusFromHover(
+                    event = event,
+                    localX = localX,
+                    localY = localY,
+                    canvasW = canvasWidth,
+                    canvasH = canvasHeight,
+                    proximityOut = proximityOut,
+                    eraser = tool == MotionEvent.TOOL_TYPE_ERASER,
+                )
+                return true
+            }
+        }
+        return super.dispatchGenericMotionEvent(event)
+    }
 }
 
+/// Window after the pen leaves the surface during which finger /
+/// palm touches are still ignored. Matches the timing scrcpy / Samsung
+/// Notes use for the same effect.
+private const val PEN_LIFT_LATCH_MS = 250L
 private const val LONG_PRESS_MS = 450L
 private const val TAP_SLOP_PX = 12f
 private const val TAP_MAX_MS = 200L
@@ -139,6 +216,7 @@ private fun TouchpadScreen() {
     var canvasSize by remember { mutableStateOf(IntSize.Zero) }
     var imeOpen by remember { mutableStateOf(false) }
     var editTextRef by remember { mutableStateOf<HostKeyboardEditText?>(null) }
+    val activity = LocalContext.current as? TouchpadActivity
     /// When `true`, every pointer in every `MotionEvent` is
     /// forwarded straight to the host's uinput Touchscreen (MT-B)
     /// device. The Android view becomes a 1:1 absolute-coord touch
@@ -197,13 +275,22 @@ private fun TouchpadScreen() {
             modifier = Modifier
                 .fillMaxSize()
                 .background(Color(0xFF101418))
-                .onSizeChanged { canvasSize = it }
+                .onSizeChanged {
+                    canvasSize = it
+                    activity?.canvasWidth = it.width
+                    activity?.canvasHeight = it.height
+                }
+                .onGloballyPositioned { coords ->
+                    val pos = coords.positionInWindow()
+                    activity?.canvasLeft = pos.x
+                    activity?.canvasTop = pos.y
+                }
                 .pointerInteropFilter { event ->
                     if (rawTouchMode) {
-                        handleRawTouchEvent(event, canvasSize)
+                        handleRawTouchEvent(activity, event, canvasSize)
                         status = "raw touch — ${event.pointerCount} fingers"
                     } else {
-                        val update = handlePointerEvent(event, canvasSize)
+                        val update = handlePointerEvent(activity, event, canvasSize)
                         if (update != null) status = update
                     }
                     true
@@ -271,11 +358,50 @@ private data class Gesture(
 
 private val gesture = Gesture()
 
-private fun handlePointerEvent(event: MotionEvent, canvas: IntSize): String? {
-    // Stylus events take their own absolute-coord path; the
-    // host-side uinput Stylus device is a separate evdev node.
-    if (event.getToolType(0) == MotionEvent.TOOL_TYPE_STYLUS) {
-        return handleStylus(event, canvas)
+private fun handlePointerEvent(
+    activity: TouchpadActivity?,
+    event: MotionEvent,
+    canvas: IntSize,
+): String? {
+    // Palm rejection: if the pen is present in this event, the only
+    // pointer we ever forward is the pen itself. Any finger / palm
+    // pointers in the same MotionEvent are dropped wholesale.
+    val penIdx = scanPenIndex(event)
+    if (penIdx >= 0) {
+        // POINTER_DOWN / POINTER_UP whose actionIndex is a finger
+        // means a palm just landed or lifted while the pen is in
+        // contact — there is no pen state change to report, so we
+        // ignore the event entirely (handleStylus would re-emit the
+        // pen position needlessly).
+        val act = event.actionMasked
+        if ((act == MotionEvent.ACTION_POINTER_DOWN || act == MotionEvent.ACTION_POINTER_UP) &&
+            event.actionIndex != penIdx
+        ) {
+            return "palm rejected (pen down)"
+        }
+        val penTool = event.getToolType(penIdx)
+        return handleStylus(
+            activity = activity,
+            event = event,
+            canvas = canvas,
+            idx = penIdx,
+            eraser = penTool == MotionEvent.TOOL_TYPE_ERASER,
+        )
+    }
+
+    // No pen in this event. Drop finger touches while the pen is
+    // still in proximity OR within the post-lift latch window — that
+    // is the palm settling on the screen as the user pulls the pen
+    // away, and acting on it would jump the cursor / fire spurious
+    // clicks.
+    if (activity != null && isPenLatchActive(activity)) {
+        // Cancel any in-flight gesture so a finger that started
+        // before the pen entered proximity doesn't continue.
+        if (gesture.leftHeld) { sendButton(button = 1, pressed = false); gesture.leftHeld = false }
+        if (gesture.rightHeld) { sendButton(button = 2, pressed = false); gesture.rightHeld = false }
+        releaseCtrlIfHeld()
+        gesture.twoFingerActive = false
+        return "palm rejected (pen latch)"
     }
 
     return when (event.actionMasked) {
@@ -515,26 +641,71 @@ private fun releaseCtrlIfHeld() {
  * with native touch handling (browsers, GIMP/Krita with touch,
  * Wayland compositors with libinput gestures) actually want.
  */
-private fun handleRawTouchEvent(event: MotionEvent, canvas: IntSize) {
+private fun handleRawTouchEvent(activity: TouchpadActivity?, event: MotionEvent, canvas: IntSize) {
     if (canvas.width <= 0 || canvas.height <= 0) return
+    // In raw-touch mode the stylus still bypasses the touchscreen
+    // forwarder and goes through the dedicated uinput pen device —
+    // route the pen pointer (if any) to handleStylus and continue
+    // emitting only the *non-finger* pointers below.
+    val penIdx = scanPenIndex(event)
+    if (penIdx >= 0) {
+        val penTool = event.getToolType(penIdx)
+        handleStylus(
+            activity = activity,
+            event = event,
+            canvas = canvas,
+            idx = penIdx,
+            eraser = penTool == MotionEvent.TOOL_TYPE_ERASER,
+        )
+    }
+    val latched = activity != null && isPenLatchActive(activity)
     when (event.actionMasked) {
         MotionEvent.ACTION_DOWN, MotionEvent.ACTION_POINTER_DOWN -> {
+            if (event.actionIndex == penIdx) return
+            if (latched && event.getToolType(event.actionIndex) == MotionEvent.TOOL_TYPE_FINGER) return
             emitTouchSlot(event, event.actionIndex, canvas, lifted = false)
         }
         MotionEvent.ACTION_MOVE -> {
             for (i in 0 until event.pointerCount) {
+                if (i == penIdx) continue
+                if (latched && event.getToolType(i) == MotionEvent.TOOL_TYPE_FINGER) continue
                 emitTouchSlot(event, i, canvas, lifted = false)
             }
         }
         MotionEvent.ACTION_UP, MotionEvent.ACTION_POINTER_UP -> {
+            if (event.actionIndex == penIdx) return
             emitTouchSlot(event, event.actionIndex, canvas, lifted = true)
         }
         MotionEvent.ACTION_CANCEL -> {
             for (i in 0 until event.pointerCount) {
+                if (i == penIdx) continue
                 emitTouchSlot(event, i, canvas, lifted = true)
             }
         }
     }
+}
+
+/// Return the index of the first stylus / eraser pointer in [event],
+/// or -1 if there are none. Used by every input path to peel the pen
+/// off and treat it independently from finger / palm pointers.
+private fun scanPenIndex(event: MotionEvent): Int {
+    for (i in 0 until event.pointerCount) {
+        val t = event.getToolType(i)
+        if (t == MotionEvent.TOOL_TYPE_STYLUS || t == MotionEvent.TOOL_TYPE_ERASER) {
+            return i
+        }
+    }
+    return -1
+}
+
+/// True while finger pointers should be rejected — i.e. the pen is
+/// currently in proximity, or the post-lift latch window has not
+/// elapsed yet.
+private fun isPenLatchActive(activity: TouchpadActivity): Boolean {
+    if (activity.penActive) return true
+    val released = activity.penReleasedAt
+    if (released == 0L) return false
+    return (SystemClock.uptimeMillis() - released) < PEN_LIFT_LATCH_MS
 }
 
 private fun emitTouchSlot(event: MotionEvent, idx: Int, canvas: IntSize, lifted: Boolean) {
@@ -558,27 +729,50 @@ private fun emitTouchSlot(event: MotionEvent, idx: Int, canvas: IntSize, lifted:
     )
 }
 
-private fun handleStylus(event: MotionEvent, canvas: IntSize): String {
+/**
+ * Touch-path stylus handler. Builds the wire packet from a
+ * MotionEvent that came through `dispatchTouchEvent` (i.e. the pen
+ * is already in contact). Proximity is always on for these events;
+ * hover events take the `dispatchGenericMotionEvent` path via
+ * [emitStylusFromHover].
+ *
+ * `btn` byte semantics (mirror of the Rust uinput consumer):
+ *   bit 0 : BARREL primary button held
+ *   bit 1 : BARREL secondary button held
+ *   bit 2 : eraser tool active (host emits BTN_TOOL_RUBBER instead of BTN_TOOL_PEN)
+ *   bit 7 : in-proximity (cleared on ACTION_HOVER_EXIT)
+ */
+private fun handleStylus(
+    activity: TouchpadActivity?,
+    event: MotionEvent,
+    canvas: IntSize,
+    idx: Int,
+    eraser: Boolean,
+): String {
+    val rawX = event.getX(idx); val rawY = event.getY(idx)
     val absX = if (canvas.width > 0) {
-        (event.x.coerceIn(0f, canvas.width.toFloat()) * STYLUS_ABS_MAX / canvas.width).toInt()
+        (rawX.coerceIn(0f, canvas.width.toFloat()) * STYLUS_ABS_MAX / canvas.width).toInt()
     } else 0
     val absY = if (canvas.height > 0) {
-        (event.y.coerceIn(0f, canvas.height.toFloat()) * STYLUS_ABS_MAX / canvas.height).toInt()
+        (rawY.coerceIn(0f, canvas.height.toFloat()) * STYLUS_ABS_MAX / canvas.height).toInt()
     } else 0
-    val pressure = when (event.actionMasked) {
-        MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> 0
-        else -> (event.pressure.coerceIn(0f, 1f) * STYLUS_PRESSURE_MAX).toInt()
+    // Pen lifts from the surface are signalled either by a pressure
+    // reading of 0 (preferred — the OEM driver reports it directly)
+    // or by ACTION_UP / ACTION_POINTER_UP whose `actionIndex` is the
+    // pen pointer. Read pressure directly off the pen slot — it's
+    // already 0 in both lift cases on every device we've tested.
+    val act = event.actionMasked
+    val penLifting = (act == MotionEvent.ACTION_UP) ||
+        (act == MotionEvent.ACTION_CANCEL) ||
+        (act == MotionEvent.ACTION_POINTER_UP && event.actionIndex == idx)
+    val pressure = if (penLifting) 0 else {
+        (event.getPressure(idx).coerceIn(0f, 1f) * STYLUS_PRESSURE_MAX).toInt()
             .coerceIn(0, STYLUS_PRESSURE_MAX)
     }
-    val tilt = event.getAxisValue(MotionEvent.AXIS_TILT)
-    val orient = event.orientation
-    val degs = (tilt * 180.0 / Math.PI).toFloat()
-    val tiltX = (degs * kotlin.math.cos(orient.toDouble())).toInt()
-        .coerceIn(-90, 90).toShort()
-    val tiltY = (degs * kotlin.math.sin(orient.toDouble())).toInt()
-        .coerceIn(-90, 90).toShort()
+    val (tiltX, tiltY) = computeTilt(event, idx)
     val btnState = event.buttonState
-    var btn = 0
+    var btn = 0x80   // in-proximity (touch path always has the pen near the surface)
+    if (eraser) btn = btn or 0x4
     if ((btnState and MotionEvent.BUTTON_STYLUS_PRIMARY) != 0) btn = btn or 0x1
     if ((btnState and MotionEvent.BUTTON_STYLUS_SECONDARY) != 0) btn = btn or 0x2
     NativeBridge.nativeSendInputMessage(
@@ -591,7 +785,72 @@ private fun handleStylus(event: MotionEvent, canvas: IntSize): String {
             btn = btn.toByte(),
         ).encode()
     )
-    return "stylus p=$pressure"
+    if (activity != null) {
+        if (penLifting) {
+            // Stamp release time so finger touches stay blocked for
+            // PEN_LIFT_LATCH_MS even on devices that don't emit
+            // ACTION_HOVER_EXIT after the lift. If hover events do
+            // fire, the proximity-out branch will refresh the stamp.
+            activity.penActive = false
+            activity.penReleasedAt = SystemClock.uptimeMillis()
+        } else {
+            activity.penActive = true
+        }
+    }
+    return if (eraser) "eraser p=$pressure" else "stylus p=$pressure"
+}
+
+/**
+ * Hover-path stylus handler. Called from the activity-level
+ * `dispatchGenericMotionEvent` override for `ACTION_HOVER_*` events,
+ * which `pointerInteropFilter` never sees. Coords arrive in window
+ * space; the caller has already subtracted the canvas top-left.
+ *
+ * Pressure is always 0 here (pen is in proximity but not touching);
+ * the host's uinput consumer treats this as BTN_TOOL_PEN=1 +
+ * BTN_TOUCH=0 — cursor follows the pen without clicking.
+ */
+internal fun emitStylusFromHover(
+    event: MotionEvent,
+    localX: Float,
+    localY: Float,
+    canvasW: Int,
+    canvasH: Int,
+    proximityOut: Boolean,
+    eraser: Boolean,
+) {
+    if (canvasW <= 0 || canvasH <= 0) return
+    val absX = (localX.coerceIn(0f, canvasW.toFloat()) * STYLUS_ABS_MAX / canvasW).toInt()
+    val absY = (localY.coerceIn(0f, canvasH.toFloat()) * STYLUS_ABS_MAX / canvasH).toInt()
+    val penIdx = scanPenIndex(event).coerceAtLeast(0)
+    val (tiltX, tiltY) = computeTilt(event, penIdx)
+    val btnState = event.buttonState
+    var btn = 0
+    if (!proximityOut) btn = btn or 0x80
+    if (eraser) btn = btn or 0x4
+    if ((btnState and MotionEvent.BUTTON_STYLUS_PRIMARY) != 0) btn = btn or 0x1
+    if ((btnState and MotionEvent.BUTTON_STYLUS_SECONDARY) != 0) btn = btn or 0x2
+    NativeBridge.nativeSendInputMessage(
+        WireInputMessage.Stylus(
+            x = absX,
+            y = absY,
+            pressure = 0,
+            tiltX = tiltX,
+            tiltY = tiltY,
+            btn = btn.toByte(),
+        ).encode()
+    )
+}
+
+private fun computeTilt(event: MotionEvent, idx: Int = 0): Pair<Short, Short> {
+    val tilt = event.getAxisValue(MotionEvent.AXIS_TILT, idx)
+    val orient = event.getOrientation(idx)
+    val degs = (tilt * 180.0 / Math.PI).toFloat()
+    val tiltX = (degs * kotlin.math.cos(orient.toDouble())).toInt()
+        .coerceIn(-90, 90).toShort()
+    val tiltY = (degs * kotlin.math.sin(orient.toDouble())).toInt()
+        .coerceIn(-90, 90).toShort()
+    return tiltX to tiltY
 }
 
 private fun sendButton(button: Int, pressed: Boolean) {
