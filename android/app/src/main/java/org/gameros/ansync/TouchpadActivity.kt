@@ -383,10 +383,27 @@ private fun handleTouchpadEvent(
     }
 }
 
+/// Maps Android's reusable `pointerId` to a monotonic tracking_id so
+/// libinput's MT-B "Touch jump" heuristic doesn't kick in when two
+/// consecutive single-finger taps both come in on Android's pointer
+/// id 0. Each new touchdown allocates a fresh id; lift removes the
+/// entry. The counter wraps at 0xFFFF (the kernel max we advertise).
+private val activeTouchpadTracking = HashMap<Int, Int>()
+private var nextTouchpadTrackingId = 0
+
 private fun emitTouchpadSlot(event: MotionEvent, idx: Int, canvas: IntSize, lifted: Boolean) {
     val pointerId = event.getPointerId(idx)
     val slot = (pointerId and 0xFF).toByte()
-    val trackingId = if (lifted) -1 else pointerId
+    val trackingId: Int = if (lifted) {
+        activeTouchpadTracking.remove(pointerId)
+        -1
+    } else {
+        activeTouchpadTracking.getOrPut(pointerId) {
+            val tid = nextTouchpadTrackingId
+            nextTouchpadTrackingId = (nextTouchpadTrackingId + 1) and 0xFFFF
+            tid
+        }
+    }
     val absX = (event.getX(idx).coerceIn(0f, canvas.width.toFloat()) *
         TOUCH_ABS_MAX / canvas.width).toInt().coerceIn(0, TOUCH_ABS_MAX)
     val absY = (event.getY(idx).coerceIn(0f, canvas.height.toFloat()) *
