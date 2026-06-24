@@ -32,10 +32,14 @@ build:
         -c './gradlew assembleRelease --no-daemon'
 
 sign:
-    # Run apksigner to sign generated apk
+    # AGP pre-signs the release APK with the debug keystore (see
+    # `app/build.gradle.kts`) so CI artifacts ship installable
+    # without provisioning a release keystore. Locally we override
+    # that signature with `{{key_store}}` — apksigner replaces the
+    # existing v1/v2/v3 signatures in place.
     docker run --rm -it -v "$(pwd)/:/src" -w /src --entrypoint apksigner sergioribera/rust-android:1.96-sdk-37.0 \
-        sign --ks-key-alias {{key_alias}} --ks {{key_store}} android/app/build/outputs/apk/release/app-release-unsigned.apk
-    sudo cp android/app/build/outputs/apk/release/app-release-unsigned.apk \
+        sign --ks-key-alias {{key_alias}} --ks {{key_store}} android/app/build/outputs/apk/release/app-release.apk
+    sudo cp android/app/build/outputs/apk/release/app-release.apk \
         android/app/build/outputs/apk/release/app-release-signed.apk
 
 install:
