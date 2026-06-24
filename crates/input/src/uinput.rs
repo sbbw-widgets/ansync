@@ -520,14 +520,18 @@ impl VirtualInputDevice for Touchpad {
         handle.set_evbit(EventKind::Key)?;
         handle.set_evbit(EventKind::Absolute)?;
         handle.set_evbit(EventKind::Synchronize)?;
-        // Clickpad buttons (no physical L/R/M — `INPUT_PROP_BUTTONPAD`
-        // tells libinput that the surface itself is the button). Plus
-        // the BTN_TOOL_<N>TAP family so libinput's tap-detection knows
-        // how many fingers are down — tap-button-map maps 1/2/3 → L/R/M.
+        // Clickpad layout: only `BTN_LEFT` is advertised on the kernel
+        // device — `INPUT_PROP_BUTTONPAD` tells libinput the whole
+        // surface IS the single physical button, and libinput
+        // synthesises BTN_RIGHT / BTN_MIDDLE itself from tap-button-map
+        // or software-button regions. Advertising BTN_RIGHT/MIDDLE
+        // here would trigger libinput's "clickpad advertising right
+        // button" kernel-bug warning and may disable some heuristics.
+        //
+        // The BTN_TOOL_<N>TAP family lets libinput count contact
+        // fingers (1/2/3-finger taps → L/R/M via tap-button-map).
         for button in [
             Key::ButtonLeft,
-            Key::ButtonRight,
-            Key::ButtonMiddle,
             Key::ButtonTouch,
             Key::ButtonToolFinger,
             Key::ButtonToolDoubleTap,
