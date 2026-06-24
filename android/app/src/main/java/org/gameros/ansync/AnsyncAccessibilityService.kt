@@ -100,7 +100,7 @@ class AnsyncAccessibilityService : AccessibilityService() {
             is WireInputMessage.Text -> dispatchText(msg.text)
             is WireInputMessage.Stylus, is WireInputMessage.MouseMove,
             is WireInputMessage.MouseButton, is WireInputMessage.MouseWheel,
-            is WireInputMessage.Gamepad -> {
+            is WireInputMessage.Gamepad, is WireInputMessage.TouchpadSlot -> {
                 // Out-of-band on Android: the host shouldn't push these
                 // back to the device. Drop silently.
             }
