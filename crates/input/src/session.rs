@@ -38,6 +38,7 @@ pub trait InputDeviceFactory: Send + Sync {
     fn build_keyboard(&self) -> Box<dyn VirtualInputDevice>;
     fn build_mouse(&self) -> Box<dyn VirtualInputDevice>;
     fn build_touchscreen(&self) -> Box<dyn VirtualInputDevice>;
+    fn build_touchpad(&self) -> Box<dyn VirtualInputDevice>;
     fn build_stylus(&self) -> Box<dyn VirtualInputDevice>;
     fn build_gamepad(&self) -> Box<dyn VirtualInputDevice>;
 }
@@ -58,6 +59,9 @@ impl InputDeviceFactory for UinputFactory {
     fn build_touchscreen(&self) -> Box<dyn VirtualInputDevice> {
         Box::new(crate::uinput::Touchscreen::new())
     }
+    fn build_touchpad(&self) -> Box<dyn VirtualInputDevice> {
+        Box::new(crate::uinput::Touchpad::new())
+    }
     fn build_stylus(&self) -> Box<dyn VirtualInputDevice> {
         Box::new(crate::uinput::Stylus::new())
     }
@@ -74,6 +78,7 @@ pub struct InputSession {
     keyboard: Option<Box<dyn VirtualInputDevice>>,
     mouse: Option<Box<dyn VirtualInputDevice>>,
     touchscreen: Option<Box<dyn VirtualInputDevice>>,
+    touchpad: Option<Box<dyn VirtualInputDevice>>,
     stylus: Option<Box<dyn VirtualInputDevice>>,
     gamepad: Option<Box<dyn VirtualInputDevice>>,
 }
@@ -93,6 +98,7 @@ impl InputSession {
             keyboard: None,
             mouse: None,
             touchscreen: None,
+            touchpad: None,
             stylus: None,
             gamepad: None,
         }
@@ -117,6 +123,7 @@ impl InputSession {
             | InputEvent::MouseButton { .. }
             | InputEvent::MouseWheel { .. } => self.send_via(SessionDevice::Mouse, event).await,
             InputEvent::TouchSlot { .. } => self.send_via(SessionDevice::Touchscreen, event).await,
+            InputEvent::TouchpadSlot { .. } => self.send_via(SessionDevice::Touchpad, event).await,
             InputEvent::Stylus { .. } => self.send_via(SessionDevice::Stylus, event).await,
             InputEvent::Gamepad { .. } => self.send_via(SessionDevice::Gamepad, event).await,
             InputEvent::Sync => Ok(()),
@@ -132,6 +139,7 @@ impl InputSession {
             &mut self.keyboard,
             &mut self.mouse,
             &mut self.touchscreen,
+            &mut self.touchpad,
             &mut self.stylus,
             &mut self.gamepad,
         ] {
@@ -162,6 +170,7 @@ impl InputSession {
             SessionDevice::Keyboard => &mut self.keyboard,
             SessionDevice::Mouse => &mut self.mouse,
             SessionDevice::Touchscreen => &mut self.touchscreen,
+            SessionDevice::Touchpad => &mut self.touchpad,
             SessionDevice::Stylus => &mut self.stylus,
             SessionDevice::Gamepad => &mut self.gamepad,
         };
@@ -170,6 +179,7 @@ impl InputSession {
                 SessionDevice::Keyboard => self.factory.build_keyboard(),
                 SessionDevice::Mouse => self.factory.build_mouse(),
                 SessionDevice::Touchscreen => self.factory.build_touchscreen(),
+                SessionDevice::Touchpad => self.factory.build_touchpad(),
                 SessionDevice::Stylus => self.factory.build_stylus(),
                 SessionDevice::Gamepad => self.factory.build_gamepad(),
             };
@@ -186,6 +196,7 @@ enum SessionDevice {
     Keyboard,
     Mouse,
     Touchscreen,
+    Touchpad,
     Stylus,
     Gamepad,
 }
@@ -205,6 +216,19 @@ fn wire_to_event(msg: InputMessage) -> InputEvent {
             pressure,
             tracking_id,
         } => InputEvent::TouchSlot {
+            slot,
+            x,
+            y,
+            pressure,
+            tracking_id,
+        },
+        InputMessage::TouchpadSlot {
+            slot,
+            x,
+            y,
+            pressure,
+            tracking_id,
+        } => InputEvent::TouchpadSlot {
             slot,
             x,
             y,

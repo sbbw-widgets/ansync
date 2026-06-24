@@ -203,6 +203,15 @@ pub enum InputMessage {
     /// realizes this via `AccessibilityNodeInfo.ACTION_SET_TEXT` on
     /// the focused `EditText`.
     Text(String),
+    /// Multi-touch slot on the host's *touchpad* device (libinput
+    /// classifies as buttonpad/clickpad → tap-to-click, two-finger
+    /// scroll, pinch zoom etc. handled natively by the compositor's
+    /// libinput config). Same payload shape as `TouchSlot` but routes
+    /// to a different uinput node so the companion can choose
+    /// between "Mac-style touchpad" (this) and "absolute touchscreen"
+    /// (`TouchSlot`) per gesture mode. Added at the end of the enum
+    /// to preserve the postcard variant indices of the older entries.
+    TouchpadSlot { slot: u8, x: i32, y: i32, pressure: u16, tracking_id: i32 },
 }
 
 #[derive(Debug, Serialize, Deserialize)]

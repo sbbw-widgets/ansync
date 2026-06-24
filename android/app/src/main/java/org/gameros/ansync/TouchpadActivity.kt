@@ -48,27 +48,34 @@ import androidx.compose.ui.unit.dp
 /**
  * Full-screen device→host input surface. Routes every interaction
  * over the QUIC `Input` stream the companion already keeps open per
- * peer:
+ * peer.
  *
- *  ┌─ Touch / mouse pad ────────────────────────────────────────────┐
- *  │ • 1-finger drag         → `MouseMove { dx, dy }` (no button)    │
- *  │ • 1-finger tap          → `MouseButton { 1, down/up }`          │
- *  │ • long press            → `MouseButton { 2, down/up }`          │
- *  │ • double-tap + hold     → `MouseButton { 1, down }` + drag      │
- *  │ • 2-finger drag         → `MouseWheel { dx, dy }`               │
- *  │ • 2-finger tap          → `MouseButton { 3, down/up }`          │
- *  │ • stylus events         → `Stylus { x, y, pressure, tilt, btn }`│
+ *  ┌─ Touch (default: touchpad mode) ────────────────────────────────┐
+ *  │ Every finger pointer becomes a raw `TouchpadSlot` (MT-B) packet │
+ *  │ aimed at the host's clickpad uinput device. libinput on the     │
+ *  │ host drives ALL gesture detection: tap-to-click, two-finger     │
+ *  │ scroll, pinch zoom, drag-lock, palm rejection — configured      │
+ *  │ from the user's compositor input settings. No per-finger        │
+ *  │ synthesis lives on the companion any more.                      │
+ *  │                                                                 │
+ *  │ The "Touchscreen mode" toggle flips to `TouchSlot` packets so   │
+ *  │ the same fingers land on the host's absolute-coord touchscreen  │
+ *  │ uinput device — useful for apps that want raw multi-touch       │
+ *  │ instead of pointer gestures.                                    │
  *  └────────────────────────────────────────────────────────────────┘
  *
- *  ┌─ Keyboard ──────────────────────────────────────────────────────┐
- *  │ • Hardware KeyEvent  → `KeyPress { keycode, pressed }` via the  │
- *  │   activity-level `dispatchKeyEvent` (USB / BT keyboards).       │
- *  │ • Soft IME           → an offscreen `EditText` whose            │
- *  │   `InputConnection` intercepts `commitText`,                    │
- *  │   `deleteSurroundingText` and `sendKeyEvent` 1-to-1 — no shared │
- *  │   text buffer, so IME composition / autocomplete cannot         │
- *  │   manufacture phantom deletes the way `BasicTextField`+         │
- *  │   `onValueChange` did.                                          │
+ *  ┌─ Stylus ───────────────────────────────────────────────────────┐
+ *  │ Pen / eraser pointers always take the dedicated tablet path    │
+ *  │ regardless of mode → `Stylus { x, y, pressure, tilt, btn }` →  │
+ *  │ host uinput Stylus (Wacom-style indirect tablet). Hover events │
+ *  │ ride through `dispatchGenericMotionEvent` so the cursor tracks │
+ *  │ the pen mid-air.                                               │
+ *  └────────────────────────────────────────────────────────────────┘
+ *
+ *  ┌─ Keyboard ─────────────────────────────────────────────────────┐
+ *  │ Hardware KeyEvent → `KeyPress` via `dispatchKeyEvent`. Soft IME│
+ *  │ → offscreen `EditText` whose `InputConnection` intercepts      │
+ *  │ `commitText` / `deleteSurroundingText` / `sendKeyEvent` 1-to-1.│
  *  └────────────────────────────────────────────────────────────────┘
  */
 class TouchpadActivity : ComponentActivity() {
@@ -183,31 +190,11 @@ class TouchpadActivity : ComponentActivity() {
 /// palm touches are still ignored. Matches the timing scrcpy / Samsung
 /// Notes use for the same effect.
 private const val PEN_LIFT_LATCH_MS = 250L
-private const val LONG_PRESS_MS = 450L
-private const val TAP_SLOP_PX = 12f
-private const val TAP_MAX_MS = 200L
-private const val DOUBLE_TAP_MS = 300L
 private const val STYLUS_ABS_MAX = 32767
 private const val STYLUS_PRESSURE_MAX = 8191
-/// Hi-res wheel ticks emitted per pixel of finger travel. 120 ticks
-/// equal one legacy notch, so this factor lands ~3-4 notches per 100
-/// px of swipe — close to how a physical trackpad behaves on the
-/// same hardware.
-private const val WHEEL_HI_RES_PER_PIXEL = 4f
-/// Pixels of dominant axis travel before a 2-finger gesture commits
-/// to scroll-vs-pinch mode. Below this both are still being
-/// measured; whichever crossed first wins for the rest of the
-/// gesture.
-private const val MODE_LOCK_PX = 16f
-/// Hi-res wheel ticks emitted per pixel of pinch spread / contract.
-/// Pinch mode wraps the wheel in Ctrl press/release so apps see the
-/// universal `Ctrl+Scroll = zoom` shortcut.
-private const val PINCH_HI_RES_PER_PIXEL = 3f
-private const val TWO_FINGER_MODE_UNDECIDED = 0
-private const val TWO_FINGER_MODE_SCROLL = 1
-private const val TWO_FINGER_MODE_PINCH = 2
-/// Linux evdev `KEY_LEFTCTRL`.
-private const val EVDEV_LEFTCTRL = 29
+/// Absolute coord upper bound for touchpad / touchscreen slots —
+/// matches the `ABS_MAX` advertised on the host uinput devices.
+private const val TOUCH_ABS_MAX = 32767
 
 @OptIn(ExperimentalComposeUiApi::class)
 @Composable
@@ -247,7 +234,7 @@ private fun TouchpadScreen() {
                 Text(if (imeOpen) "Hide keyboard" else "Show keyboard")
             }
             Button(onClick = { rawTouchMode = !rawTouchMode }) {
-                Text(if (rawTouchMode) "Trackpad mode" else "Raw touch mode")
+                Text(if (rawTouchMode) "Touchpad mode" else "Touchscreen mode")
             }
             Text(
                 text = status,
@@ -286,12 +273,18 @@ private fun TouchpadScreen() {
                     activity?.canvasTop = pos.y
                 }
                 .pointerInteropFilter { event ->
-                    if (rawTouchMode) {
+                    // Stylus pointers always take the dedicated tablet
+                    // pipeline regardless of mode.
+                    val pen = scanPenIndex(event)
+                    if (pen >= 0) {
+                        val update = handlePointerEvent(activity, event, canvasSize)
+                        if (update != null) status = update
+                    } else if (rawTouchMode) {
                         handleRawTouchEvent(activity, event, canvasSize)
                         status = "raw touch — ${event.pointerCount} fingers"
                     } else {
-                        val update = handlePointerEvent(activity, event, canvasSize)
-                        if (update != null) status = update
+                        handleTouchpadEvent(activity, event, canvasSize)
+                        status = "touchpad — ${event.pointerCount} fingers"
                     }
                     true
                 },
@@ -302,10 +295,9 @@ private fun TouchpadScreen() {
                     "pinch / pan / rotate handled by the host compositor\n" +
                     "no synthesised clicks — apps see real touch events"
             } else {
-                "drag → cursor  •  tap → click  •  long press → right\n" +
-                    "double-tap + hold → left button drag\n" +
-                    "2-finger drag → wheel  •  2-finger tap → middle\n" +
-                    "pinch fingers → Ctrl+Wheel zoom\n" +
+                "Mac-style touchpad → host clickpad\n" +
+                    "tap-to-click, two-finger scroll, pinch zoom handled\n" +
+                    "by libinput on the host (configure in your compositor)\n" +
                     "stylus → pen events  •  Show keyboard → type to host"
             }
             Text(
@@ -318,312 +310,100 @@ private fun TouchpadScreen() {
     }
 }
 
-// ── Pointer state machine ────────────────────────────────────────────
+// ── Touch / stylus dispatch ──────────────────────────────────────────
 
-private data class Gesture(
-    var downAt: Long = 0L,
-    var startX: Float = 0f,
-    var startY: Float = 0f,
-    var lastX: Float = 0f,
-    var lastY: Float = 0f,
-    var rightHeld: Boolean = false,
-    var leftHeld: Boolean = false,
-    var twoFingerActive: Boolean = false,
-    var twoFingerLastY: Float = 0f,
-    var twoFingerLastX: Float = 0f,
-    var twoFingerStartX: Float = 0f,
-    var twoFingerStartY: Float = 0f,
-    var twoFingerMoved: Boolean = false,
-    var lastUpAt: Long = 0L,
-    var wheelRemainderX: Float = 0f,
-    var wheelRemainderY: Float = 0f,
-    /// 0 = undecided, 1 = scroll, 2 = pinch. Locked at the moment
-    /// either accumulator crosses `MODE_LOCK_PX`.
-    var twoFingerMode: Int = TWO_FINGER_MODE_UNDECIDED,
-    /// Sum of |center axis delta| since gesture start. Used to
-    /// classify scroll vs pinch during the undecided window.
-    var scrollAccum: Float = 0f,
-    /// Sum of |distance delta between the two pointers| since
-    /// gesture start.
-    var pinchAccum: Float = 0f,
-    /// Distance between the two pointers at the previous MOVE event.
-    var pinchLastDistance: Float = 0f,
-    /// Sub-tick carry for pinch → hi-res wheel conversion.
-    var pinchRemainder: Float = 0f,
-    /// Whether `KEY_LEFTCTRL` is currently held on the host because
-    /// the gesture is in pinch mode (released at UP / CANCEL /
-    /// POINTER_DOWN→scroll downgrade).
-    var ctrlHeld: Boolean = false,
-)
-
-private val gesture = Gesture()
-
+/**
+ * Stylus-only path. Called from the touch dispatcher when a stylus
+ * pointer is present in the MotionEvent; the finger pointers (palm)
+ * in the same event are dropped wholesale so the host pen doesn't
+ * see them. Returns `null` when there is no stylus pointer at all —
+ * the caller should fall through to [handleTouchpadEvent].
+ */
 private fun handlePointerEvent(
     activity: TouchpadActivity?,
     event: MotionEvent,
     canvas: IntSize,
 ): String? {
-    // Palm rejection: if the pen is present in this event, the only
-    // pointer we ever forward is the pen itself. Any finger / palm
-    // pointers in the same MotionEvent are dropped wholesale.
     val penIdx = scanPenIndex(event)
-    if (penIdx >= 0) {
-        // POINTER_DOWN / POINTER_UP whose actionIndex is a finger
-        // means a palm just landed or lifted while the pen is in
-        // contact — there is no pen state change to report, so we
-        // ignore the event entirely (handleStylus would re-emit the
-        // pen position needlessly).
-        val act = event.actionMasked
-        if ((act == MotionEvent.ACTION_POINTER_DOWN || act == MotionEvent.ACTION_POINTER_UP) &&
-            event.actionIndex != penIdx
-        ) {
-            return "palm rejected (pen down)"
-        }
-        val penTool = event.getToolType(penIdx)
-        return handleStylus(
-            activity = activity,
-            event = event,
-            canvas = canvas,
-            idx = penIdx,
-            eraser = penTool == MotionEvent.TOOL_TYPE_ERASER,
-        )
+    if (penIdx < 0) return null
+    val act = event.actionMasked
+    if ((act == MotionEvent.ACTION_POINTER_DOWN || act == MotionEvent.ACTION_POINTER_UP) &&
+        event.actionIndex != penIdx
+    ) {
+        return "palm rejected (pen down)"
     }
-
-    // No pen in this event. Drop finger touches while the pen is
-    // still in proximity OR within the post-lift latch window — that
-    // is the palm settling on the screen as the user pulls the pen
-    // away, and acting on it would jump the cursor / fire spurious
-    // clicks.
-    if (activity != null && isPenLatchActive(activity)) {
-        // Cancel any in-flight gesture so a finger that started
-        // before the pen entered proximity doesn't continue.
-        if (gesture.leftHeld) { sendButton(button = 1, pressed = false); gesture.leftHeld = false }
-        if (gesture.rightHeld) { sendButton(button = 2, pressed = false); gesture.rightHeld = false }
-        releaseCtrlIfHeld()
-        gesture.twoFingerActive = false
-        return "palm rejected (pen latch)"
-    }
-
-    return when (event.actionMasked) {
-        MotionEvent.ACTION_DOWN -> {
-            val now = SystemClock.uptimeMillis()
-            gesture.downAt = now
-            gesture.startX = event.x
-            gesture.startY = event.y
-            gesture.lastX = event.x
-            gesture.lastY = event.y
-            gesture.rightHeld = false
-            gesture.twoFingerActive = false
-            gesture.twoFingerMoved = false
-            // Double-tap-and-hold: if the previous tap released
-            // within the double-tap window, the new touch starts
-            // with the left button held — user can now drag the
-            // selection / window / scrollbar.
-            gesture.leftHeld = (now - gesture.lastUpAt) < DOUBLE_TAP_MS
-            if (gesture.leftHeld) sendButton(button = 1, pressed = true)
-            if (gesture.leftHeld) "drag-mode" else "pointer-down"
-        }
-        MotionEvent.ACTION_POINTER_DOWN -> {
-            // Second finger landed — promote the gesture to a
-            // two-finger scroll / pinch / middle-click stream. Any
-            // drag-mode single-finger gesture in progress is
-            // cancelled (button release) before flipping.
-            if (gesture.leftHeld) {
-                sendButton(button = 1, pressed = false)
-                gesture.leftHeld = false
-            }
-            gesture.twoFingerActive = true
-            val cx = if (event.pointerCount >= 2) (event.getX(0) + event.getX(1)) / 2 else event.x
-            val cy = if (event.pointerCount >= 2) (event.getY(0) + event.getY(1)) / 2 else event.y
-            gesture.twoFingerLastX = cx
-            gesture.twoFingerLastY = cy
-            gesture.twoFingerStartX = cx
-            gesture.twoFingerStartY = cy
-            gesture.twoFingerMoved = false
-            gesture.wheelRemainderX = 0f
-            gesture.wheelRemainderY = 0f
-            gesture.twoFingerMode = TWO_FINGER_MODE_UNDECIDED
-            gesture.scrollAccum = 0f
-            gesture.pinchAccum = 0f
-            gesture.pinchRemainder = 0f
-            gesture.pinchLastDistance = if (event.pointerCount >= 2) {
-                kotlin.math.hypot(
-                    (event.getX(0) - event.getX(1)).toDouble(),
-                    (event.getY(0) - event.getY(1)).toDouble(),
-                ).toFloat()
-            } else 0f
-            "two-finger active"
-        }
-        MotionEvent.ACTION_MOVE -> {
-            if (gesture.twoFingerActive) {
-                handleTwoFingerMove(event)
-            } else {
-                val dx = (event.x - gesture.lastX).toInt()
-                val dy = (event.y - gesture.lastY).toInt()
-                if (dx != 0 || dy != 0) {
-                    val moved = kotlin.math.hypot(
-                        (event.x - gesture.startX).toDouble(),
-                        (event.y - gesture.startY).toDouble(),
-                    )
-                    val elapsed = SystemClock.uptimeMillis() - gesture.downAt
-                    // Long-press right-click: stationary finger
-                    // past the threshold upgrades to button 2 held.
-                    // Drag mode already has button 1 held from
-                    // ACTION_DOWN; plain drag emits *just* MouseMove
-                    // with no implicit button press.
-                    if (!gesture.leftHeld && !gesture.rightHeld &&
-                        elapsed > LONG_PRESS_MS && moved < TAP_SLOP_PX
-                    ) {
-                        sendButton(button = 2, pressed = true)
-                        gesture.rightHeld = true
-                    }
-                    NativeBridge.nativeSendInputMessage(
-                        WireInputMessage.MouseMove(dx = dx, dy = dy).encode()
-                    )
-                    gesture.lastX = event.x
-                    gesture.lastY = event.y
-                }
-                if (gesture.leftHeld) "drag" else if (gesture.rightHeld) "right-drag" else "move"
-            }
-        }
-        MotionEvent.ACTION_POINTER_UP -> {
-            // First of the two fingers lifted. Release Ctrl now so
-            // a stuck modifier never escapes the gesture, even if
-            // the user keeps the remaining finger down without ever
-            // hitting ACTION_UP.
-            releaseCtrlIfHeld()
-            "two-finger ending"
-        }
-        MotionEvent.ACTION_UP -> {
-            val now = SystemClock.uptimeMillis()
-            val elapsed = now - gesture.downAt
-            val moved = kotlin.math.hypot(
-                (event.x - gesture.startX).toDouble(),
-                (event.y - gesture.startY).toDouble(),
-            )
-            when {
-                gesture.twoFingerActive -> {
-                    if (!gesture.twoFingerMoved && elapsed < TAP_MAX_MS) {
-                        sendButton(button = 3, pressed = true)
-                        sendButton(button = 3, pressed = false)
-                    }
-                }
-                gesture.rightHeld -> sendButton(button = 2, pressed = false)
-                gesture.leftHeld -> sendButton(button = 1, pressed = false)
-                elapsed < TAP_MAX_MS && moved < TAP_SLOP_PX -> {
-                    sendButton(button = 1, pressed = true)
-                    sendButton(button = 1, pressed = false)
-                    gesture.lastUpAt = now
-                }
-            }
-            releaseCtrlIfHeld()
-            gesture.leftHeld = false
-            gesture.rightHeld = false
-            gesture.twoFingerActive = false
-            "pointer-up"
-        }
-        MotionEvent.ACTION_CANCEL -> {
-            if (gesture.leftHeld) sendButton(button = 1, pressed = false)
-            if (gesture.rightHeld) sendButton(button = 2, pressed = false)
-            releaseCtrlIfHeld()
-            gesture.leftHeld = false
-            gesture.rightHeld = false
-            gesture.twoFingerActive = false
-            "cancelled"
-        }
-        else -> null
-    }
+    val penTool = event.getToolType(penIdx)
+    return handleStylus(
+        activity = activity,
+        event = event,
+        canvas = canvas,
+        idx = penIdx,
+        eraser = penTool == MotionEvent.TOOL_TYPE_ERASER,
+    )
 }
 
 /**
- * Two-finger ACTION_MOVE branch. Resolves the gesture into either
- * a scroll (emit `MouseWheel` from the centroid delta) or a pinch
- * (emit `Ctrl+MouseWheel` from the inter-finger distance delta).
- * The decision is locked the first time either accumulator crosses
- * [MODE_LOCK_PX] so the mid-gesture intent is stable.
+ * Touchpad path. Forwards every finger pointer in [event] straight
+ * to the host's uinput *touchpad* (clickpad) device as raw MT-B
+ * `TouchpadSlot` packets. libinput on the host then drives every
+ * gesture (tap-to-click, two-finger scroll, pinch zoom, palm
+ * rejection) via the compositor's input config — there is no
+ * per-finger gesture synthesis on the companion side.
+ *
+ * The companion still owns the pen-latch palm rejection because
+ * the stylus is a separate uinput device (libinput can't correlate
+ * a stylus on one node with a finger on another) — every finger
+ * touch is dropped while the pen is in proximity OR within the
+ * post-lift window.
  */
-private fun handleTwoFingerMove(event: MotionEvent): String {
-    if (event.pointerCount < 2) return "wheel"
-    val p0x = event.getX(0); val p0y = event.getY(0)
-    val p1x = event.getX(1); val p1y = event.getY(1)
-    val cx = (p0x + p1x) / 2; val cy = (p0y + p1y) / 2
-    val distance = kotlin.math.hypot((p0x - p1x).toDouble(), (p0y - p1y).toDouble()).toFloat()
-
-    val centerDx = cx - gesture.twoFingerLastX
-    val centerDy = cy - gesture.twoFingerLastY
-    val distanceDelta = distance - gesture.pinchLastDistance
-
-    // Update mode-classification accumulators while still undecided.
-    if (gesture.twoFingerMode == TWO_FINGER_MODE_UNDECIDED) {
-        gesture.scrollAccum += kotlin.math.abs(centerDy)
-        gesture.pinchAccum += kotlin.math.abs(distanceDelta)
-        val travelled = kotlin.math.hypot(
-            (cx - gesture.twoFingerStartX).toDouble(),
-            (cy - gesture.twoFingerStartY).toDouble(),
-        )
-        if (travelled > TAP_SLOP_PX || gesture.pinchAccum > TAP_SLOP_PX) {
-            gesture.twoFingerMoved = true
+private fun handleTouchpadEvent(
+    activity: TouchpadActivity?,
+    event: MotionEvent,
+    canvas: IntSize,
+) {
+    if (canvas.width <= 0 || canvas.height <= 0) return
+    if (activity != null && isPenLatchActive(activity)) return
+    when (event.actionMasked) {
+        MotionEvent.ACTION_DOWN, MotionEvent.ACTION_POINTER_DOWN -> {
+            emitTouchpadSlot(event, event.actionIndex, canvas, lifted = false)
         }
-        if (gesture.scrollAccum >= MODE_LOCK_PX || gesture.pinchAccum >= MODE_LOCK_PX) {
-            gesture.twoFingerMode = if (gesture.pinchAccum > gesture.scrollAccum) {
-                TWO_FINGER_MODE_PINCH
-            } else {
-                TWO_FINGER_MODE_SCROLL
-            }
-            if (gesture.twoFingerMode == TWO_FINGER_MODE_PINCH && !gesture.ctrlHeld) {
-                sendKey(EVDEV_LEFTCTRL, true)
-                gesture.ctrlHeld = true
+        MotionEvent.ACTION_MOVE -> {
+            for (i in 0 until event.pointerCount) {
+                emitTouchpadSlot(event, i, canvas, lifted = false)
             }
         }
-    }
-
-    when (gesture.twoFingerMode) {
-        TWO_FINGER_MODE_SCROLL, TWO_FINGER_MODE_UNDECIDED -> {
-            // Pure scroll path — same smooth hi-res wheel emission
-            // as the previous single-mode implementation.
-            gesture.wheelRemainderX += centerDx * WHEEL_HI_RES_PER_PIXEL
-            // Y-up == wheel-up == positive `REL_WHEEL`.
-            gesture.wheelRemainderY += -centerDy * WHEEL_HI_RES_PER_PIXEL
-            val wheelX = gesture.wheelRemainderX.toInt()
-            val wheelY = gesture.wheelRemainderY.toInt()
-            if (wheelX != 0 || wheelY != 0) {
-                gesture.wheelRemainderX -= wheelX.toFloat()
-                gesture.wheelRemainderY -= wheelY.toFloat()
-                NativeBridge.nativeSendInputMessage(
-                    WireInputMessage.MouseWheel(dx = wheelX, dy = wheelY).encode()
-                )
+        MotionEvent.ACTION_UP, MotionEvent.ACTION_POINTER_UP -> {
+            emitTouchpadSlot(event, event.actionIndex, canvas, lifted = true)
+        }
+        MotionEvent.ACTION_CANCEL -> {
+            for (i in 0 until event.pointerCount) {
+                emitTouchpadSlot(event, i, canvas, lifted = true)
             }
         }
-        TWO_FINGER_MODE_PINCH -> {
-            // Pinch path — Ctrl is already held; positive distance
-            // delta (spread) maps to wheel-up (zoom in).
-            gesture.pinchRemainder += distanceDelta * PINCH_HI_RES_PER_PIXEL
-            val zoom = gesture.pinchRemainder.toInt()
-            if (zoom != 0) {
-                gesture.pinchRemainder -= zoom.toFloat()
-                NativeBridge.nativeSendInputMessage(
-                    WireInputMessage.MouseWheel(dx = 0, dy = zoom).encode()
-                )
-            }
-        }
-    }
-
-    gesture.twoFingerLastX = cx
-    gesture.twoFingerLastY = cy
-    gesture.pinchLastDistance = distance
-    return when (gesture.twoFingerMode) {
-        TWO_FINGER_MODE_PINCH -> "pinch"
-        TWO_FINGER_MODE_SCROLL -> "wheel"
-        else -> "two-finger"
     }
 }
 
-private fun releaseCtrlIfHeld() {
-    if (gesture.ctrlHeld) {
-        sendKey(EVDEV_LEFTCTRL, false)
-        gesture.ctrlHeld = false
-    }
+private fun emitTouchpadSlot(event: MotionEvent, idx: Int, canvas: IntSize, lifted: Boolean) {
+    val pointerId = event.getPointerId(idx)
+    val slot = (pointerId and 0xFF).toByte()
+    val trackingId = if (lifted) -1 else pointerId
+    val absX = (event.getX(idx).coerceIn(0f, canvas.width.toFloat()) *
+        TOUCH_ABS_MAX / canvas.width).toInt().coerceIn(0, TOUCH_ABS_MAX)
+    val absY = (event.getY(idx).coerceIn(0f, canvas.height.toFloat()) *
+        TOUCH_ABS_MAX / canvas.height).toInt().coerceIn(0, TOUCH_ABS_MAX)
+    val pressure = (event.getPressure(idx).coerceIn(0f, 1f) * 255).toInt()
+        .coerceIn(0, 255)
+    NativeBridge.nativeSendInputMessage(
+        WireInputMessage.TouchpadSlot(
+            slot = slot,
+            x = absX,
+            y = absY,
+            pressure = pressure,
+            trackingId = trackingId,
+        ).encode()
+    )
 }
+
 
 // ── Raw touch (MT-B passthrough) ─────────────────────────────────────
 
@@ -851,12 +631,6 @@ private fun computeTilt(event: MotionEvent, idx: Int = 0): Pair<Short, Short> {
     val tiltY = (degs * kotlin.math.sin(orient.toDouble())).toInt()
         .coerceIn(-90, 90).toShort()
     return tiltX to tiltY
-}
-
-private fun sendButton(button: Int, pressed: Boolean) {
-    NativeBridge.nativeSendInputMessage(
-        WireInputMessage.MouseButton(button = button.toByte(), pressed = pressed).encode()
-    )
 }
 
 internal fun sendKey(evdev: Int, pressed: Boolean) {

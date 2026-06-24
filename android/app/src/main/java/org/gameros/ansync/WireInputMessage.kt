@@ -42,6 +42,20 @@ sealed class WireInputMessage {
     ) : WireInputMessage()
     /** UTF-8 text to inject at the focused text field. */
     data class Text(val text: String) : WireInputMessage()
+    /**
+     * Multi-touch slot on the host's *touchpad* clickpad device.
+     * Same wire layout as [TouchSlot]; routed to a different uinput
+     * node so libinput drives all gesture detection (tap-to-click,
+     * two-finger scroll, pinch zoom) instead of the companion-side
+     * `Gesture` state machine.
+     */
+    data class TouchpadSlot(
+        val slot: Byte,
+        val x: Int,
+        val y: Int,
+        val pressure: Int,
+        val trackingId: Int,
+    ) : WireInputMessage()
 
     fun encode(): ByteArray {
         val buf = mutableListOf<Byte>()
@@ -97,6 +111,14 @@ sealed class WireInputMessage {
                 u32(payload.size)
                 payload.forEach { buf.add(it) }
             }
+            is TouchpadSlot -> {
+                u8(8)
+                u8(slot.toInt() and 0xFF)
+                i32(x)
+                i32(y)
+                u16(pressure)
+                i32(trackingId)
+            }
         }
         return buf.toByteArray()
     }
@@ -140,6 +162,13 @@ sealed class WireInputMessage {
                     buf.get(arr)
                     Text(String(arr, Charsets.UTF_8))
                 }
+                8 -> TouchpadSlot(
+                    slot = buf.get(),
+                    x = buf.int,
+                    y = buf.int,
+                    pressure = buf.short.toInt() and 0xFFFF,
+                    trackingId = buf.int,
+                )
                 else -> throw IllegalArgumentException("unknown WireInputMessage tag $tag")
             }
         }

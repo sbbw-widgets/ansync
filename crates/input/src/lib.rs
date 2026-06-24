@@ -20,6 +20,7 @@ pub enum InputKind {
     Keyboard,
     Mouse,
     Touchscreen,
+    Touchpad,
     Stylus,
     Gamepad,
 }
@@ -31,6 +32,9 @@ pub enum InputEvent {
     MouseButton { button: u8, pressed: bool },
     MouseWheel { dx: i32, dy: i32 },
     TouchSlot { slot: u8, x: i32, y: i32, pressure: u16, tracking_id: i32 },
+    /// Multi-touch slot routed to the host's *touchpad* device
+    /// instead of the touchscreen. Same field layout as `TouchSlot`.
+    TouchpadSlot { slot: u8, x: i32, y: i32, pressure: u16, tracking_id: i32 },
     Stylus { x: i32, y: i32, pressure: u16, tilt_x: i16, tilt_y: i16, btn: u8 },
     Gamepad { buttons: u32, lx: i16, ly: i16, rx: i16, ry: i16, lt: u8, rt: u8 },
     Sync,

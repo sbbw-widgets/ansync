@@ -1063,6 +1063,10 @@ async fn input_recv_loop(mut stream: QuicStream, tx: UnboundedSender<Vec<u8>>) {
 ///   4  TouchSlot    : tag(1) u8 slot | i32 x | i32 y | u16 pressure | i32 tracking_id
 ///   5  Stylus       : tag(1) i32 x | i32 y | u16 pressure | i16 tilt_x | i16 tilt_y | u8 btn
 ///   6  Gamepad      : tag(1) u32 buttons | i16 lx | i16 ly | i16 rx | i16 ry | u8 lt | u8 rt
+///   7  Text         : tag(1) u32 len | bytes(len)  (UTF-8)
+///   8  TouchpadSlot : same wire layout as TouchSlot — routes to the
+///                    host's Mac-style clickpad uinput device instead
+///                    of the absolute touchscreen one
 fn encode_for_kotlin(msg: &InputMessage) -> Vec<u8> {
     let mut out = Vec::with_capacity(24);
     match msg {
@@ -1118,6 +1122,14 @@ fn encode_for_kotlin(msg: &InputMessage) -> Vec<u8> {
             let bytes = s.as_bytes();
             out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
             out.extend_from_slice(bytes);
+        }
+        InputMessage::TouchpadSlot { slot, x, y, pressure, tracking_id } => {
+            out.push(8);
+            out.push(*slot);
+            out.extend_from_slice(&x.to_le_bytes());
+            out.extend_from_slice(&y.to_le_bytes());
+            out.extend_from_slice(&pressure.to_le_bytes());
+            out.extend_from_slice(&tracking_id.to_le_bytes());
         }
     }
     out
@@ -1315,6 +1327,14 @@ fn decode_input_from_kotlin(bytes: &[u8]) -> Result<InputMessage, String> {
                 .map_err(|e| format!("Text: invalid utf8: {e}"))?
                 .to_string();
             Ok(InputMessage::Text(s))
+        }
+        8 => {
+            let slot = c.take(1)?[0];
+            let x = c.take_i32()?;
+            let y = c.take_i32()?;
+            let pressure = c.take_u16()?;
+            let tracking_id = c.take_i32()?;
+            Ok(InputMessage::TouchpadSlot { slot, x, y, pressure, tracking_id })
         }
         other => Err(format!("unknown InputMessage tag {other}")),
     }

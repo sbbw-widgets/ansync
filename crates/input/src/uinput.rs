@@ -34,6 +34,7 @@ const PRODUCT_MOUSE: u16 = 0xA001;
 const PRODUCT_TOUCHSCREEN: u16 = 0xA002;
 const PRODUCT_STYLUS: u16 = 0xA003;
 const PRODUCT_GAMEPAD: u16 = 0xA004;
+const PRODUCT_TOUCHPAD: u16 = 0xA005;
 const VERSION: u16 = 0x0001;
 
 /// Maximum coordinate emitted for any absolute axis whose range we
@@ -455,6 +456,156 @@ impl VirtualInputDevice for Touchscreen {
                     // tracking_id = -1 → lift. Emit BTN_TOUCH up if
                     // this was the last active slot. Higher layers
                     // track that — single-finger heuristic for now.
+                    events.push(raw(EventKind::Key, Key::ButtonTouch as u16, 0));
+                }
+                events.push(syn_report());
+                write_events(h, &events)
+            }
+            InputEvent::Sync => write_events(h, &[syn_report()]),
+            _ => Ok(()),
+        }
+    }
+
+    async fn destroy(&mut self) -> Result<(), InputError> {
+        if let Some(h) = self.handle.take() {
+            h.dev_destroy()?;
+        }
+        Ok(())
+    }
+}
+
+// ── Touchpad (Mac-style clickpad) ────────────────────────────────
+//
+// Same multi-touch type B protocol as `Touchscreen`, but the axis
+// properties + KEY caps are tuned so libinput classifies the device
+// as a *clickpad* (`INPUT_PROP_POINTER + INPUT_PROP_BUTTONPAD`).
+// That unlocks the full libinput touchpad UX surface from the
+// compositor's input config: tap-to-click, two-finger scroll,
+// pinch-to-zoom, palm rejection, drag-lock, natural scrolling, etc.
+//
+// All gesture detection runs on the host (libinput → compositor) so
+// the companion only has to forward raw multi-touch slots — the
+// Kotlin `Gesture` state machine collapses to "every pointer in the
+// MotionEvent becomes a `TouchpadSlot` packet" and Linux apps treat
+// the Android tablet like a Magic Trackpad.
+
+pub struct Touchpad {
+    handle: Option<UInputHandle<File>>,
+    active_slot: i32,
+}
+
+impl Touchpad {
+    pub fn new() -> Self {
+        Self {
+            handle: None,
+            active_slot: -1,
+        }
+    }
+}
+
+impl Default for Touchpad {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl VirtualInputDevice for Touchpad {
+    fn kind(&self) -> InputKind {
+        InputKind::Touchpad
+    }
+
+    async fn create(&mut self, name: &str) -> Result<(), InputError> {
+        let handle = open_uinput()?;
+        handle.set_evbit(EventKind::Key)?;
+        handle.set_evbit(EventKind::Absolute)?;
+        handle.set_evbit(EventKind::Synchronize)?;
+        // Clickpad buttons (no physical L/R/M — `INPUT_PROP_BUTTONPAD`
+        // tells libinput that the surface itself is the button). Plus
+        // the BTN_TOOL_<N>TAP family so libinput's tap-detection knows
+        // how many fingers are down — tap-button-map maps 1/2/3 → L/R/M.
+        for button in [
+            Key::ButtonLeft,
+            Key::ButtonRight,
+            Key::ButtonMiddle,
+            Key::ButtonTouch,
+            Key::ButtonToolFinger,
+            Key::ButtonToolDoubleTap,
+            Key::ButtonToolTripleTap,
+            Key::ButtonToolQuadtap,
+            Key::ButtonToolQuintTap,
+        ] {
+            handle.set_keybit(button)?;
+        }
+        // Indirect pointer + clickpad. libinput rejects touchpads
+        // without these props (falls back to "generic touchscreen").
+        handle.set_propbit(InputProperty::Pointer)?;
+        handle.set_propbit(InputProperty::ButtonPad)?;
+        let abs_setup = [
+            abs_res(AbsoluteAxis::X, 0, ABS_MAX, 100),
+            abs_res(AbsoluteAxis::Y, 0, ABS_MAX, 100),
+            abs(AbsoluteAxis::Pressure, 0, 255),
+            abs(AbsoluteAxis::MultitouchSlot, 0, MT_SLOTS - 1),
+            abs(AbsoluteAxis::MultitouchTrackingId, 0, 0xFFFF),
+            abs_res(AbsoluteAxis::MultitouchPositionX, 0, ABS_MAX, 100),
+            abs_res(AbsoluteAxis::MultitouchPositionY, 0, ABS_MAX, 100),
+            abs(AbsoluteAxis::MultitouchPressure, 0, 255),
+        ];
+        let full_name = format!("{name} Touchpad");
+        handle.create(
+            &make_id_bus(PRODUCT_TOUCHPAD, BUS_USB),
+            full_name.as_bytes(),
+            0,
+            &abs_setup,
+        )?;
+        debug!(name = %full_name, "uinput touchpad created");
+        self.handle = Some(handle);
+        Ok(())
+    }
+
+    async fn send(&mut self, event: InputEvent) -> Result<(), InputError> {
+        let h = self.handle.as_ref().ok_or(InputError::BackendUnavailable)?;
+        match event {
+            InputEvent::TouchpadSlot {
+                slot,
+                x,
+                y,
+                pressure,
+                tracking_id,
+            } => {
+                let slot_i = slot as i32;
+                let mut events = Vec::with_capacity(7);
+                if self.active_slot != slot_i {
+                    events.push(raw(
+                        EventKind::Absolute,
+                        AbsoluteAxis::MultitouchSlot as u16,
+                        slot_i,
+                    ));
+                    self.active_slot = slot_i;
+                }
+                events.push(raw(
+                    EventKind::Absolute,
+                    AbsoluteAxis::MultitouchTrackingId as u16,
+                    tracking_id,
+                ));
+                if tracking_id >= 0 {
+                    events.push(raw(
+                        EventKind::Absolute,
+                        AbsoluteAxis::MultitouchPositionX as u16,
+                        x,
+                    ));
+                    events.push(raw(
+                        EventKind::Absolute,
+                        AbsoluteAxis::MultitouchPositionY as u16,
+                        y,
+                    ));
+                    events.push(raw(
+                        EventKind::Absolute,
+                        AbsoluteAxis::MultitouchPressure as u16,
+                        pressure as i32,
+                    ));
+                    events.push(raw(EventKind::Key, Key::ButtonTouch as u16, 1));
+                } else {
                     events.push(raw(EventKind::Key, Key::ButtonTouch as u16, 0));
                 }
                 events.push(syn_report());
