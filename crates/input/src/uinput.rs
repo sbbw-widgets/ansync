@@ -546,14 +546,20 @@ impl VirtualInputDevice for Touchpad {
         handle.set_propbit(InputProperty::Pointer)?;
         handle.set_propbit(InputProperty::ButtonPad)?;
         // Resolution = 500 units/mm gives a reported device size of
-        // ~65 mm × 65 mm (close to a small MacBook trackpad). The
-        // previous 100 units/mm advertised a 328 mm "touchpad", which
-        // makes every per-frame finger delta look like a 20-30 mm
-        // jump in libinput's world — `kernel bug: Touch jump detected
-        // and discarded` fires and libinput drops the events. Higher
-        // resolution shrinks the mm-per-ABS-unit ratio so realistic
-        // finger speeds stay below libinput's jump heuristic
-        // (currently ~20 mm/event).
+        // ~65 mm × 65 mm (close to a small MacBook trackpad). Higher
+        // values make per-event deltas tiny in libinput's mm-world,
+        // staying under the jump heuristic threshold even on fast
+        // swipes.
+        //
+        // We also advertise the full MT contact-shape axis set
+        // (`MT_TOUCH_MAJOR/MINOR`, `MT_ORIENTATION`, `MT_TOOL_TYPE`).
+        // Without these, libinput's palm / thumb / "phantom finger"
+        // detection runs with defaults that are pessimistic for our
+        // virtual device — it can't tell that contact is a normal
+        // finger and discards events as suspected firmware bugs
+        // ("Touch jump detected and discarded"). Emitting them per
+        // touch identifies us as a finger of ~8 mm major axis,
+        // matching what a real touchpad reports.
         let abs_setup = [
             abs_res(AbsoluteAxis::X, 0, ABS_MAX, 500),
             abs_res(AbsoluteAxis::Y, 0, ABS_MAX, 500),
@@ -563,6 +569,17 @@ impl VirtualInputDevice for Touchpad {
             abs_res(AbsoluteAxis::MultitouchPositionX, 0, ABS_MAX, 500),
             abs_res(AbsoluteAxis::MultitouchPositionY, 0, ABS_MAX, 500),
             abs(AbsoluteAxis::MultitouchPressure, 0, 255),
+            // Contact ellipse axes — values are in the same units as
+            // position (1/500 mm). A finger major-axis of ~8 mm =
+            // 4000 units. We send 4000 on every contact so libinput's
+            // palm / size heuristics see a believable finger.
+            abs_res(AbsoluteAxis::MultitouchTouchMajor, 0, ABS_MAX, 500),
+            abs_res(AbsoluteAxis::MultitouchTouchMinor, 0, ABS_MAX, 500),
+            abs(AbsoluteAxis::MultitouchOrientation, -127, 127),
+            // 0 = MT_TOOL_FINGER, 1 = MT_TOOL_PEN, 2 = MT_TOOL_PALM.
+            // We always emit 0 — even when the user touches with a
+            // stylus, that goes through the dedicated Stylus device.
+            abs(AbsoluteAxis::MultitouchToolType, 0, 2),
         ];
         let full_name = format!("{name} Touchpad");
         handle.create(
@@ -616,6 +633,31 @@ impl VirtualInputDevice for Touchpad {
                         EventKind::Absolute,
                         AbsoluteAxis::MultitouchPressure as u16,
                         pressure as i32,
+                    ));
+                    // Tag every contact as a normal finger of ~8 mm
+                    // (4000 units at 500/mm). libinput uses these for
+                    // palm vs finger classification; without them the
+                    // touchpad pipeline assumes worst-case and starts
+                    // discarding events.
+                    events.push(raw(
+                        EventKind::Absolute,
+                        AbsoluteAxis::MultitouchToolType as u16,
+                        0, // MT_TOOL_FINGER
+                    ));
+                    events.push(raw(
+                        EventKind::Absolute,
+                        AbsoluteAxis::MultitouchTouchMajor as u16,
+                        4000,
+                    ));
+                    events.push(raw(
+                        EventKind::Absolute,
+                        AbsoluteAxis::MultitouchTouchMinor as u16,
+                        4000,
+                    ));
+                    events.push(raw(
+                        EventKind::Absolute,
+                        AbsoluteAxis::MultitouchOrientation as u16,
+                        0,
                     ));
                     events.push(raw(EventKind::Key, Key::ButtonTouch as u16, 1));
                 } else {
