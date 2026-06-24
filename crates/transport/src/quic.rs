@@ -327,6 +327,17 @@ impl QuicConnection {
     pub async fn closed(&self) {
         self.inner.closed().await;
     }
+
+    /// Snapshot of the underlying quinn connection stats. Exposed for
+    /// telemetry — `debug!`-level periodic logging in daemon-core +
+    /// companion to diagnose packet loss / RTT regressions.
+    pub fn stats(&self) -> quinn::ConnectionStats {
+        self.inner.stats()
+    }
+
+    pub fn rtt(&self) -> std::time::Duration {
+        self.inner.rtt()
+    }
 }
 
 #[async_trait]

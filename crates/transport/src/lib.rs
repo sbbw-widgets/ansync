@@ -19,6 +19,9 @@ pub mod quic;
 #[cfg(feature = "quic")]
 pub use quic::{QuicConnection, QuicServer, QuicStream, QuicTransport};
 
+#[cfg(feature = "quic")]
+pub use quinn::ConnectionStats;
+
 #[derive(Debug, thiserror::Error)]
 pub enum TransportError {
     #[error("connection closed")]

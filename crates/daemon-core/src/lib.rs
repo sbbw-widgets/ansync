@@ -1005,6 +1005,11 @@ async fn handle_connection(
         }
     }
 
+    let stats_handle = tokio::spawn(stats_telemetry_loop(
+        conn_arc.clone(),
+        peer_id.clone(),
+    ));
+
     loop {
         let (kind, stream) = match conn_arc.accept().await {
             Ok(v) => v,
@@ -1158,6 +1163,7 @@ async fn handle_connection(
         .inbound_tx
         .lock()
         .expect("audio inbound tx poisoned") = None;
+    stats_handle.abort();
     if conn_still_current {
         if let Err(e) = Device::emit_state_changed(
             &dbus_conn,
@@ -1176,6 +1182,45 @@ async fn handle_connection(
         );
     }
     Ok(())
+}
+
+/// Periodic per-peer QUIC stats. Runs alongside `handle_connection`,
+/// aborted by the join handle when the parent loop exits. Output is
+/// `debug!` so default journald stays quiet; flip on with
+/// `RUST_LOG=ansync_daemon_core=debug` to diagnose packet-loss /
+/// rtt regressions reported as "cursor feels heavy" or "Conn cycle".
+async fn stats_telemetry_loop(conn: Arc<QuicConnection>, peer_id: DeviceId) {
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
+    // Skip the very first tick (fires immediately) — first useful
+    // sample needs at least one keep-alive RTT.
+    tick.tick().await;
+    let mut prev_sent: u64 = 0;
+    let mut prev_lost: u64 = 0;
+    loop {
+        tick.tick().await;
+        let s = conn.stats();
+        let sent = s.path.sent_packets;
+        let lost = s.path.lost_packets;
+        let dsent = sent.saturating_sub(prev_sent);
+        let dlost = lost.saturating_sub(prev_lost);
+        prev_sent = sent;
+        prev_lost = lost;
+        let loss_pct = if dsent == 0 {
+            0.0
+        } else {
+            (dlost as f64 / dsent as f64) * 100.0
+        };
+        debug!(
+            %peer_id,
+            rtt_ms = conn.rtt().as_millis() as u64,
+            sent = dsent,
+            lost = dlost,
+            loss_pct = format!("{loss_pct:.2}"),
+            cwnd = s.path.cwnd,
+            black_holes = s.path.black_holes_detected,
+            "quic stats"
+        );
+    }
 }
 
 async fn camera_stream_loop(

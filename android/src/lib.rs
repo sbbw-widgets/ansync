@@ -48,7 +48,7 @@ use bytes::Bytes;
 use jni::JNIEnv;
 use jni::objects::{JByteArray, JClass, JString};
 use jni::sys::{jboolean, jint, jlong};
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::sync::Mutex as AsyncMutex;
@@ -568,6 +568,10 @@ pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativeOpenConnection
         progress_tx.clone(),
     ));
 
+    // Periodic QUIC stats. Auto-exits when streams_accept_loop drops
+    // the conn (last Arc gone → Weak::upgrade returns None).
+    runtime().spawn(stats_telemetry_loop(Arc::downgrade(&conn_arc)));
+
     let session = ActiveSession {
         conn: conn_arc,
         video_stream: Arc::new(AsyncMutex::new(video_stream)),
@@ -607,6 +611,45 @@ pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativeIsConnected<'l
         jni::sys::JNI_TRUE
     } else {
         jni::sys::JNI_FALSE
+    }
+}
+
+/// Periodic per-session QUIC stats. Mirror of the daemon-side loop in
+/// `ansync-daemon-core::stats_telemetry_loop`. Exits when the last
+/// strong `Arc<QuicConnection>` is dropped (session torn down).
+/// Tagged at log-level `Debug` — gate with
+/// `RUST_LOG=ansync_companion_native=debug` to surface in logcat.
+async fn stats_telemetry_loop(conn: std::sync::Weak<QuicConnection>) {
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
+    tick.tick().await;
+    let mut prev_sent: u64 = 0;
+    let mut prev_lost: u64 = 0;
+    loop {
+        tick.tick().await;
+        let Some(conn) = conn.upgrade() else {
+            return;
+        };
+        let s = conn.stats();
+        let sent = s.path.sent_packets;
+        let lost = s.path.lost_packets;
+        let dsent = sent.saturating_sub(prev_sent);
+        let dlost = lost.saturating_sub(prev_lost);
+        prev_sent = sent;
+        prev_lost = lost;
+        let loss_pct = if dsent == 0 {
+            0.0
+        } else {
+            (dlost as f64 / dsent as f64) * 100.0
+        };
+        debug!(
+            "quic stats: rtt={}ms sent={} lost={} loss={:.2}% cwnd={} black_holes={}",
+            conn.rtt().as_millis() as u64,
+            dsent,
+            dlost,
+            loss_pct,
+            s.path.cwnd,
+            s.path.black_holes_detected,
+        );
     }
 }
 
