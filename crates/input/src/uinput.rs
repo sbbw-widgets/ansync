@@ -12,6 +12,7 @@
 //! latency cost of the syscall itself. The trait surface stays
 //! `async` because the rest of the daemon is `async`.
 
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 
 use async_trait::async_trait;
@@ -492,6 +493,12 @@ impl VirtualInputDevice for Touchscreen {
 pub struct Touchpad {
     handle: Option<UInputHandle<File>>,
     active_slot: i32,
+    // Last POSITION emitted for each currently-held slot. Used to
+    // clamp intra-touch deltas so a noisy / batched sample inside a
+    // single gesture can't trip libinput's >7mm jump filter (which
+    // would discard the frame and lose motion). Touchdowns go
+    // through RAW: see `send()` for why.
+    last_pos: HashMap<i32, (i32, i32)>,
 }
 
 impl Touchpad {
@@ -499,9 +506,29 @@ impl Touchpad {
         Self {
             handle: None,
             active_slot: -1,
+            last_pos: HashMap::new(),
         }
     }
 }
+
+// Touchpad axis resolution (units per millimetre). 200 units/mm with
+// `ABS_MAX = 32_767` makes the device report ~163mm × 163mm — close
+// to a Magic Trackpad. A larger reported size means a given gesture
+// covers more mm/s in libinput's world model, so cursor velocity
+// before any accel ramp is higher (the host doesn't have to crank
+// `accel-speed` to get a snappy pointer). The previous 500 units/mm
+// reported a tiny ~65mm pad, which capped peak cursor velocity.
+const TOUCHPAD_RES: i32 = 200;
+
+// Cap any single-event delta to this many millimetres. libinput's
+// jump filter discards events whose POSITION jumps further than ~7mm
+// between SYN_REPORTs (a firmware-bug guard). We clamp at 5mm so we
+// stay safely below that threshold even at the limits of the
+// per-axis quantisation. Bigger user moves get spread across
+// multiple SYN_REPORTs — the cursor "catches up" within a frame or
+// two and the user sees continuous motion instead of a discarded
+// jump.
+const TOUCHPAD_MAX_DELTA_MM: i32 = 5;
 
 impl Default for Touchpad {
     fn default() -> Self {
@@ -545,36 +572,32 @@ impl VirtualInputDevice for Touchpad {
         // without these props (falls back to "generic touchscreen").
         handle.set_propbit(InputProperty::Pointer)?;
         handle.set_propbit(InputProperty::ButtonPad)?;
-        // Resolution = 500 units/mm gives a reported device size of
-        // ~65 mm × 65 mm (close to a small MacBook trackpad). Higher
-        // values make per-event deltas tiny in libinput's mm-world,
-        // staying under the jump heuristic threshold even on fast
-        // swipes.
+        // Axis resolution is `TOUCHPAD_RES` units/mm. With `ABS_MAX =
+        // 32_767` that yields a reported device size of ~163mm,
+        // close to a Magic Trackpad. Bigger reported size = more mm/s
+        // perceived by libinput for the same user gesture = faster
+        // cursor before any compositor accel curve.
         //
         // We also advertise the full MT contact-shape axis set
         // (`MT_TOUCH_MAJOR/MINOR`, `MT_ORIENTATION`, `MT_TOOL_TYPE`).
         // Without these, libinput's palm / thumb / "phantom finger"
         // detection runs with defaults that are pessimistic for our
         // virtual device — it can't tell that contact is a normal
-        // finger and discards events as suspected firmware bugs
-        // ("Touch jump detected and discarded"). Emitting them per
-        // touch identifies us as a finger of ~8 mm major axis,
-        // matching what a real touchpad reports.
+        // finger and discards events as suspected firmware bugs.
+        // Emitting them per touch identifies us as a finger of ~8mm
+        // major axis, matching what a real touchpad reports.
+        let major = 8 * TOUCHPAD_RES; // 8mm contact ellipse
         let abs_setup = [
-            abs_res(AbsoluteAxis::X, 0, ABS_MAX, 500),
-            abs_res(AbsoluteAxis::Y, 0, ABS_MAX, 500),
+            abs_res(AbsoluteAxis::X, 0, ABS_MAX, TOUCHPAD_RES),
+            abs_res(AbsoluteAxis::Y, 0, ABS_MAX, TOUCHPAD_RES),
             abs(AbsoluteAxis::Pressure, 0, 255),
             abs(AbsoluteAxis::MultitouchSlot, 0, MT_SLOTS - 1),
             abs(AbsoluteAxis::MultitouchTrackingId, 0, 0xFFFF),
-            abs_res(AbsoluteAxis::MultitouchPositionX, 0, ABS_MAX, 500),
-            abs_res(AbsoluteAxis::MultitouchPositionY, 0, ABS_MAX, 500),
+            abs_res(AbsoluteAxis::MultitouchPositionX, 0, ABS_MAX, TOUCHPAD_RES),
+            abs_res(AbsoluteAxis::MultitouchPositionY, 0, ABS_MAX, TOUCHPAD_RES),
             abs(AbsoluteAxis::MultitouchPressure, 0, 255),
-            // Contact ellipse axes — values are in the same units as
-            // position (1/500 mm). A finger major-axis of ~8 mm =
-            // 4000 units. We send 4000 on every contact so libinput's
-            // palm / size heuristics see a believable finger.
-            abs_res(AbsoluteAxis::MultitouchTouchMajor, 0, ABS_MAX, 500),
-            abs_res(AbsoluteAxis::MultitouchTouchMinor, 0, ABS_MAX, 500),
+            abs_res(AbsoluteAxis::MultitouchTouchMajor, 0, major, TOUCHPAD_RES),
+            abs_res(AbsoluteAxis::MultitouchTouchMinor, 0, major, TOUCHPAD_RES),
             abs(AbsoluteAxis::MultitouchOrientation, -127, 127),
             // 0 = MT_TOOL_FINGER, 1 = MT_TOOL_PEN, 2 = MT_TOOL_PALM.
             // We always emit 0 — even when the user touches with a
@@ -619,40 +642,64 @@ impl VirtualInputDevice for Touchpad {
                     tracking_id,
                 ));
                 if tracking_id >= 0 {
+                    // The first POSITION of a fresh touch (no entry
+                    // in `last_pos` for this slot) goes through RAW.
+                    // libinput pairs that POSITION with the new
+                    // `MT_TRACKING_ID` and treats it as the contact's
+                    // anchor — no POINTER_MOTION is synthesised.
+                    // Clamping the touchdown against the previous
+                    // touch's last position would instead make
+                    // libinput drag the cursor from there to the new
+                    // finger location across multiple SYN_REPORTs,
+                    // which feels like the pointer "jumping" toward
+                    // wherever you next tapped.
+                    //
+                    // Once the slot is established we DO clamp every
+                    // subsequent POSITION against the previous one,
+                    // so a noisy / batched sample inside a single
+                    // touch can't trip libinput's >7mm jump filter
+                    // and lose frames mid-gesture.
+                    let (cx, cy) = match self.last_pos.get(&slot_i).copied() {
+                        Some(prev) => {
+                            let max_delta = TOUCHPAD_RES * TOUCHPAD_MAX_DELTA_MM;
+                            (
+                                prev.0 + (x - prev.0).clamp(-max_delta, max_delta),
+                                prev.1 + (y - prev.1).clamp(-max_delta, max_delta),
+                            )
+                        }
+                        None => (x, y),
+                    };
+                    self.last_pos.insert(slot_i, (cx, cy));
                     events.push(raw(
                         EventKind::Absolute,
                         AbsoluteAxis::MultitouchPositionX as u16,
-                        x,
+                        cx,
                     ));
                     events.push(raw(
                         EventKind::Absolute,
                         AbsoluteAxis::MultitouchPositionY as u16,
-                        y,
+                        cy,
                     ));
                     events.push(raw(
                         EventKind::Absolute,
                         AbsoluteAxis::MultitouchPressure as u16,
                         pressure as i32,
                     ));
-                    // Tag every contact as a normal finger of ~8 mm
-                    // (4000 units at 500/mm). libinput uses these for
-                    // palm vs finger classification; without them the
-                    // touchpad pipeline assumes worst-case and starts
-                    // discarding events.
                     events.push(raw(
                         EventKind::Absolute,
                         AbsoluteAxis::MultitouchToolType as u16,
                         0, // MT_TOOL_FINGER
                     ));
+                    let major = 8 * TOUCHPAD_RES;
                     events.push(raw(
                         EventKind::Absolute,
                         AbsoluteAxis::MultitouchTouchMajor as u16,
-                        4000,
+                        major,
                     ));
                     events.push(raw(
                         EventKind::Absolute,
                         AbsoluteAxis::MultitouchTouchMinor as u16,
-                        4000,
+                        major,
                     ));
                     events.push(raw(
                         EventKind::Absolute,
@@ -661,6 +708,7 @@ impl VirtualInputDevice for Touchpad {
                     ));
                     events.push(raw(EventKind::Key, Key::ButtonTouch as u16, 1));
                 } else {
+                    self.last_pos.remove(&slot_i);
                     events.push(raw(EventKind::Key, Key::ButtonTouch as u16, 0));
                 }
                 events.push(syn_report());
