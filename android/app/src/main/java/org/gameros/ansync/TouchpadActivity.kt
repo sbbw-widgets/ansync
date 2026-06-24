@@ -368,6 +368,19 @@ private fun handleTouchpadEvent(
             emitTouchpadSlot(event, event.actionIndex, canvas, lifted = false)
         }
         MotionEvent.ACTION_MOVE -> {
+            // Android batches sub-frame motion into the MotionEvent's
+            // historical samples (`event.historySize` of them, each
+            // ~8 ms apart). Emit them in order BEFORE the current
+            // sample so libinput's per-event delta stays small —
+            // otherwise a single ACTION_MOVE that covers 3-5 sub-
+            // frames in one shot looks like a 30 mm finger
+            // teleport and gets discarded as a "Touch jump".
+            val historySize = event.historySize
+            for (h in 0 until historySize) {
+                for (i in 0 until event.pointerCount) {
+                    emitTouchpadSlotHistorical(event, i, h, canvas)
+                }
+            }
             for (i in 0 until event.pointerCount) {
                 emitTouchpadSlot(event, i, canvas, lifted = false)
             }
@@ -381,6 +394,32 @@ private fun handleTouchpadEvent(
             }
         }
     }
+}
+
+private fun emitTouchpadSlotHistorical(
+    event: MotionEvent,
+    idx: Int,
+    historyIdx: Int,
+    canvas: IntSize,
+) {
+    val pointerId = event.getPointerId(idx)
+    val slot = (pointerId and 0xFF).toByte()
+    val trackingId = activeTouchpadTracking[pointerId] ?: return
+    val absX = (event.getHistoricalX(idx, historyIdx).coerceIn(0f, canvas.width.toFloat()) *
+        TOUCH_ABS_MAX / canvas.width).toInt().coerceIn(0, TOUCH_ABS_MAX)
+    val absY = (event.getHistoricalY(idx, historyIdx).coerceIn(0f, canvas.height.toFloat()) *
+        TOUCH_ABS_MAX / canvas.height).toInt().coerceIn(0, TOUCH_ABS_MAX)
+    val pressure = (event.getHistoricalPressure(idx, historyIdx).coerceIn(0f, 1f) * 255).toInt()
+        .coerceIn(0, 255)
+    NativeBridge.nativeSendInputMessage(
+        WireInputMessage.TouchpadSlot(
+            slot = slot,
+            x = absX,
+            y = absY,
+            pressure = pressure,
+            trackingId = trackingId,
+        ).encode()
+    )
 }
 
 /// Maps Android's reusable `pointerId` to a monotonic tracking_id so
