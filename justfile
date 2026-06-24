@@ -60,11 +60,17 @@ run: (build) (sign) (install)
 #   alpha     same shape, with -alpha.N
 #   release   1.2.4-rc.2  -> 1.2.4       (strip pre-release)
 #
-# Reads the current version from `[workspace.package].version`, bumps
-# it, refreshes the lockfile, commits the bump, pushes to origin,
+# Bumps `[workspace.package].version` in the root `Cargo.toml`. Only
+# the binaries (`ansyncd`, `ansyncctl`) inherit it via
+# `version.workspace = true`; every `crates/*/Cargo.toml` pins its own
+# `version = "0.1.0"` and stays put so a release bump doesn't churn
+# every library's version, keeping nix store paths (and therefore the
+# crane / cache.sergioribera.rs cache) warm across releases.
+#
+# Refreshes the lockfile workspace-member entries, commits, pushes,
 # tags + pushes the tag. `release.yml` fires on the tag and builds
-# host bundles + the companion APK so `CARGO_PKG_VERSION` (host) and
-# `versionName` (APK) line up.
+# host bundles + the companion APK so `CARGO_PKG_VERSION` (binaries)
+# and `versionName` (APK) line up.
 publish bump:
     #!/usr/bin/env bash
     set -euo pipefail
