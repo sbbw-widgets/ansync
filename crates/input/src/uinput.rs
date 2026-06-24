@@ -12,7 +12,6 @@
 //! latency cost of the syscall itself. The trait surface stays
 //! `async` because the rest of the daemon is `async`.
 
-use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 
 use async_trait::async_trait;
@@ -493,12 +492,6 @@ impl VirtualInputDevice for Touchscreen {
 pub struct Touchpad {
     handle: Option<UInputHandle<File>>,
     active_slot: i32,
-    // Last POSITION emitted for each currently-held slot. Used to
-    // clamp intra-touch deltas so a noisy / batched sample inside a
-    // single gesture can't trip libinput's >7mm jump filter (which
-    // would discard the frame and lose motion). Touchdowns go
-    // through RAW: see `send()` for why.
-    last_pos: HashMap<i32, (i32, i32)>,
 }
 
 impl Touchpad {
@@ -506,7 +499,6 @@ impl Touchpad {
         Self {
             handle: None,
             active_slot: -1,
-            last_pos: HashMap::new(),
         }
     }
 }
@@ -519,16 +511,6 @@ impl Touchpad {
 // `accel-speed` to get a snappy pointer). The previous 500 units/mm
 // reported a tiny ~65mm pad, which capped peak cursor velocity.
 const TOUCHPAD_RES: i32 = 200;
-
-// Cap any single-event delta to this many millimetres. libinput's
-// jump filter discards events whose POSITION jumps further than ~7mm
-// between SYN_REPORTs (a firmware-bug guard). We clamp at 5mm so we
-// stay safely below that threshold even at the limits of the
-// per-axis quantisation. Bigger user moves get spread across
-// multiple SYN_REPORTs — the cursor "catches up" within a frame or
-// two and the user sees continuous motion instead of a discarded
-// jump.
-const TOUCHPAD_MAX_DELTA_MM: i32 = 5;
 
 impl Default for Touchpad {
     fn default() -> Self {
@@ -642,43 +624,23 @@ impl VirtualInputDevice for Touchpad {
                     tracking_id,
                 ));
                 if tracking_id >= 0 {
-                    // The first POSITION of a fresh touch (no entry
-                    // in `last_pos` for this slot) goes through RAW.
-                    // libinput pairs that POSITION with the new
-                    // `MT_TRACKING_ID` and treats it as the contact's
-                    // anchor — no POINTER_MOTION is synthesised.
-                    // Clamping the touchdown against the previous
-                    // touch's last position would instead make
-                    // libinput drag the cursor from there to the new
-                    // finger location across multiple SYN_REPORTs,
-                    // which feels like the pointer "jumping" toward
-                    // wherever you next tapped.
-                    //
-                    // Once the slot is established we DO clamp every
-                    // subsequent POSITION against the previous one,
-                    // so a noisy / batched sample inside a single
-                    // touch can't trip libinput's >7mm jump filter
-                    // and lose frames mid-gesture.
-                    let (cx, cy) = match self.last_pos.get(&slot_i).copied() {
-                        Some(prev) => {
-                            let max_delta = TOUCHPAD_RES * TOUCHPAD_MAX_DELTA_MM;
-                            (
-                                prev.0 + (x - prev.0).clamp(-max_delta, max_delta),
-                                prev.1 + (y - prev.1).clamp(-max_delta, max_delta),
-                            )
-                        }
-                        None => (x, y),
-                    };
-                    self.last_pos.insert(slot_i, (cx, cy));
+                    // Emit POSITION raw — Kotlin already splits each
+                    // MotionEvent into its historical sub-samples
+                    // (~8ms apart) before forwarding, and measured
+                    // packet loss is 0% on LAN, so consecutive samples
+                    // are always close enough to stay under libinput's
+                    // 7mm jump filter. A previous intra-touch clamp
+                    // (5mm) was eating distance on fast drags and made
+                    // the cursor feel like it was tugging — drop it.
                     events.push(raw(
                         EventKind::Absolute,
                         AbsoluteAxis::MultitouchPositionX as u16,
-                        cx,
+                        x,
                     ));
                     events.push(raw(
                         EventKind::Absolute,
                         AbsoluteAxis::MultitouchPositionY as u16,
-                        cy,
+                        y,
                     ));
                     events.push(raw(
                         EventKind::Absolute,
@@ -708,7 +670,6 @@ impl VirtualInputDevice for Touchpad {
                     ));
                     events.push(raw(EventKind::Key, Key::ButtonTouch as u16, 1));
                 } else {
-                    self.last_pos.remove(&slot_i);
                     events.push(raw(EventKind::Key, Key::ButtonTouch as u16, 0));
                 }
                 events.push(syn_report());
