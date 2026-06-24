@@ -685,13 +685,32 @@ async fn streams_accept_loop(
     // Helper struct so any early return out of the accept loop —
     // graceful Closed or a hard error — flips the global liveness
     // flag and unblocks HostDialer's poll. Drop = transport gone.
-    struct ConnGuard;
+    //
+    // Carries our own `Arc<QuicConnection>` so the Drop side can
+    // distinguish "we're the live session" from "we've been
+    // superseded by a fresh `nativeOpenConnection`". Two
+    // `streams_accept_loop` tasks can be alive at the same time when
+    // the dialer races a redial against the old session's graceful
+    // shutdown; without this check the LATER drop wins and the global
+    // `CONNECTED` flag flips false despite a working session.
+    struct ConnGuard {
+        conn: Arc<QuicConnection>,
+    }
     impl Drop for ConnGuard {
         fn drop(&mut self) {
-            mark_connected(false);
+            let still_current = state_slot()
+                .lock()
+                .expect("state mutex poisoned")
+                .as_ref()
+                .and_then(|s| s.session.as_ref())
+                .map(|sess| Arc::ptr_eq(&sess.conn, &self.conn))
+                .unwrap_or(false);
+            if still_current {
+                mark_connected(false);
+            }
         }
     }
-    let _guard = ConnGuard;
+    let _guard = ConnGuard { conn: conn.clone() };
     loop {
         let (kind, stream) = match conn.accept().await {
             Ok(v) => v,
@@ -1446,11 +1465,20 @@ pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativeSendInputMessa
             let stream = conn.open(StreamKind::Input).await?;
             *guard = Some(stream);
         }
-        guard
+        let send_result = guard
             .as_mut()
             .expect("just inserted")
             .send(bytes::Bytes::from(postcard_bytes))
-            .await
+            .await;
+        // Stream died — clear the slot so the next call can reopen on
+        // the same QuicConnection. Without this, every subsequent
+        // input event silently fails because we keep handing out the
+        // dead stream. Symptom = cursor freezes after one transient
+        // network blip even though the QUIC conn is otherwise fine.
+        if send_result.is_err() {
+            *guard = None;
+        }
+        send_result
     });
     match result {
         Ok(()) => {
