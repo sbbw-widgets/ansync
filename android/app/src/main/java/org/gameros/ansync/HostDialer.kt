@@ -225,12 +225,19 @@ class HostDialer(private val ctx: Context) {
         if (raw.isNullOrBlank()) return
         for (entry in raw.split(',')) {
             if (connected) return
-            val (ip, port) = entry.split(':', limit = 2).let {
-                val ip = it.getOrNull(0)?.trim().orEmpty()
-                val port = it.getOrNull(1)?.trim()?.toIntOrNull() ?: 0
-                ip to port
-            }
+            // PREF_HOST_ADDR may contain IPv6 literals (multiple colons).
+            // Split on the LAST `:` so `[fe80::1]:47215` and
+            // `192.168.0.1:47215` both parse correctly.
+            val sep = entry.lastIndexOf(':')
+            if (sep <= 0) continue
+            val ip = entry.substring(0, sep).trim().removeSurrounding("[", "]")
+            val port = entry.substring(sep + 1).trim().toIntOrNull() ?: 0
             if (ip.isEmpty() || port == 0) continue
+            val parsed = runCatching { java.net.InetAddress.getByName(ip) }.getOrNull()
+            if (parsed == null || !HostDiscovery.isDialableAddress(parsed)) {
+                Log.i(TAG, "skip direct-dial entry $ip: undialable")
+                continue
+            }
             Log.i(TAG, "direct-dial fallback: $ip:$port")
             if (dial(ip, port, hex, "direct")) return
         }

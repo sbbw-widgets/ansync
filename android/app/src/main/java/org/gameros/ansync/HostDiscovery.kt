@@ -5,6 +5,7 @@ import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
 import android.net.wifi.WifiManager
 import android.util.Log
+import java.net.Inet6Address
 import java.net.InetAddress
 
 /**
@@ -80,6 +81,13 @@ class HostDiscovery(private val ctx: Context) {
                             Log.w(TAG, "resolved ${resolved.serviceName} but no host address")
                             return
                         }
+                        if (!isDialableAddress(host)) {
+                            Log.i(
+                                TAG,
+                                "skip ${resolved.serviceName}: undialable address ${host.hostAddress}",
+                            )
+                            return
+                        }
                         Log.i(
                             TAG,
                             "added host '$name' @ ${host.hostAddress}:${resolved.port} pubkey=${pubkey.take(16)}…",
@@ -122,5 +130,18 @@ class HostDiscovery(private val ctx: Context) {
         // ansync_discovery::ANNOUNCE_TYPE. NsdManager wants the
         // trailing dot.
         private const val SERVICE_TYPE = "_ansync._udp."
+
+        /** Reject addresses that are unreachable from a phone on Wi-Fi:
+         *  loopback (only valid to the host process itself), wildcard
+         *  any-address, and IPv6 link-local (`fe80::/10` — requires a
+         *  scope-id; QUIC dial against `fe80::…%wlan0` hangs ~4s before
+         *  failing). Anycast / multicast literals can't be daemon
+         *  endpoints either. */
+        internal fun isDialableAddress(addr: InetAddress): Boolean {
+            if (addr.isLoopbackAddress || addr.isAnyLocalAddress) return false
+            if (addr.isMulticastAddress) return false
+            if (addr is Inet6Address && addr.isLinkLocalAddress) return false
+            return true
+        }
     }
 }
