@@ -26,6 +26,12 @@ pub use quinn::ConnectionStats;
 pub enum TransportError {
     #[error("connection closed")]
     Closed,
+    /// Keep-alive expired — peer unreachable. Distinguished from
+    /// `Closed` so loops can downgrade the log level (it's expected on
+    /// Android Doze / wifi handoff / daemon restart) without losing
+    /// the diagnostic signal at debug.
+    #[error("connection timed out")]
+    TimedOut,
     #[error("handshake: {0}")]
     Handshake(String),
     #[error("identity mismatch")]

@@ -1019,6 +1019,10 @@ async fn handle_connection(
                 info!(%peer_id, "peer closed connection");
                 break;
             }
+            Err(ansync_transport::TransportError::TimedOut) => {
+                info!(%peer_id, "peer keep-alive timed out");
+                break;
+            }
             Err(e) => return Err(e.into()),
         };
         match kind {
@@ -1281,7 +1285,8 @@ async fn camera_stream_loop(
     loop {
         let bytes = match stream.recv().await {
             Ok(b) => b,
-            Err(ansync_transport::TransportError::Closed) => {
+            Err(ansync_transport::TransportError::Closed)
+            | Err(ansync_transport::TransportError::TimedOut) => {
                 info!(%peer_id, "camera stream closed");
                 return;
             }
@@ -1466,7 +1471,8 @@ async fn clipboard_inbound_loop(
     loop {
         let bytes = match stream.recv().await {
             Ok(b) => b,
-            Err(ansync_transport::TransportError::Closed) => return,
+            Err(ansync_transport::TransportError::Closed)
+            | Err(ansync_transport::TransportError::TimedOut) => return,
             Err(e) => {
                 warn!(%peer_id, error = %e, "clipboard recv error");
                 return;
@@ -1532,7 +1538,8 @@ async fn notification_inbound_loop(
     // surfaces each finished stream's FIN to us.
     let bytes = match stream.recv().await {
         Ok(b) => b,
-        Err(ansync_transport::TransportError::Closed) => return,
+        Err(ansync_transport::TransportError::Closed)
+        | Err(ansync_transport::TransportError::TimedOut) => return,
         Err(ansync_transport::TransportError::Io(e))
             if e.kind() == std::io::ErrorKind::UnexpectedEof =>
         {
@@ -1889,7 +1896,8 @@ async fn audio_inbound_loop(
     loop {
         let bytes = match stream.recv().await {
             Ok(b) => b,
-            Err(ansync_transport::TransportError::Closed) => {
+            Err(ansync_transport::TransportError::Closed)
+            | Err(ansync_transport::TransportError::TimedOut) => {
                 info!(%peer_id, "audio inbound stream closed");
                 return;
             }
@@ -2262,7 +2270,8 @@ async fn video_stream_loop(
     loop {
         let bytes = match stream.recv().await {
             Ok(b) => b,
-            Err(ansync_transport::TransportError::Closed) => {
+            Err(ansync_transport::TransportError::Closed)
+            | Err(ansync_transport::TransportError::TimedOut) => {
                 info!(%peer_id, "video stream closed");
                 return;
             }
@@ -2815,7 +2824,8 @@ async fn input_stream_loop(
     loop {
         let bytes = match stream.recv().await {
             Ok(b) => b,
-            Err(ansync_transport::TransportError::Closed) => break,
+            Err(ansync_transport::TransportError::Closed)
+            | Err(ansync_transport::TransportError::TimedOut) => break,
             Err(e) => {
                 warn!(error = %e, "input stream recv failed");
                 break;

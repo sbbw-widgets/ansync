@@ -60,6 +60,23 @@ fn stream_kind_from_tag(tag: u8) -> Result<StreamKind, TransportError> {
 impl From<FrameError> for TransportError {
     fn from(value: FrameError) -> Self {
         match value {
+            // `UnexpectedEof` here means the peer dropped its send half
+            // mid-frame — a clean transport-level FIN, not an error.
+            // Bubbling it as `Closed` lets every recv loop collapse the
+            // graceful-shutdown path into a single match arm and log at
+            // info-level. `BrokenPipe` / `ConnectionReset` carry the
+            // same "peer is gone" semantics.
+            FrameError::Io(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::UnexpectedEof
+                        | std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
+                ) =>
+            {
+                TransportError::Closed
+            }
             FrameError::Io(e) => TransportError::Io(e),
             other => TransportError::Handshake(other.to_string()),
         }
@@ -71,10 +88,17 @@ fn map_connect_err(e: quinn::ConnectError) -> TransportError {
 }
 
 fn map_conn_err(e: quinn::ConnectionError) -> TransportError {
+    // Anything that means "the connection is gone" maps to `Closed` so
+    // call sites can stop with one match arm and log at info-level.
+    // `TimedOut` gets its own variant — it's the signal we want for
+    // Doze / wifi-handoff diagnostics without flooding the journal.
+    // Genuine handshake / protocol bugs keep `Handshake`.
     match e {
-        quinn::ConnectionError::LocallyClosed | quinn::ConnectionError::ApplicationClosed(_) => {
-            TransportError::Closed
-        }
+        quinn::ConnectionError::LocallyClosed
+        | quinn::ConnectionError::ApplicationClosed(_)
+        | quinn::ConnectionError::ConnectionClosed(_)
+        | quinn::ConnectionError::Reset => TransportError::Closed,
+        quinn::ConnectionError::TimedOut => TransportError::TimedOut,
         other => TransportError::Handshake(format!("conn: {other}")),
     }
 }

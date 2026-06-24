@@ -699,6 +699,10 @@ async fn streams_accept_loop(
                 info!("streams_accept_loop: connection closed");
                 return;
             }
+            Err(ansync_transport::TransportError::TimedOut) => {
+                info!("streams_accept_loop: keep-alive timed out");
+                return;
+            }
             Err(e) => {
                 warn!("streams_accept_loop: accept failed: {e}");
                 return;
@@ -859,7 +863,8 @@ async fn control_recv_loop(
     loop {
         let bytes = match stream.recv().await {
             Ok(b) => b,
-            Err(ansync_transport::TransportError::Closed) => {
+            Err(ansync_transport::TransportError::Closed)
+            | Err(ansync_transport::TransportError::TimedOut) => {
                 info!("control_recv_loop: stream closed");
                 return;
             }
@@ -959,7 +964,8 @@ async fn audio_in_loop(mut stream: QuicStream, tx: UnboundedSender<Vec<u8>>) {
                     return;
                 }
             }
-            Err(ansync_transport::TransportError::Closed) => {
+            Err(ansync_transport::TransportError::Closed)
+            | Err(ansync_transport::TransportError::TimedOut) => {
                 info!("audio_in_loop: stream closed");
                 return;
             }
@@ -979,7 +985,8 @@ async fn clipboard_in_loop(
     loop {
         let bytes = match stream.recv().await {
             Ok(b) => b,
-            Err(ansync_transport::TransportError::Closed) => return,
+            Err(ansync_transport::TransportError::Closed)
+            | Err(ansync_transport::TransportError::TimedOut) => return,
             Err(e) => {
                 warn!("clipboard_in_loop: recv error: {e}");
                 return;
@@ -1094,7 +1101,8 @@ async fn input_recv_loop(mut stream: QuicStream, tx: UnboundedSender<Vec<u8>>) {
                     return;
                 }
             }
-            Err(ansync_transport::TransportError::Closed) => {
+            Err(ansync_transport::TransportError::Closed)
+            | Err(ansync_transport::TransportError::TimedOut) => {
                 info!("input_recv_loop: stream closed");
                 return;
             }
