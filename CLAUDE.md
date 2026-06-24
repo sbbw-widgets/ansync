@@ -154,7 +154,12 @@ El `flake.nix` pinea `nixpkgs` a `549bd84d6279f9852cae6225e372cc67fb91a4c1` para
 
 - **Share (Quick Share-style) cerrado (2026-06-19)** — reemplaza FUSE como mecanismo de file-sharing. `StreamKind::Url` (0x0b) + `Message::Url(UrlMessage)` + `Permission::ShareReceive` + `Capabilities::SHARE`. D-Bus `Device.SendFiles` / `Device.SendUrl` / signal `FileReceived`. Daemon `url_inbound_loop` xdg-open + `notify-send`. Companion JNI `nativeSendFile/nativeSendUrl/nativePollIncomingUrl/nativePollReceivedFile`. Kotlin `ShareActivity` (intent-filter `ACTION_SEND` + `ACTION_SEND_MULTIPLE`) + `ShareTile` QSTile + receive workers (URL prompt notif + file received notif + MediaScanner). `ansyncctl push <id> <paths...>` y `ansyncctl url <id> <url>` ahora SIEMPRE D-Bus (sin direct QUIC). Multi-host picker queda gated por N8.
 
-Ver `PLAN.md` § Roadmap para la lista completa.
+- **Touchpad Mac-style cerrado (2026-06-24)** — diagnosticado vía `libinput debug-events --verbose --device /dev/input/eventNN`. Dos bugs cazados:
+  - **Palm 100% false positive** (`cbcc0c7`): Android `getPressure() ~1.0 * 255 = 255` (max axis), libinput palm threshold hardcoded 130 → todos los touches palm-rejected. Fix: `scaleTouchpadPressure(raw)` en `TouchpadActivity.kt` mapea 0..1.5 → 30..120 (arriba de touch threshold 30, abajo de palm 130).
+  - **Jump filter al touchdown** (`2b8d03c`): libinput retiene last-position per-slot aún post tracking_id transition → primer POSITION nuevo touch >7mm = `Touch jump detected`. Fix: `TOUCHPAD_RES` 500→200 (touchpad reportado 65→163mm, Magic Trackpad-ish, cursor más rápido sin compositor accel) + intra-touch delta clamp 5mm vs `last_pos[slot]` HashMap. **Touchdown va RAW** (sin clamp) → libinput toma POSITION como anchor sin POINTER_MOTION espurio. TouchMajor/Minor recalc a `8*RES = 1600`.
+  - **Pendiente** próxima sesión (combinado con `Conn cycle 3s`): diagnosticar packet loss real companion ↔ host. Síntoma: cursor fluido, intermitente "se siente duro" / mueve poco → probable loss + clamp 5mm arrastrando. Log frame counters + `quinn::Connection::stats()`. Si loss baja → subir clamp a 6mm o eliminarlo. Si alto → root cause es bug `streams_accept_loop` muere.
+
+Ver `PLAN.md` § Roadmap + § Touchpad Mac-style para la lista completa.
 
 ## Convenciones de continuidad
 

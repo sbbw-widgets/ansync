@@ -653,49 +653,32 @@ Entregables del lado ansync:
 - `ansync/Cargo.toml` activa `ferricast-core` / `ferricast-encoder` / `ferricast-decoder` con feature set `["openh264","vaapi","nvenc","nvenc-hevc","vaapi-hevc"]` (encoder) y `["openh264-decode","nvdec-decode","nvdec-hevc-decode","vaapi-hevc-decode"]` (decoder).
 - `ansync_video` con `CodecCapabilities`, `negotiate_codec(peer, local)`, `local_decoder_caps()` (one-shot HW probe cacheado), `HostDecoder` enum dispatch sobre `H264Decoder | H265Decoder`. Sin render — Step 6.
 
-## Touchpad Mac-style — pendiente (sesión 2026-06-24)
+## Touchpad Mac-style — cerrado (sesión 2026-06-24)
 
-Intento de exponer `TouchpadActivity` como Mac-style touchpad delegando tap/scroll/pinch a libinput. Llegamos a `cap:pg size 66x66mm tap (dl off)` pero libinput **descarta todos los eventos como "Touch jump detected"** aunque evtest confirme deltas <2mm/frame.
+`TouchpadActivity` ahora delega tap/scroll/pinch/gestures a libinput. Diagnosticado con `libinput debug-events --verbose --device /dev/input/eventNN` (NN cambia por reinstall — buscar en `/proc/bus/input/devices`).
 
-### Estado actual del código (commit `68bcbce`)
+### Bugs encontrados + fixes
 
-- **Host `crates/input/src/uinput.rs::Touchpad`** — `INPUT_PROP_POINTER + INPUT_PROP_BUTTONPAD`, `BUS_USB`, MT axes completos:
-  - X/Y resolution 500 units/mm (tamaño 66×66mm).
-  - `MT_TOUCH_MAJOR/MINOR=4000` (~8mm finger).
-  - `MT_TOOL_TYPE=0` (finger) por contact.
-  - `MT_ORIENTATION=0`.
-  - Single `BTN_LEFT` (sin RIGHT/MIDDLE — clickpad puro).
-  - Buttons `BTN_TOOL_FINGER/DOUBLE/TRIPLE/QUAD/QUINTTAP` para tap detection.
-- **Companion `TouchpadActivity.kt`** — handleTouchpadEvent emite `TouchpadSlot` con:
-  - Slot rotation via FIFO pool (10 slots), evita reuse inmediato.
-  - tracking_id monotónico per touch.
-  - Historical samples (cuando `historySize > 0` — en logcat siempre 0 igual).
-- **Wire** — `InputMessage::TouchpadSlot` (postcard tag al final del enum por compat), Android JNI tag-binary 8.
+- **Palm rejection 100% false positive** (`cbcc0c7`). Log inicial mostraba `palm: touch N (TOUCH_BEGIN), palm detected (pressure)` para TODOS los touches.
+  - Causa: Android `MotionEvent.getPressure()` devuelve ~1.0 para capacitive normal, escalábamos a 255 (max del axis), libinput hardcoded palm threshold = 130 para touchpads "unknown" → cada touch caía en palm zone → descartado.
+  - Fix: nueva `scaleTouchpadPressure(raw)` en `TouchpadActivity.kt` mapea Android 0..1.5 → 30..120 (arriba del touch threshold 30, abajo del palm 130). Aplicado en `emitTouchpadSlot` + `emitTouchpadSlotHistorical`. Touchscreen raw mode + Stylus NO tocados (devices distintos con thresholds propios).
+- **Jump filter al touchdown** (`2b8d03c`). 5 `kernel bug: Touch jump detected and discarded` al primer touch antes del rate-limit (24h).
+  - Causa: libinput retiene "last position" interno per-slot aún después de tracking_id transition. Primer POSITION del nuevo touch saltaba >7mm del prev → discardeado.
+  - Fix: bajar `TOUCHPAD_RES` 500→200 units/mm (touchpad reportado 65mm→163mm, Magic Trackpad-ish, cursor más rápido sin compositor accel) + intra-touch delta clamp 5mm vs `last_pos[slot]` HashMap. **Touchdown va RAW** (sin clamp) para que libinput tome ese POSITION como anchor del nuevo touch sin POINTER_MOTION espurio (arrastre desde último touch).
+  - TouchMajor/Minor recalc a `8 * TOUCHPAD_RES` = 1600 (era 4000 hardcoded para res 500).
 
-### Fixes intentados (no resuelven el jump filter)
+### Pendiente — sensación intermitente "cursor pesado" (sesión próxima)
 
-1. Resolution 100→500 units/mm.
-2. Slot rotation FIFO (no reuse slot 0 entre taps).
-3. Monotonic tracking_id (no reuse tracking_id 0).
-4. Historical samples emission.
-5. `MT_TOOL_TYPE` + `MT_TOUCH_MAJOR/MINOR` + `MT_ORIENTATION`.
-6. Drop `BTN_RIGHT/MIDDLE` (clickpad puro).
+Síntoma: cursor fluido, de la nada se siente "duro" / mueve poco mientras dedo sigue normal en tablet. Hipótesis fuerte: **packet loss companion ↔ host** dispara nuestro clamp 5mm cuando sample N+1 perdido + sample N+2 trae delta grande → libinput recibe POSITION clampeado que arrastra cursor lento varios frames.
 
-### Hipótesis para próxima iteración
+Diagnóstico planificado para próxima sesión (combinado con bug "Conn cycle 3s" — pueden ser misma causa):
 
-- **Cálculo de coords** — sospecha del user: algo en cómo escalamos Android coords → 0..32767 puede dispararle a libinput algún flag. Probar:
-  - Emitir coords nativas Android (sin escalar) + ajustar resolution al ratio real.
-  - O usar coords mucho más chicas (ej. max 1024) con res baja.
-- **`MT_TOUCH_MAJOR=0`** (no advertise contact ellipse). Quizás libinput ve ellipse de 8mm + posición distinta entre frames y conflictúa.
-- **First-event vs steady-state** — emitir todos los axes solo en touchdown, después solo X/Y. Mimica drivers reales (Apple, Synaptics).
-- **Compare bit-by-bit con touchpad real** — `evtest /dev/input/event<touchpad>` en una laptop con touchpad de hardware, hacer el MISMO gesto, diffear con nuestro event28. Diferencias en orden / axes faltantes / patrones de SYN delatan qué se nos escapa.
-- **`AttrIsVirtualMouse`** o quirks file en `/etc/libinput/local-overrides.quirks` — verificado que NO existe `DisableJumpFilter` attr directa, pero quizás `Model*` flag específica destrava algo. Path de bajo % éxito.
+- Log timestamps + counter de `TouchpadSlot` emitidos en companion (`android/src/lib.rs::nativeSendInputMessage`) vs recibidos en daemon (`input_stream_loop`). Diferencia = loss real.
+- `quinn::Connection::stats()` per peer: `path.lost_packets`, `path.sent_packets`, `frame.retx`. Si loss > 1% → wifi / mDNS issue.
+- Si loss real bajo (< 0.5%) → clamp es muy agresivo. Subir a 6mm (margen mínimo bajo threshold 7mm) o eliminar clamp intra-touch (solo dejar raw touchdown) — libinput perdería 1 frame ocasional pero recuperaría fluidez.
+- Si loss alto → atacar root cause (probable mismo bug que **Conn cycle 3s** — `streams_accept_loop` muere prematuro).
 
-### Plan B: revertir a synthesis client-side
+### Otros bugs separados a atacar en la misma sesión próxima
 
-Si la iteración del touchpad uinput sigue sin éxito tras intentar las hipótesis de arriba, restaurar el `Gesture` state machine que fue removido en commit `8f9f063` (1-finger drag → MouseMove, tap → BtnLeft, long-press → BtnRight, 2-finger drag → MouseWheel, pinch → Ctrl+Wheel, etc). Funcionaba bien — perdemos integración con `niri input.touchpad` config pero recuperamos UX inmediato.
-
-### Otros bugs separados (no bloquean touchpad pero notar)
-
-- **Conn cycle 3s** del companion: `HostDialer.livenessProbe` cada 3s redial cuando `nativeIsConnected()` devuelve false. `ConnGuard::drop` en `streams_accept_loop` de `android/src/lib.rs` marca CONNECTED=false al primer error del accept loop. Investigar por qué el accept loop muere rápido (¿QUIC stream close prematuro? ¿panic en spawned task?). El fix real requiere logcat con `RUST_LOG=ansync_companion_native=trace` o similar.
-- **Logs noisy** del daemon: `video recv error: connection lost` debería ser `debug!` cuando viene de un graceful close, no `warn!`.
+- **Conn cycle 3s** companion: `HostDialer.livenessProbe` cada 3s redial cuando `nativeIsConnected()` devuelve false. `ConnGuard::drop` en `streams_accept_loop` (`android/src/lib.rs`) marca CONNECTED=false al primer error. Necesita logcat con `RUST_LOG=ansync_companion_native=trace`. Hipótesis: QUIC stream close prematuro o panic en spawned task. Relacionado con packet loss.
+- **Logs noisy** daemon: `video recv error: connection lost` debería ser `debug!` cuando es graceful close, no `warn!`.
