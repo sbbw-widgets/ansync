@@ -153,7 +153,12 @@
             "deb"
             "rpm"
             "archlinux"
-            "appimage"
+            # "appimage" — disabled 2026-06-24: upstream type2-runtime
+            # rebuilt the `continuous` release with a new SHA, and
+            # nix-bundle-app pins the old hash, so every CI build hard-
+            # fails the fixed-output derivation. Re-enable once the
+            # nix-bundle-app input bumps to a runtime hash that matches
+            # (or pins a stable type2-runtime tag instead of `continuous`).
             "flatpak"
             "tar.zst"
           ];

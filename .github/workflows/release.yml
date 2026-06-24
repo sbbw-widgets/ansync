@@ -5,6 +5,13 @@ on:
     tags:
       - "v*"
   workflow_dispatch:
+
+# The rust-android container ships `/bin/sh` = dash, which rejects
+# `set -o pipefail`. Pin bash globally so every `run:` block — both
+# on the runner and inside containers — gets the same shell semantics.
+defaults:
+  run:
+    shell: bash
     inputs:
       tag:
         description: "Tag to release (e.g. v0.1.0)."
