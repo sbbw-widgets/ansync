@@ -410,8 +410,7 @@ private fun emitTouchpadSlotHistorical(
         TOUCH_ABS_MAX / canvas.width).toInt().coerceIn(0, TOUCH_ABS_MAX)
     val absY = (event.getHistoricalY(idx, historyIdx).coerceIn(0f, canvas.height.toFloat()) *
         TOUCH_ABS_MAX / canvas.height).toInt().coerceIn(0, TOUCH_ABS_MAX)
-    val pressure = (event.getHistoricalPressure(idx, historyIdx).coerceIn(0f, 1f) * 255).toInt()
-        .coerceIn(0, 255)
+    val pressure = scaleTouchpadPressure(event.getHistoricalPressure(idx, historyIdx))
     NativeBridge.nativeSendInputMessage(
         WireInputMessage.TouchpadSlot(
             slot = slot,
@@ -422,6 +421,21 @@ private fun emitTouchpadSlotHistorical(
         ).encode()
     )
 }
+
+// Android `getPressure()` returns ~1.0 for a normal capacitive touch
+// (it's a normalized "fraction of max sensor reading", not raw force).
+// Scaling that to the full ABS_MT_PRESSURE max declared on the uinput
+// device (255) means every contact reports as max pressure, which
+// libinput's hardcoded palm threshold (130, ~50% of axis max for an
+// unknown touchpad) treats as a palm — every touch ends up discarded.
+//
+// Map Android's 0..1 into a range that sits above libinput's touch
+// detection floor (25..30 on the same scale) and well below the palm
+// threshold (130). A normal touch lands at ~80; a hard press at ~120;
+// nothing reaches palm territory unless the caller explicitly passes
+// pressure > 1 (which Android never does for fingers).
+private fun scaleTouchpadPressure(raw: Float): Int =
+    (raw.coerceIn(0f, 1.5f) * 80f).toInt().coerceIn(30, 120)
 
 /// Per-pointer (Android `pointerId`) → (slot, tracking_id) mapping.
 ///
@@ -464,8 +478,7 @@ private fun emitTouchpadSlot(event: MotionEvent, idx: Int, canvas: IntSize, lift
         TOUCH_ABS_MAX / canvas.width).toInt().coerceIn(0, TOUCH_ABS_MAX)
     val absY = (event.getY(idx).coerceIn(0f, canvas.height.toFloat()) *
         TOUCH_ABS_MAX / canvas.height).toInt().coerceIn(0, TOUCH_ABS_MAX)
-    val pressure = (event.getPressure(idx).coerceIn(0f, 1f) * 255).toInt()
-        .coerceIn(0, 255)
+    val pressure = scaleTouchpadPressure(event.getPressure(idx))
     NativeBridge.nativeSendInputMessage(
         WireInputMessage.TouchpadSlot(
             slot = slot,
