@@ -16,9 +16,9 @@ use std::fs::{File, OpenOptions};
 
 use async_trait::async_trait;
 use input_linux::{
-    AbsoluteAxis, AbsoluteInfo, AbsoluteInfoSetup, EventKind, EventTime, InputId, Key, KeyState,
-    SynchronizeKind, UInputHandle,
-    sys::{BUS_VIRTUAL, input_event},
+    AbsoluteAxis, AbsoluteInfo, AbsoluteInfoSetup, EventKind, EventTime, InputId, InputProperty,
+    Key, KeyState, SynchronizeKind, UInputHandle,
+    sys::{BUS_USB, BUS_VIRTUAL, input_event},
 };
 use tracing::debug;
 
@@ -59,8 +59,12 @@ fn open_uinput() -> Result<UInputHandle<File>, InputError> {
 }
 
 fn make_id(product: u16) -> InputId {
+    make_id_bus(product, BUS_VIRTUAL)
+}
+
+fn make_id_bus(product: u16, bus: u16) -> InputId {
     InputId {
-        bustype: BUS_VIRTUAL,
+        bustype: bus,
         vendor: VENDOR_PID_CODES,
         product,
         version: VERSION,
@@ -87,6 +91,20 @@ fn write_events(handle: &UInputHandle<File>, events: &[input_event]) -> Result<(
 }
 
 fn abs(axis: AbsoluteAxis, min: i32, max: i32) -> AbsoluteInfoSetup {
+    abs_res(axis, min, max, 0)
+}
+
+/// Same as [`abs`] but with a non-zero `resolution`. Required by
+/// libinput's tablet pipeline on ABS_X / ABS_Y: a `resolution == 0`
+/// logs `"missing tablet capabilities: resolution. Ignoring this
+/// device."` and the tablet is dropped entirely — no tablet-tool
+/// events ever reach the compositor.
+///
+/// Units:
+/// - Spatial axes (X/Y): units per *millimetre*.
+/// - Tilt axes: units per *radian*.
+/// - Pressure: not required by libinput; leave at 0.
+fn abs_res(axis: AbsoluteAxis, min: i32, max: i32, resolution: i32) -> AbsoluteInfoSetup {
     AbsoluteInfoSetup {
         axis,
         info: AbsoluteInfo {
@@ -95,7 +113,7 @@ fn abs(axis: AbsoluteAxis, min: i32, max: i32) -> AbsoluteInfoSetup {
             maximum: max,
             fuzz: 0,
             flat: 0,
-            resolution: 0,
+            resolution,
         },
     }
 }
@@ -357,19 +375,31 @@ impl VirtualInputDevice for Touchscreen {
         handle.set_evbit(EventKind::Absolute)?;
         handle.set_evbit(EventKind::Synchronize)?;
         handle.set_keybit(Key::ButtonTouch)?;
+        // Touchscreens are direct-mapped (1:1 with a display). Without
+        // `INPUT_PROP_DIRECT`, libinput skips the touchscreen pipeline
+        // and falls back to a generic absolute pointer — gestures and
+        // multi-touch don't reach the compositor.
+        handle.set_propbit(InputProperty::Direct)?;
+        // Same rationale as the Stylus block: libinput's touch / MT-B
+        // pipeline expects a non-zero resolution on the position
+        // axes so it can convert between device units and the output
+        // it maps to. 100 units/mm matches the Stylus device.
         let abs_setup = [
-            abs(AbsoluteAxis::X, 0, ABS_MAX),
-            abs(AbsoluteAxis::Y, 0, ABS_MAX),
+            abs_res(AbsoluteAxis::X, 0, ABS_MAX, 100),
+            abs_res(AbsoluteAxis::Y, 0, ABS_MAX, 100),
             abs(AbsoluteAxis::Pressure, 0, 255),
             abs(AbsoluteAxis::MultitouchSlot, 0, MT_SLOTS - 1),
             abs(AbsoluteAxis::MultitouchTrackingId, 0, 0xFFFF),
-            abs(AbsoluteAxis::MultitouchPositionX, 0, ABS_MAX),
-            abs(AbsoluteAxis::MultitouchPositionY, 0, ABS_MAX),
+            abs_res(AbsoluteAxis::MultitouchPositionX, 0, ABS_MAX, 100),
+            abs_res(AbsoluteAxis::MultitouchPositionY, 0, ABS_MAX, 100),
             abs(AbsoluteAxis::MultitouchPressure, 0, 255),
         ];
         let full_name = format!("{name} Touchscreen");
+        // `BUS_USB` (not `BUS_VIRTUAL`) so libinput's input classifier
+        // recognises this as a real touchscreen — virtual-bus devices
+        // are filtered out of the touch / tablet pipelines.
         handle.create(
-            &make_id(PRODUCT_TOUCHSCREEN),
+            &make_id_bus(PRODUCT_TOUCHSCREEN, BUS_USB),
             full_name.as_bytes(),
             0,
             &abs_setup,
@@ -481,16 +511,36 @@ impl VirtualInputDevice for Stylus {
         ] {
             handle.set_keybit(button)?;
         }
+        // `INPUT_PROP_POINTER` marks this as an indirect graphics
+        // tablet (Wacom Intuos-style): libinput moves the system
+        // cursor instead of trying to map it 1:1 to a specific
+        // display via libwacom. Without this prop the device shows
+        // up under evdev but never reaches the compositor's pointer.
+        handle.set_propbit(InputProperty::Pointer)?;
+        // Resolution units chosen to mimic a Wacom Intuos-class
+        // graphics tablet so libinput's tablet pipeline accepts us:
+        //   - X/Y at 100 units/mm → 32767 range maps to ~327 mm of
+        //     virtual tablet surface (libinput uses the ratio, not
+        //     the absolute extent, since `INPUT_PROP_POINTER` makes
+        //     this an indirect tablet that drives the system cursor).
+        //   - Tilt at 57 units/radian (= 1 unit/degree) so our
+        //     -90..90 degree report converts to libinput's radian
+        //     convention with the right magnitude.
+        // Pressure intentionally has no resolution — libinput treats
+        // it as a unitless 0..1 ratio.
         let abs_setup = [
-            abs(AbsoluteAxis::X, 0, ABS_MAX),
-            abs(AbsoluteAxis::Y, 0, ABS_MAX),
+            abs_res(AbsoluteAxis::X, 0, ABS_MAX, 100),
+            abs_res(AbsoluteAxis::Y, 0, ABS_MAX, 100),
             abs(AbsoluteAxis::Pressure, 0, 8191),
-            abs(AbsoluteAxis::TiltX, -90, 90),
-            abs(AbsoluteAxis::TiltY, -90, 90),
+            abs_res(AbsoluteAxis::TiltX, -90, 90, 57),
+            abs_res(AbsoluteAxis::TiltY, -90, 90, 57),
         ];
         let full_name = format!("{name} Stylus");
+        // `BUS_USB` instead of `BUS_VIRTUAL` so libinput's tablet
+        // classifier (and libwacom's fallback heuristics) actually
+        // pick this device up — virtual-bus tablets get rejected.
         handle.create(
-            &make_id(PRODUCT_STYLUS),
+            &make_id_bus(PRODUCT_STYLUS, BUS_USB),
             full_name.as_bytes(),
             0,
             &abs_setup,
@@ -511,9 +561,22 @@ impl VirtualInputDevice for Stylus {
                 tilt_y,
                 btn,
             } => {
-                let touch = if pressure > 0 { 1 } else { 0 };
+                // `btn` byte layout (companion → host):
+                //   bit 0 : ButtonStylus  (BARREL primary)
+                //   bit 1 : ButtonStylus2 (BARREL secondary)
+                //   bit 2 : eraser tool active (BTN_TOOL_RUBBER)
+                //   bit 7 : in-proximity (1 = pen near surface, 0 = lifted)
+                //   bits 3-6 : reserved
+                // When bit 7 is 0 the pen is out of proximity — release
+                // both tool bits so libinput finishes the stroke and
+                // the cursor doesn't appear stuck.
                 let stylus_btn = (btn & 0x01) as i32;
                 let stylus_btn2 = ((btn >> 1) & 0x01) as i32;
+                let eraser = (btn & 0x04) != 0;
+                let in_prox = (btn & 0x80) != 0;
+                let touch = if in_prox && pressure > 0 { 1 } else { 0 };
+                let tool_pen = if in_prox && !eraser { 1 } else { 0 };
+                let tool_rub = if in_prox && eraser { 1 } else { 0 };
                 write_events(
                     h,
                     &[
@@ -526,7 +589,8 @@ impl VirtualInputDevice for Stylus {
                         ),
                         raw(EventKind::Absolute, AbsoluteAxis::TiltX as u16, tilt_x as i32),
                         raw(EventKind::Absolute, AbsoluteAxis::TiltY as u16, tilt_y as i32),
-                        raw(EventKind::Key, Key::ButtonToolPen as u16, 1),
+                        raw(EventKind::Key, Key::ButtonToolPen as u16, tool_pen),
+                        raw(EventKind::Key, Key::ButtonToolRubber as u16, tool_rub),
                         raw(EventKind::Key, Key::ButtonTouch as u16, touch),
                         raw(EventKind::Key, Key::ButtonStylus as u16, stylus_btn),
                         raw(EventKind::Key, Key::ButtonStylus2 as u16, stylus_btn2),
