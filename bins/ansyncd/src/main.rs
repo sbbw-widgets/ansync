@@ -28,12 +28,10 @@ struct Args {
     /// Override the identity key path.
     #[arg(long)]
     identity: Option<PathBuf>,
-    /// Override the peers directory.
+    /// Override the peers directory. Per-device permissions live in
+    /// the same toml — there is no separate `--permissions-dir` flag.
     #[arg(long)]
     peers_dir: Option<PathBuf>,
-    /// Override the per-device permissions directory.
-    #[arg(long)]
-    permissions_dir: Option<PathBuf>,
     /// Bring up the mirror window and feed it from a local Annex-B
     /// recording (`.h264` / `.h265`). Dev-only — only present when
     /// compiled with `--features dev-playback`.
@@ -93,7 +91,6 @@ async fn run_daemon(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let mut config = DaemonConfig::new(device_name);
     config.identity_path = args.identity;
     config.peers_dir = args.peers_dir;
-    config.permissions_dir = args.permissions_dir;
 
     let daemon = Arc::new(Daemon::new(config));
     daemon.run().await?;

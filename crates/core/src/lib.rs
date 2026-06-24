@@ -125,8 +125,9 @@ impl Default for DevicePermissions {
         //
         // The PC owns the gates: re-tighten any of these via
         // `Permissions/{id}.Set(<flag>, false)` on D-Bus or by editing
-        // `$XDG_CONFIG_HOME/ansync/devices/{id}.toml` directly. A
-        // re-pair re-applies these defaults.
+        // the `[permissions]` block of
+        // `$XDG_DATA_HOME/ansync/peers/{id}.toml` directly. A re-pair
+        // re-applies these defaults.
         Self {
             screen_mirror: true,
             camera_video: false,

@@ -1,18 +1,18 @@
-//! Per-device permission storage and enforcement.
+//! Per-device permission trait surface and helpers.
 //!
-//! Persisted as `$XDG_CONFIG_HOME/ansync/devices/{device_id}.toml`. The
-//! daemon must check the relevant flag before *every* capability-bound
-//! action; downstream crates surface `Error::PermissionDenied(Permission)`
-//! when the check fails.
+//! The on-disk storage is owned by the daemon (`daemon-core::perms_backend`)
+//! and lives next to the rest of the per-peer state in
+//! `~/.local/share/ansync/peers/{id}.toml`. The daemon must check the
+//! relevant flag before *every* capability-bound action; downstream
+//! crates surface `Error::PermissionDenied(Permission)` when the check
+//! fails.
 
 use ansync_core::{DeviceId, DevicePermissions, Permission};
 use async_trait::async_trait;
 
 pub mod store;
 
-pub use store::{
-    FilePermissionsStore, apply_permission, parse_permission, permission_name, permission_value,
-};
+pub use store::{apply_permission, parse_permission, permission_name, permission_value};
 
 #[derive(Debug, thiserror::Error)]
 pub enum PermissionsError {

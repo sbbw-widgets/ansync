@@ -27,7 +27,7 @@ use ansync_files::{
 };
 use ansync_input::{InputDeviceFactory, InputSession, UinputFactory};
 use ansync_pairing::PeerStore;
-use ansync_permissions::FilePermissionsStore;
+use perms_backend::PeerStorePermissions;
 use ansync_proto::{
     AudioDirection, AudioStreamInit, CameraConfig, ClipboardMessage, ControlMessage, Envelope,
     Hello, InputMessage, Message, NotificationMessage, PROTOCOL_VERSION, UrlMessage,
@@ -40,6 +40,7 @@ use ansync_transport::{
 use ansync_video::{DecodedFrame, HostDecoder, PixelFormat, VideoCodec, VideoDecoder};
 
 mod mirror_subprocess;
+mod perms_backend;
 use mirror_subprocess::spawn_mirror_subprocess;
 use directories::{BaseDirs, UserDirs};
 use tokio::signal::unix::{SignalKind, signal};
@@ -84,11 +85,10 @@ pub struct DaemonConfig {
     /// `$XDG_DATA_HOME/ansync/identity.key`.
     pub identity_path: Option<PathBuf>,
     /// Override the peers directory. Defaults to
-    /// `$XDG_DATA_HOME/ansync/peers/`.
+    /// `$XDG_DATA_HOME/ansync/peers/`. Per-device permissions live in
+    /// the same toml as the peer record — there is no separate
+    /// permissions tree to override.
     pub peers_dir: Option<PathBuf>,
-    /// Override the per-device permissions directory. Defaults to
-    /// `$XDG_CONFIG_HOME/ansync/devices/`.
-    pub permissions_dir: Option<PathBuf>,
     /// Address the QUIC server binds to. `0.0.0.0:0` (default) picks
     /// a random unused port — that port is then announced via mDNS
     /// so peers can connect on the LAN.
@@ -113,7 +113,6 @@ impl DaemonConfig {
             device_name,
             identity_path: None,
             peers_dir: None,
-            permissions_dir: None,
             // Fixed default port so cached companion endpoints
             // (PREF_HOST_ADDR) survive daemon restarts. Override
             // with `DaemonConfig.listen_addr` for tests / multi-host.
@@ -157,11 +156,6 @@ impl Daemon {
             .peers_dir
             .clone()
             .unwrap_or(default_data_dir()?.join("peers"));
-        let permissions_dir = self
-            .config
-            .permissions_dir
-            .clone()
-            .unwrap_or(default_config_dir()?.join("devices"));
         let download_dir = self
             .config
             .download_dir
@@ -173,7 +167,7 @@ impl Daemon {
 
         let peers = PeerStore::open(peers_dir)?;
         let permissions: Arc<dyn ansync_permissions::PermissionsStore> =
-            Arc::new(FilePermissionsStore::open(permissions_dir)?);
+            Arc::new(PeerStorePermissions::new(peers.clone()));
 
         let pubkey = identity.public().as_bytes();
         let mdns = MdnsDiscovery::new(pubkey)?;
@@ -214,6 +208,7 @@ impl Daemon {
         let mirrors = Arc::new(MirrorRegistry::default());
         let cameras = Arc::new(CameraRegistry::default());
         let audios = Arc::new(AudioRegistry::default());
+        let inputs = Arc::new(InputRegistry::default());
         let clipboard_sync = ClipboardSync::default();
         let action_handle = tokio::spawn(action_loop(
             action_rx,
@@ -261,6 +256,7 @@ impl Daemon {
             mirrors: mirrors.clone(),
             cameras: cameras.clone(),
             audios: audios.clone(),
+            inputs: inputs.clone(),
             dbus_conn: dbus_conn_arc.clone(),
             device_name: self.config.device_name.clone(),
             capabilities: self.config.capabilities,
@@ -320,6 +316,7 @@ struct AcceptCtx {
     mirrors: Arc<MirrorRegistry>,
     cameras: Arc<CameraRegistry>,
     audios: Arc<AudioRegistry>,
+    inputs: Arc<InputRegistry>,
     dbus_conn: Arc<zbus::Connection>,
     /// Local host's human-readable name (e.g. `gethostname(2)` output).
     /// Sent verbatim on the outbound `StreamKind::Hello` so the peer
@@ -339,6 +336,46 @@ struct AcceptCtx {
     /// Coalesces inbound file completions so multi-share bursts
     /// surface as one notif instead of N stacked entries.
     inbound_coalescer: Arc<InboundCoalescer>,
+}
+
+/// Per-peer [`InputSession`] cache. The session owns the uinput
+/// device handles, so the lifetime of *this* map is the lifetime of
+/// every virtual `/dev/input/eventN` we ever create. Critically the
+/// session is NOT torn down on peer disconnect — keeping the uinput
+/// devices alive across companion reconnects (which can happen as
+/// often as every few seconds when the QUIC keep-alive expires)
+/// avoids the libinput / X11 / Wayland tablet-tool reattach hiccup
+/// that otherwise drops the cursor every cycle and makes apps like
+/// Krita re-acquire the device mid-stroke.
+#[derive(Default)]
+pub struct InputRegistry {
+    entries: StdMutex<HashMap<DeviceId, Arc<Mutex<InputSession>>>>,
+}
+
+impl InputRegistry {
+    /// Get-or-create the input session for `id`. Subsequent reconnects
+    /// from the same peer reuse the existing session and its already-
+    /// created uinput devices.
+    pub fn ensure(
+        &self,
+        id: &DeviceId,
+        name: &DeviceName,
+        permissions: Arc<dyn ansync_permissions::PermissionsStore>,
+        factory: Arc<dyn InputDeviceFactory>,
+    ) -> Arc<Mutex<InputSession>> {
+        let mut entries = self.entries.lock().expect("input registry poisoned");
+        entries
+            .entry(id.clone())
+            .or_insert_with(|| {
+                Arc::new(Mutex::new(InputSession::new(
+                    id.clone(),
+                    name.clone(),
+                    permissions,
+                    factory,
+                )))
+            })
+            .clone()
+    }
 }
 
 /// Per-peer mirror state. The window itself lives in a subprocess so
@@ -451,6 +488,15 @@ pub struct CameraEntry {
     /// The v4l2loopback sink. Lazily created on the first StartCamera
     /// and reused across reconfigures within the same peer.
     sink: tokio::sync::Mutex<Option<Arc<dyn VirtualCameraSink>>>,
+    /// True once `sink.register()` has run successfully. Persists
+    /// across companion reconnects: every new `camera_decode_loop`
+    /// spawn checks this before calling `register()` again so we
+    /// don't keep dyn-adding `/dev/video<N>` nodes on every cycle
+    /// (which is what makes OBS / browsers see a new device after
+    /// every keep-alive expiry). Cleared by `handle_stop_camera` (the
+    /// explicit D-Bus tear-down path) so a follow-up StartCamera with
+    /// a different format does re-register.
+    sink_registered: std::sync::atomic::AtomicBool,
     /// `Some` while a camera stream is alive. Dropping it stops the
     /// decoder feed loop.
     handle: StdMutex<Option<tokio::task::JoinHandle<()>>>,
@@ -470,6 +516,7 @@ impl CameraRegistry {
                 Arc::new(CameraEntry {
                     peer_name: name.to_string(),
                     sink: tokio::sync::Mutex::new(None),
+                    sink_registered: std::sync::atomic::AtomicBool::new(false),
                     handle: StdMutex::new(None),
                     frame_tx: StdMutex::new(None),
                 })
@@ -825,6 +872,7 @@ async fn accept_loop(ctx: AcceptCtx) {
                 let mirrors = ctx.mirrors.clone();
                 let cameras = ctx.cameras.clone();
                 let audios = ctx.audios.clone();
+                let inputs = ctx.inputs.clone();
                 let dbus_conn = ctx.dbus_conn.clone();
                 let device_name = ctx.device_name.clone();
                 let capabilities = ctx.capabilities;
@@ -842,6 +890,7 @@ async fn accept_loop(ctx: AcceptCtx) {
                         mirrors,
                         cameras,
                         audios,
+                        inputs,
                         dbus_conn,
                         device_name,
                         capabilities,
@@ -873,6 +922,7 @@ async fn handle_connection(
     mirrors: Arc<MirrorRegistry>,
     cameras: Arc<CameraRegistry>,
     audios: Arc<AudioRegistry>,
+    inputs: Arc<InputRegistry>,
     dbus_conn: Arc<zbus::Connection>,
     device_name: String,
     capabilities: Capabilities,
@@ -895,15 +945,19 @@ async fn handle_connection(
         warn!(%peer_id, error = %e, "emit Authenticated state failed");
     }
 
-    // Per-peer InputSession lives behind an Arc<Mutex> so any future
-    // input stream re-opened by the peer (e.g. after a brief
-    // network blip) can re-attach to the same uinput devices.
-    let input_session: Arc<Mutex<InputSession>> = Arc::new(Mutex::new(InputSession::new(
-        peer_id.clone(),
-        peer.name.clone(),
+    // Per-peer InputSession lives in `InputRegistry` for the lifetime
+    // of the daemon — that is, the uinput devices we create on first
+    // input event survive companion reconnects. Without this, every
+    // QUIC keep-alive expiry (~6 s on a flaky network) would tear the
+    // device down and force libinput / Wayland to re-acquire it,
+    // dropping the cursor mid-stroke and confusing apps like Krita
+    // that hold an open fd to the stylus.
+    let input_session = inputs.ensure(
+        &peer_id,
+        &peer.name,
         permissions.clone(),
         factory.clone(),
-    )));
+    );
 
     let conn_arc = Arc::new(conn);
 
@@ -1041,7 +1095,11 @@ async fn handle_connection(
             }
         }
     }
-    input_session.lock().await.shutdown().await;
+    // NOTE: the per-peer InputSession is owned by `InputRegistry` and
+    // intentionally NOT torn down here. Companion reconnects reuse the
+    // same uinput devices so apps holding `/dev/input/eventN` don't see
+    // the device vanish every cycle. The session is dropped (and the
+    // uinput nodes destroyed) only when the daemon itself exits.
     // Only clear the conn slot + emit Disconnected when the conn we
     // just lost is the one currently registered for this peer. When
     // the companion races a redial against our keep-alive (rare but
@@ -1059,8 +1117,14 @@ async fn handle_connection(
     if conn_still_current {
         *mirror_entry.conn.lock().expect("conn slot poisoned") = None;
     }
-    // Camera pipeline is per-action; if it was running, kill its
-    // task and unregister the sink so the v4l2 device is free.
+    // Camera pipeline: the decoder task and the frame_tx pipe are
+    // wired to the now-dead QUIC stream, so tear them down. The
+    // v4l2loopback *sink* itself is intentionally NOT unregistered —
+    // keeping `/dev/video<N>` alive across reconnects means OBS /
+    // Discord / browsers don't lose the device from their picker (and
+    // don't have to re-select it after every keep-alive cycle). The
+    // sink is only released on explicit `StopCamera` (D-Bus) or on
+    // daemon shutdown (Drop chain).
     if let Some(handle) = camera_entry
         .handle
         .lock()
@@ -1070,12 +1134,10 @@ async fn handle_connection(
         handle.abort();
     }
     *camera_entry.frame_tx.lock().expect("frame tx slot poisoned") = None;
-    if let Some(sink) = camera_entry.sink.lock().await.take() {
-        if let Err(e) = sink.unregister().await {
-            warn!(%peer_id, error = %e, "camera sink unregister on disconnect failed");
-        }
-    }
-    // Audio: tear down both directions if the peer drops mid-stream.
+    // Audio: tear down the conn-bound pump / inbound tasks (the QUIC
+    // streams they hold are dead). The CpalSink stays alive for the
+    // same reason as the camera sink — disappearing audio routes
+    // confuse PipeWire's port-watching clients.
     if let Some(h) = audio_entry
         .pump_handle
         .lock()
@@ -1096,7 +1158,6 @@ async fn handle_connection(
         .inbound_tx
         .lock()
         .expect("audio inbound tx poisoned") = None;
-    *audio_entry.sink.lock().await = None;
     if conn_still_current {
         if let Err(e) = Device::emit_state_changed(
             &dbus_conn,
@@ -1306,9 +1367,29 @@ async fn hello_inbound_loop(mut stream: QuicStream, peer_id: DeviceId, peers: Pe
         }
     };
     let new_name = hello.name.0;
+    let new_caps = hello.capabilities;
+    let mut dirty = false;
     if !new_name.is_empty() && stored.name.0 != new_name {
         info!(%peer_id, old = %stored.name, new = %new_name, "peer name refreshed via Hello");
         stored.name = DeviceName(new_name);
+        dirty = true;
+    }
+    // Capabilities only become known post-handshake (the pair flow
+    // happens before the Noise/QUIC tunnel and so cannot exchange
+    // them — every StoredPeer is born with `Capabilities::empty()`).
+    // The Hello frame is the one place we learn what the peer can
+    // serve, so refresh the persisted snapshot here.
+    if stored.capabilities != new_caps {
+        info!(
+            %peer_id,
+            old = ?stored.capabilities,
+            new = ?new_caps,
+            "peer capabilities refreshed via Hello",
+        );
+        stored.capabilities = new_caps;
+        dirty = true;
+    }
+    if dirty {
         if let Err(e) = peers.put(&stored) {
             warn!(%peer_id, error = %e, "PeerStore::put after Hello failed");
         }
@@ -1551,20 +1632,33 @@ async fn handle_start_audio(
             .inbound_tile_kind
             .lock()
             .expect("audio inbound tile slot poisoned") = Some(inbound_tile_kind);
-        let label = format!("ansync-in-{}", entry.peer_name);
-        let format = AudioFormat {
-            sample_rate: 48_000,
-            channels: 2,
-            format: SampleFormat::S16Le,
-        };
-        let sink = match CpalBackend::new().create_sink(&label, format).await {
-            Ok(s) => Arc::new(tokio::sync::Mutex::new(s)),
-            Err(e) => {
-                warn!(%device, error = %e, "open CpalSink failed");
-                return Ok(());
+        // Reuse the existing CpalSink across reconnects / re-Starts
+        // so PipeWire / PulseAudio clients (Discord, browsers, OBS)
+        // keep their "ansync-in-..." selection. Building a new sink
+        // every time creates a fresh device node and apps fall back
+        // to whatever default was active before.
+        let mut sink_guard = entry.sink.lock().await;
+        let sink = match sink_guard.clone() {
+            Some(existing) => existing,
+            None => {
+                let label = format!("ansync-in-{}", entry.peer_name);
+                let format = AudioFormat {
+                    sample_rate: 48_000,
+                    channels: 2,
+                    format: SampleFormat::S16Le,
+                };
+                let built = match CpalBackend::new().create_sink(&label, format).await {
+                    Ok(s) => Arc::new(tokio::sync::Mutex::new(s)),
+                    Err(e) => {
+                        warn!(%device, error = %e, "open CpalSink failed");
+                        return Ok(());
+                    }
+                };
+                *sink_guard = Some(built.clone());
+                built
             }
         };
-        *entry.sink.lock().await = Some(sink.clone());
+        drop(sink_guard);
         let handle = tokio::spawn(audio_render_loop(rx, sink));
         *entry
             .inbound_handle
@@ -1890,6 +1984,12 @@ async fn handle_stop_camera(
             warn!(%device, error = %e, "camera sink unregister failed");
         }
     }
+    // Reset the persisted registration flag so a follow-up StartCamera
+    // (possibly with a different format) re-runs `register()` on the
+    // freshly-built sink instead of skipping it.
+    entry
+        .sink_registered
+        .store(false, std::sync::atomic::Ordering::Release);
     info!(%device, "StopCamera done");
     Ok(())
 }
@@ -1912,9 +2012,13 @@ async fn camera_decode_loop(
             return;
         }
     };
-    // Lazy-register the sink on the first decoded frame so we know the
-    // actual frame dimensions (decoder may re-derive from SPS).
-    let mut sink_registered = false;
+    // Lazy-register the sink on the first decoded frame so we know
+    // the actual frame dimensions (decoder may re-derive from SPS).
+    // The flag lives on `entry` (not in a local) so that subsequent
+    // decoder spawns after a companion reconnect skip the re-register
+    // path and keep writing to the *same* `/dev/video<N>` node — every
+    // call to `sink.register()` dyn-adds a fresh loopback node, which
+    // would yank the device out from under OBS / browsers / Discord.
     while let Some(bytes) = frame_rx.recv().await {
         if let Err(e) = decoder.feed(bytes).await {
             warn!(error = %e, "camera decoder feed failed; continuing");
@@ -1950,7 +2054,10 @@ async fn camera_decode_loop(
                 return;
             }
         };
-        if !sink_registered {
+        if !entry
+            .sink_registered
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
             let fmt = CameraFormat {
                 width: frame.width,
                 height: frame.height,
@@ -1961,7 +2068,9 @@ async fn camera_decode_loop(
                 warn!(error = %e, "camera sink register failed");
                 return;
             }
-            sink_registered = true;
+            entry
+                .sink_registered
+                .store(true, std::sync::atomic::Ordering::Release);
         }
         if let Err(e) = sink.write_frame(packed).await {
             warn!(error = %e, "camera sink write_frame failed");
@@ -2684,12 +2793,6 @@ fn default_download_dir() -> PathBuf {
         return u.home_dir().join("Downloads").join("ansync");
     }
     PathBuf::from("ansync")
-}
-
-fn default_config_dir() -> Result<PathBuf, DaemonError> {
-    BaseDirs::new()
-        .map(|b| b.config_dir().join("ansync"))
-        .ok_or_else(|| DaemonError::Startup("$HOME not set; cannot resolve XDG paths".into()))
 }
 
 /// Enumerate IPv4 addresses on non-loopback / non-docker interfaces.

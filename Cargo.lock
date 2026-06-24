@@ -299,6 +299,7 @@ dependencies = [
  "ansync-proto",
  "ansync-transport",
  "ansync-video",
+ "async-trait",
  "bytes",
  "directories",
  "libc",

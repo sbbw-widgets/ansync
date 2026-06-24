@@ -1,88 +1,12 @@
-//! Toml-backed [`PermissionsStore`] under `$XDG_CONFIG_HOME/ansync/devices/`.
+//! Permission helpers — projection/mutation/parsing utilities for
+//! [`DevicePermissions`].
 //!
-//! Writes are atomic (tmp + rename); reads return [`DevicePermissions`]
-//! defaults when the file is absent so the daemon can treat "never seen"
-//! and "explicitly default" identically.
+//! The on-disk store itself lives in the daemon (backed by the
+//! `PeerStore`'s toml; see `daemon-core::perms_backend`) — this
+//! module is intentionally storage-free so it can be linked into
+//! both the host daemon and the companion JNI bridge.
 
-use std::fs;
-use std::io::ErrorKind;
-use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
-
-use ansync_core::{DeviceId, DevicePermissions, Permission};
-use async_trait::async_trait;
-
-use crate::{PermissionsError, PermissionsStore};
-
-pub struct FilePermissionsStore {
-    root: PathBuf,
-}
-
-impl FilePermissionsStore {
-    pub fn open(root: PathBuf) -> Result<Self, PermissionsError> {
-        if !root.exists() {
-            fs::create_dir_all(&root)?;
-            let mut perms = fs::metadata(&root)?.permissions();
-            perms.set_mode(0o700);
-            let _ = fs::set_permissions(&root, perms);
-        }
-        Ok(Self { root })
-    }
-
-    pub fn root(&self) -> &Path {
-        &self.root
-    }
-
-    fn path_for(&self, id: &DeviceId) -> PathBuf {
-        self.root.join(format!("{id}.toml"))
-    }
-}
-
-#[async_trait]
-impl PermissionsStore for FilePermissionsStore {
-    async fn load(&self, id: &DeviceId) -> Result<DevicePermissions, PermissionsError> {
-        let path = self.path_for(id);
-        match fs::read_to_string(&path) {
-            Ok(s) => toml::from_str(&s).map_err(|e| PermissionsError::TomlDecode(e.to_string())),
-            Err(e) if e.kind() == ErrorKind::NotFound => Ok(DevicePermissions::default()),
-            Err(e) => Err(e.into()),
-        }
-    }
-
-    async fn save(
-        &self,
-        id: &DeviceId,
-        perms: &DevicePermissions,
-    ) -> Result<(), PermissionsError> {
-        let serialized =
-            toml::to_string_pretty(perms).map_err(|e| PermissionsError::TomlEncode(e.to_string()))?;
-        let path = self.path_for(id);
-        let tmp = path.with_extension("toml.tmp");
-        fs::write(&tmp, serialized)?;
-        let mut file_perms = fs::metadata(&tmp)?.permissions();
-        file_perms.set_mode(0o600);
-        let _ = fs::set_permissions(&tmp, file_perms);
-        fs::rename(&tmp, &path)?;
-        Ok(())
-    }
-
-    async fn delete(&self, id: &DeviceId) -> Result<(), PermissionsError> {
-        match fs::remove_file(self.path_for(id)) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e.into()),
-        }
-    }
-
-    async fn check(
-        &self,
-        id: &DeviceId,
-        permission: Permission,
-    ) -> Result<bool, PermissionsError> {
-        let perms = self.load(id).await?;
-        Ok(permission_value(&perms, permission))
-    }
-}
+use ansync_core::{DevicePermissions, Permission};
 
 /// Read the boolean projection of a [`Permission`] from a
 /// [`DevicePermissions`] snapshot.
@@ -146,6 +70,8 @@ pub fn parse_permission(name: &str) -> Option<Permission> {
     })
 }
 
+/// Stable string name for a [`Permission`] — used as the toml key on
+/// disk and the D-Bus property suffix.
 pub fn permission_name(permission: Permission) -> &'static str {
     match permission {
         Permission::ScreenMirror => "screen_mirror",
@@ -162,63 +88,5 @@ pub fn permission_name(permission: Permission) -> &'static str {
         Permission::InputToDevice => "input_to_device",
         Permission::Notifications => "notifications",
         Permission::ShareReceive => "share_receive",
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    fn tempdir() -> PathBuf {
-        let ts = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let dir = std::env::temp_dir().join(format!(
-            "ansync-perm-test-{}-{}",
-            std::process::id(),
-            ts
-        ));
-        fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
-    #[tokio::test]
-    async fn defaults_on_missing_file() {
-        let dir = tempdir();
-        let store = FilePermissionsStore::open(dir.clone()).unwrap();
-        let id = DeviceId([0xAA; 16]);
-        let perms = store.load(&id).await.unwrap();
-        assert!(perms.screen_mirror);
-        assert!(!perms.mic);
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[tokio::test]
-    async fn save_load_roundtrip() {
-        let dir = tempdir();
-        let store = FilePermissionsStore::open(dir.clone()).unwrap();
-        let id = DeviceId([0x55; 16]);
-        let mut perms = DevicePermissions::default();
-        apply_permission(&mut perms, Permission::Mic, true);
-        apply_permission(&mut perms, Permission::ClipboardIn, true);
-        store.save(&id, &perms).await.unwrap();
-
-        let mode = fs::metadata(store.path_for(&id))
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777;
-        assert_eq!(mode, 0o600);
-
-        let loaded = store.load(&id).await.unwrap();
-        assert!(loaded.mic);
-        assert!(loaded.clipboard_in);
-
-        assert!(store.check(&id, Permission::Mic).await.unwrap());
-        assert!(!store.check(&id, Permission::CameraVideo).await.unwrap());
-
-        let _ = fs::remove_dir_all(&dir);
     }
 }
