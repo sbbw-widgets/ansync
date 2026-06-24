@@ -403,8 +403,9 @@ private fun emitTouchpadSlotHistorical(
     canvas: IntSize,
 ) {
     val pointerId = event.getPointerId(idx)
-    val slot = (pointerId and 0xFF).toByte()
-    val trackingId = activeTouchpadTracking[pointerId] ?: return
+    val entry = activeTouchpadTracking[pointerId] ?: return
+    val slot = (entry.first and 0xFF).toByte()
+    val trackingId = entry.second
     val absX = (event.getHistoricalX(idx, historyIdx).coerceIn(0f, canvas.width.toFloat()) *
         TOUCH_ABS_MAX / canvas.width).toInt().coerceIn(0, TOUCH_ABS_MAX)
     val absY = (event.getHistoricalY(idx, historyIdx).coerceIn(0f, canvas.height.toFloat()) *
@@ -422,27 +423,43 @@ private fun emitTouchpadSlotHistorical(
     )
 }
 
-/// Maps Android's reusable `pointerId` to a monotonic tracking_id so
-/// libinput's MT-B "Touch jump" heuristic doesn't kick in when two
-/// consecutive single-finger taps both come in on Android's pointer
-/// id 0. Each new touchdown allocates a fresh id; lift removes the
-/// entry. The counter wraps at 0xFFFF (the kernel max we advertise).
-private val activeTouchpadTracking = HashMap<Int, Int>()
+/// Per-pointer (Android `pointerId`) → (slot, tracking_id) mapping.
+///
+/// libinput's MT-B touchpad pipeline retains per-slot position history
+/// even after the slot's tracking_id transitions to -1, so the next
+/// touch landing in that same slot at a different position is flagged
+/// as a "Touch jump" (firmware-bug heuristic) and discarded. Sequential
+/// single-finger taps would all land in slot 0 if we mapped Android's
+/// reusable `pointerId` straight to a kernel slot — exactly the
+/// pattern that triggers the discard.
+///
+/// We allocate a FRESH slot per touchdown from a FIFO pool: slot 0
+/// goes to the back of the queue on lift, so the next 9 taps land in
+/// slots 1..9 before slot 0 is reused. By then libinput's per-slot
+/// state has aged out.
+private const val TOUCHPAD_SLOT_POOL = 10
+private val freeTouchpadSlots = ArrayDeque<Int>().apply {
+    for (i in 0 until TOUCHPAD_SLOT_POOL) add(i)
+}
+private val activeTouchpadTracking = HashMap<Int, Pair<Int, Int>>()  // pointerId → (slot, trackingId)
 private var nextTouchpadTrackingId = 0
 
 private fun emitTouchpadSlot(event: MotionEvent, idx: Int, canvas: IntSize, lifted: Boolean) {
     val pointerId = event.getPointerId(idx)
-    val slot = (pointerId and 0xFF).toByte()
-    val trackingId: Int = if (lifted) {
-        activeTouchpadTracking.remove(pointerId)
-        -1
+    val entry: Pair<Int, Int> = if (lifted) {
+        val released = activeTouchpadTracking.remove(pointerId) ?: return
+        freeTouchpadSlots.addLast(released.first)
+        Pair(released.first, -1)
     } else {
         activeTouchpadTracking.getOrPut(pointerId) {
+            val slotAssigned = freeTouchpadSlots.removeFirstOrNull() ?: return
             val tid = nextTouchpadTrackingId
             nextTouchpadTrackingId = (nextTouchpadTrackingId + 1) and 0xFFFF
-            tid
+            Pair(slotAssigned, tid)
         }
     }
+    val slot = (entry.first and 0xFF).toByte()
+    val trackingId = entry.second
     val absX = (event.getX(idx).coerceIn(0f, canvas.width.toFloat()) *
         TOUCH_ABS_MAX / canvas.width).toInt().coerceIn(0, TOUCH_ABS_MAX)
     val absY = (event.getY(idx).coerceIn(0f, canvas.height.toFloat()) *
