@@ -1005,9 +1005,11 @@ async fn handle_connection(
         }
     }
 
+    let input_rx_counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let stats_handle = tokio::spawn(stats_telemetry_loop(
         conn_arc.clone(),
         peer_id.clone(),
+        input_rx_counter.clone(),
     ));
 
     loop {
@@ -1022,7 +1024,8 @@ async fn handle_connection(
         match kind {
             StreamKind::Input => {
                 let session = input_session.clone();
-                tokio::spawn(input_stream_loop(stream, session));
+                let counter = input_rx_counter.clone();
+                tokio::spawn(input_stream_loop(stream, session, counter));
             }
             StreamKind::Files => {
                 let perms = permissions.clone();
@@ -1189,13 +1192,18 @@ async fn handle_connection(
 /// `debug!` so default journald stays quiet; flip on with
 /// `RUST_LOG=ansync_daemon_core=debug` to diagnose packet-loss /
 /// rtt regressions reported as "cursor feels heavy" or "Conn cycle".
-async fn stats_telemetry_loop(conn: Arc<QuicConnection>, peer_id: DeviceId) {
+async fn stats_telemetry_loop(
+    conn: Arc<QuicConnection>,
+    peer_id: DeviceId,
+    input_rx_counter: Arc<std::sync::atomic::AtomicU64>,
+) {
     let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
     // Skip the very first tick (fires immediately) — first useful
     // sample needs at least one keep-alive RTT.
     tick.tick().await;
     let mut prev_sent: u64 = 0;
     let mut prev_lost: u64 = 0;
+    let mut prev_input: u64 = 0;
     loop {
         tick.tick().await;
         let s = conn.stats();
@@ -1210,6 +1218,9 @@ async fn stats_telemetry_loop(conn: Arc<QuicConnection>, peer_id: DeviceId) {
         } else {
             (dlost as f64 / dsent as f64) * 100.0
         };
+        let input_total = input_rx_counter.load(std::sync::atomic::Ordering::Relaxed);
+        let dinput = input_total.saturating_sub(prev_input);
+        prev_input = input_total;
         debug!(
             %peer_id,
             rtt_ms = conn.rtt().as_millis() as u64,
@@ -1218,6 +1229,7 @@ async fn stats_telemetry_loop(conn: Arc<QuicConnection>, peer_id: DeviceId) {
             loss_pct = format!("{loss_pct:.2}"),
             cwnd = s.path.cwnd,
             black_holes = s.path.black_holes_detected,
+            input_rx = dinput,
             "quic stats"
         );
     }
@@ -2795,7 +2807,11 @@ fn spawn_share_notif(peer_name: &str, summary: &str, body: &str) {
     });
 }
 
-async fn input_stream_loop(mut stream: QuicStream, session: Arc<Mutex<InputSession>>) {
+async fn input_stream_loop(
+    mut stream: QuicStream,
+    session: Arc<Mutex<InputSession>>,
+    rx_counter: Arc<std::sync::atomic::AtomicU64>,
+) {
     loop {
         let bytes = match stream.recv().await {
             Ok(b) => b,
@@ -2805,6 +2821,7 @@ async fn input_stream_loop(mut stream: QuicStream, session: Arc<Mutex<InputSessi
                 break;
             }
         };
+        rx_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let msg: InputMessage = match postcard::from_bytes(&bytes) {
             Ok(m) => m,
             Err(e) => {

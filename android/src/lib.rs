@@ -24,6 +24,13 @@ use std::sync::{Mutex, OnceLock};
 /// network transition.
 static CONNECTED: AtomicBool = AtomicBool::new(false);
 
+/// Outbound InputMessage counter. Bumped per successful
+/// `nativeSendInputMessage` send; sampled (delta) by
+/// `stats_telemetry_loop` and logged so we can cross-check against the
+/// daemon-side `input_rx` field. Mismatch == packet loss / decode
+/// failure on the wire.
+static INPUT_TX_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn mark_connected(state: bool) {
     CONNECTED.store(state, Ordering::Relaxed);
 }
@@ -624,6 +631,7 @@ async fn stats_telemetry_loop(conn: std::sync::Weak<QuicConnection>) {
     tick.tick().await;
     let mut prev_sent: u64 = 0;
     let mut prev_lost: u64 = 0;
+    let mut prev_input: u64 = 0;
     loop {
         tick.tick().await;
         let Some(conn) = conn.upgrade() else {
@@ -641,14 +649,18 @@ async fn stats_telemetry_loop(conn: std::sync::Weak<QuicConnection>) {
         } else {
             (dlost as f64 / dsent as f64) * 100.0
         };
+        let input_total = INPUT_TX_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+        let dinput = input_total.saturating_sub(prev_input);
+        prev_input = input_total;
         debug!(
-            "quic stats: rtt={}ms sent={} lost={} loss={:.2}% cwnd={} black_holes={}",
+            "quic stats: rtt={}ms sent={} lost={} loss={:.2}% cwnd={} black_holes={} input_tx={}",
             conn.rtt().as_millis() as u64,
             dsent,
             dlost,
             loss_pct,
             s.path.cwnd,
             s.path.black_holes_detected,
+            dinput,
         );
     }
 }
@@ -1433,7 +1445,10 @@ pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativeSendInputMessa
             .await
     });
     match result {
-        Ok(()) => jni::sys::JNI_TRUE,
+        Ok(()) => {
+            INPUT_TX_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            jni::sys::JNI_TRUE
+        }
         Err(e) => {
             warn!("nativeSendInputMessage: send failed: {e}");
             jni::sys::JNI_FALSE
