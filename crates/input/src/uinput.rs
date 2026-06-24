@@ -545,14 +545,23 @@ impl VirtualInputDevice for Touchpad {
         // without these props (falls back to "generic touchscreen").
         handle.set_propbit(InputProperty::Pointer)?;
         handle.set_propbit(InputProperty::ButtonPad)?;
+        // Resolution = 500 units/mm gives a reported device size of
+        // ~65 mm × 65 mm (close to a small MacBook trackpad). The
+        // previous 100 units/mm advertised a 328 mm "touchpad", which
+        // makes every per-frame finger delta look like a 20-30 mm
+        // jump in libinput's world — `kernel bug: Touch jump detected
+        // and discarded` fires and libinput drops the events. Higher
+        // resolution shrinks the mm-per-ABS-unit ratio so realistic
+        // finger speeds stay below libinput's jump heuristic
+        // (currently ~20 mm/event).
         let abs_setup = [
-            abs_res(AbsoluteAxis::X, 0, ABS_MAX, 100),
-            abs_res(AbsoluteAxis::Y, 0, ABS_MAX, 100),
+            abs_res(AbsoluteAxis::X, 0, ABS_MAX, 500),
+            abs_res(AbsoluteAxis::Y, 0, ABS_MAX, 500),
             abs(AbsoluteAxis::Pressure, 0, 255),
             abs(AbsoluteAxis::MultitouchSlot, 0, MT_SLOTS - 1),
             abs(AbsoluteAxis::MultitouchTrackingId, 0, 0xFFFF),
-            abs_res(AbsoluteAxis::MultitouchPositionX, 0, ABS_MAX, 100),
-            abs_res(AbsoluteAxis::MultitouchPositionY, 0, ABS_MAX, 100),
+            abs_res(AbsoluteAxis::MultitouchPositionX, 0, ABS_MAX, 500),
+            abs_res(AbsoluteAxis::MultitouchPositionY, 0, ABS_MAX, 500),
             abs(AbsoluteAxis::MultitouchPressure, 0, 255),
         ];
         let full_name = format!("{name} Touchpad");
