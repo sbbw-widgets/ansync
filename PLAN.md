@@ -667,18 +667,26 @@ Entregables del lado ansync:
   - Fix: bajar `TOUCHPAD_RES` 500→200 units/mm (touchpad reportado 65mm→163mm, Magic Trackpad-ish, cursor más rápido sin compositor accel) + intra-touch delta clamp 5mm vs `last_pos[slot]` HashMap. **Touchdown va RAW** (sin clamp) para que libinput tome ese POSITION como anchor del nuevo touch sin POINTER_MOTION espurio (arrastre desde último touch).
   - TouchMajor/Minor recalc a `8 * TOUCHPAD_RES` = 1600 (era 4000 hardcoded para res 500).
 
-### Pendiente — sensación intermitente "cursor pesado" (sesión próxima)
+### Telemetría / clasificación de errores (sesión 2026-06-24)
 
-Síntoma: cursor fluido, de la nada se siente "duro" / mueve poco mientras dedo sigue normal en tablet. Hipótesis fuerte: **packet loss companion ↔ host** dispara nuestro clamp 5mm cuando sample N+1 perdido + sample N+2 trae delta grande → libinput recibe POSITION clampeado que arrastra cursor lento varios frames.
+- **Sidecar `stats_telemetry_loop`** (`f1ee08c`) per-peer en daemon (`crates/daemon-core/src/lib.rs`) + companion (`android/src/lib.rs`). Cada 5s loguea `rtt_ms / sent / lost / loss_pct / cwnd / black_holes` desde `QuicConnection::stats()` (accessor agregado en `crates/transport/src/quic.rs`). Gate `RUST_LOG=ansync_daemon_core=debug,ansync_companion_native=debug`. Auto-cancelado: daemon via `JoinHandle::abort()` al fin de `handle_connection`; companion via `Weak<QuicConnection>::upgrade()` (Arc count==0 ⇒ session muerta).
+- **Counter `input_rx/tx`** (`d3e4ec6`) `AtomicU64` per-peer en daemon + global en companion. Cross-check perfecto en sesión real (sent ↔ rx 1:1, dentro del periodo).
+- **`map_conn_err` + `From<FrameError>` reclassificación** (`2de84fe`):
+  - `ConnectionClosed | LocallyClosed | ApplicationClosed | Reset` → `TransportError::Closed`.
+  - `TimedOut` → variante nueva `TransportError::TimedOut`.
+  - IO `UnexpectedEof | BrokenPipe | ConnectionReset | ConnectionAborted` → `Closed`.
+  - 12 sitios `*_inbound_loop` / `streams_accept_loop` (daemon + companion) absorben `TimedOut` con misma rama de `Closed` → fuera el warn floor (`early eof`, `connection lost`, `Conn cycle 3s`).
 
-Diagnóstico planificado para próxima sesión (combinado con bug "Conn cycle 3s" — pueden ser misma causa):
+### "Cursor pesado" — cerrado (sesión 2026-06-24)
 
-- Log timestamps + counter de `TouchpadSlot` emitidos en companion (`android/src/lib.rs::nativeSendInputMessage`) vs recibidos en daemon (`input_stream_loop`). Diferencia = loss real.
-- `quinn::Connection::stats()` per peer: `path.lost_packets`, `path.sent_packets`, `frame.retx`. Si loss > 1% → wifi / mDNS issue.
-- Si loss real bajo (< 0.5%) → clamp es muy agresivo. Subir a 6mm (margen mínimo bajo threshold 7mm) o eliminar clamp intra-touch (solo dejar raw touchdown) — libinput perdería 1 frame ocasional pero recuperaría fluidez.
-- Si loss alto → atacar root cause (probable mismo bug que **Conn cycle 3s** — `streams_accept_loop` muere prematuro).
+Diagnóstico real con telemetría: **loss=0% RTT 7ms** sostenido. Loss descartado. Causa fue el clamp 5mm.
 
-### Otros bugs separados a atacar en la misma sesión próxima
+- **Drop clamp 5mm** (`6ea62c7`). Removía 1-2mm de movimiento por sample en drags rápidos → cursor "pesado". Con Kotlin historical-samples + 0% loss, ya no hacía falta defenderse contra missing samples.
+- **Re-introducción multi-emit subframe** (`88c0bcb`). Drop clamp solo destapó: libinput `Touch jump detected and discarded` 5x por sesión + rate-limit silencioso → tirones visibles. Fix definitivo: clamp 6mm pero, en lugar de soltar el overshoot, `subframe_path` interpola línea recta con steps `<= max_delta`, emitiendo cada sub-frame con `POSITION + PRESSURE + ToolType + Major/Minor + Orientation + BTN_TOUCH + SYN_REPORT` consecutivo. libinput recibe secuencia válida cubriendo distancia exacta. 4 unit tests (`cargo test -p ansync-input --features uinput subframe`).
+- **Discovery filter loopback / IPv6 link-local** (`0995fa4`). `HostDiscovery.onServiceResolved` rechaza `isLoopback || isAnyLocal || isMulticast || (Inet6 && isLinkLocal)`. `HostDialer.tryDirectFallback` parsea IPv6 con bracket, valida via `InetAddress.getByName`, filtra. Ya no perdíamos 4s probando `fe80::…%wlan0`.
+- **ConnGuard race** (`5546e4f`). Dos `streams_accept_loop` simultáneos (viejo + nuevo durante redial) competían por `CONNECTED` atomic. Fix: guard carga `Arc<QuicConnection>`, en drop chequea `Arc::ptr_eq` contra `state_slot().session.conn`. Solo flippea si sigue siendo current → notif "Looking..." ya no aparece con session viva.
+- **Outbound input dead-stream** (`5546e4f`). `nativeSendInputMessage` ahora clarea `*guard = None` si `send` falla → next call reabre Input stream sobre mismo conn. Antes: 1 transient send fail ⇒ todos los siguientes muertos contra stream zombi.
 
-- **Conn cycle 3s** companion: `HostDialer.livenessProbe` cada 3s redial cuando `nativeIsConnected()` devuelve false. `ConnGuard::drop` en `streams_accept_loop` (`android/src/lib.rs`) marca CONNECTED=false al primer error. Necesita logcat con `RUST_LOG=ansync_companion_native=trace`. Hipótesis: QUIC stream close prematuro o panic en spawned task. Relacionado con packet loss.
-- **Logs noisy** daemon: `video recv error: connection lost` debería ser `debug!` cuando es graceful close, no `warn!`.
+### "Cursor chill se endura" (slow-finger sticky) — cerrado
+
+Síntoma residual reportado en mid-session: cursor fluido pero se "endurece" en moves lentísimos. Hipótesis principal: libinput `accel-profile=adaptive` aplica multiplier <1.0 a velocidades bajas (precision mode by design). Fix compositor-side: `gsettings set org.gnome.desktop.peripherals.touchpad accel-profile 'flat'` (GNOME), `accel_profile flat` en sway/wayfire/hyprland config, KDE Settings → Mouse → Pointer acceleration = None. No requiere cambios en ansync.
