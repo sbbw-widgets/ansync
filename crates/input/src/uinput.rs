@@ -492,6 +492,12 @@ impl VirtualInputDevice for Touchscreen {
 pub struct Touchpad {
     handle: Option<UInputHandle<File>>,
     active_slot: i32,
+    // Last POSITION emitted per active slot. Lets `send()` interpolate
+    // straight-line intermediate POSITIONs whenever the host-side
+    // gap between two consecutive samples would exceed libinput's
+    // ~7mm jump filter — without losing any of the user's actual
+    // motion. See the comment in `send()` for the full rationale.
+    last_pos: std::collections::HashMap<i32, (i32, i32)>,
 }
 
 impl Touchpad {
@@ -499,6 +505,7 @@ impl Touchpad {
         Self {
             handle: None,
             active_slot: -1,
+            last_pos: std::collections::HashMap::new(),
         }
     }
 }
@@ -511,6 +518,16 @@ impl Touchpad {
 // `accel-speed` to get a snappy pointer). The previous 500 units/mm
 // reported a tiny ~65mm pad, which capped peak cursor velocity.
 const TOUCHPAD_RES: i32 = 200;
+
+// Per-sub-frame delta cap in millimetres. libinput's touchpad jump
+// filter discards POSITION updates that move further than ~7mm
+// between SYN_REPORTs (firmware-bug guard). 6mm leaves a safety
+// margin against axis quantisation. When the actual inter-sample
+// motion exceeds this we split the move into several sub-frames in
+// `send()` (see "multi-emit") so libinput sees a sequence of small
+// moves that cover the same total distance — no clamp-induced lag,
+// no discarded frames.
+const TOUCHPAD_SUBFRAME_MM: i32 = 6;
 
 impl Default for Touchpad {
     fn default() -> Self {
@@ -624,52 +641,71 @@ impl VirtualInputDevice for Touchpad {
                     tracking_id,
                 ));
                 if tracking_id >= 0 {
-                    // Emit POSITION raw — Kotlin already splits each
-                    // MotionEvent into its historical sub-samples
-                    // (~8ms apart) before forwarding, and measured
-                    // packet loss is 0% on LAN, so consecutive samples
-                    // are always close enough to stay under libinput's
-                    // 7mm jump filter. A previous intra-touch clamp
-                    // (5mm) was eating distance on fast drags and made
-                    // the cursor feel like it was tugging — drop it.
-                    events.push(raw(
-                        EventKind::Absolute,
-                        AbsoluteAxis::MultitouchPositionX as u16,
-                        x,
-                    ));
-                    events.push(raw(
-                        EventKind::Absolute,
-                        AbsoluteAxis::MultitouchPositionY as u16,
-                        y,
-                    ));
-                    events.push(raw(
-                        EventKind::Absolute,
-                        AbsoluteAxis::MultitouchPressure as u16,
-                        pressure as i32,
-                    ));
-                    events.push(raw(
-                        EventKind::Absolute,
-                        AbsoluteAxis::MultitouchToolType as u16,
-                        0, // MT_TOOL_FINGER
-                    ));
+                    // Multi-emit: clamp wasn't enough alone (it lost
+                    // distance on fast drags → drag-lag) and zero-clamp
+                    // wasn't enough either (libinput's 7mm jump filter
+                    // discarded frames → tirones). We now keep the
+                    // clamp threshold (6mm) but, instead of dropping
+                    // overshoot, we split the move into straight-line
+                    // sub-frames each <= the threshold and emit them
+                    // back-to-back with SYN_REPORTs in between. libinput
+                    // sees a sequence of valid small moves covering
+                    // the exact same total distance as the input — no
+                    // discards, no missing motion.
+                    //
+                    // Touchdown (no prior position for this slot) emits
+                    // a single POSITION so libinput pairs it with the
+                    // new MT_TRACKING_ID as the contact's anchor.
+                    let prev = self.last_pos.get(&slot_i).copied();
+                    let max_delta = TOUCHPAD_RES * TOUCHPAD_SUBFRAME_MM;
                     let major = 8 * TOUCHPAD_RES;
-                    events.push(raw(
-                        EventKind::Absolute,
-                        AbsoluteAxis::MultitouchTouchMajor as u16,
-                        major,
-                    ));
-                    events.push(raw(
-                        EventKind::Absolute,
-                        AbsoluteAxis::MultitouchTouchMinor as u16,
-                        major,
-                    ));
-                    events.push(raw(
-                        EventKind::Absolute,
-                        AbsoluteAxis::MultitouchOrientation as u16,
-                        0,
-                    ));
-                    events.push(raw(EventKind::Key, Key::ButtonTouch as u16, 1));
+                    let path = subframe_path(prev, (x, y), max_delta);
+                    let mut first = true;
+                    for (px, py) in path {
+                        if !first {
+                            events.push(syn_report());
+                        }
+                        first = false;
+                        events.push(raw(
+                            EventKind::Absolute,
+                            AbsoluteAxis::MultitouchPositionX as u16,
+                            px,
+                        ));
+                        events.push(raw(
+                            EventKind::Absolute,
+                            AbsoluteAxis::MultitouchPositionY as u16,
+                            py,
+                        ));
+                        events.push(raw(
+                            EventKind::Absolute,
+                            AbsoluteAxis::MultitouchPressure as u16,
+                            pressure as i32,
+                        ));
+                        events.push(raw(
+                            EventKind::Absolute,
+                            AbsoluteAxis::MultitouchToolType as u16,
+                            0, // MT_TOOL_FINGER
+                        ));
+                        events.push(raw(
+                            EventKind::Absolute,
+                            AbsoluteAxis::MultitouchTouchMajor as u16,
+                            major,
+                        ));
+                        events.push(raw(
+                            EventKind::Absolute,
+                            AbsoluteAxis::MultitouchTouchMinor as u16,
+                            major,
+                        ));
+                        events.push(raw(
+                            EventKind::Absolute,
+                            AbsoluteAxis::MultitouchOrientation as u16,
+                            0,
+                        ));
+                        events.push(raw(EventKind::Key, Key::ButtonTouch as u16, 1));
+                    }
+                    self.last_pos.insert(slot_i, (x, y));
                 } else {
+                    self.last_pos.remove(&slot_i);
                     events.push(raw(EventKind::Key, Key::ButtonTouch as u16, 0));
                 }
                 events.push(syn_report());
@@ -685,6 +721,80 @@ impl VirtualInputDevice for Touchpad {
             h.dev_destroy()?;
         }
         Ok(())
+    }
+}
+
+/// Straight-line interpolation between `prev` and `target` such that
+/// no consecutive pair of points differs by more than `max_delta` on
+/// either axis. The last point is always exactly `target` so motion
+/// is preserved end-to-end.
+///
+/// Touchdown (`prev == None`) returns a single point so libinput
+/// anchors the new contact at `target` without interpolating from the
+/// previous touch's last location.
+fn subframe_path(
+    prev: Option<(i32, i32)>,
+    target: (i32, i32),
+    max_delta: i32,
+) -> Vec<(i32, i32)> {
+    let (x, y) = target;
+    let (px, py) = match prev {
+        Some(p) => p,
+        None => return vec![(x, y)],
+    };
+    let dx = x - px;
+    let dy = y - py;
+    let span = dx.abs().max(dy.abs());
+    if span <= max_delta {
+        return vec![(x, y)];
+    }
+    let steps = (span + max_delta - 1) / max_delta;
+    let mut out = Vec::with_capacity(steps as usize);
+    for i in 1..steps {
+        // Half-step rounding so the sequence approximates a true
+        // straight line in integer space.
+        let sx = px + (dx * i + steps / 2) / steps;
+        let sy = py + (dy * i + steps / 2) / steps;
+        out.push((sx, sy));
+    }
+    out.push((x, y));
+    out
+}
+
+#[cfg(test)]
+mod subframe_tests {
+    use super::subframe_path;
+
+    #[test]
+    fn touchdown_emits_single_point() {
+        assert_eq!(subframe_path(None, (1000, 2000), 1200), vec![(1000, 2000)]);
+    }
+
+    #[test]
+    fn small_move_emits_single_point() {
+        // delta 500 < cap 1200 → no split.
+        let path = subframe_path(Some((0, 0)), (500, 100), 1200);
+        assert_eq!(path, vec![(500, 100)]);
+    }
+
+    #[test]
+    fn large_horizontal_move_splits_into_subframes() {
+        // dx = 3600, cap = 1200 → 3 sub-frames.
+        let path = subframe_path(Some((0, 0)), (3600, 0), 1200);
+        assert_eq!(path, vec![(1200, 0), (2400, 0), (3600, 0)]);
+    }
+
+    #[test]
+    fn final_point_always_equals_target() {
+        let path = subframe_path(Some((100, 100)), (10_000, -5_000), 1000);
+        assert_eq!(path.last(), Some(&(10_000, -5_000)));
+        // Every step within cap.
+        let mut prev = (100, 100);
+        for p in path {
+            assert!(((p.0 - prev.0).abs()) <= 1000);
+            assert!(((p.1 - prev.1).abs()) <= 1000);
+            prev = p;
+        }
     }
 }
 
