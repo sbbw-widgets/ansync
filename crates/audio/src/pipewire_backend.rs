@@ -264,20 +264,38 @@ fn run_virtual_sink(
     let context = pw::context::Context::new(&mainloop)?;
     let core = context.connect(None)?;
 
+    // Magic prop combo to make a Playback stream appear in app
+    // device pickers as a virtual audio source (= virtual mic):
+    //   * `media.class = Audio/Source/Virtual` registers the node as
+    //     a Source, not a Stream/Output/Audio (which apps ignore for
+    //     mic pickers).
+    //   * `node.virtual = true` tells wireplumber not to expect a
+    //     hardware device backing it.
+    //   * `audio.position = [FL,FR]` pins the stereo layout so apps
+    //     don't see "unknown" channels.
+    // Discord, OBS, Firefox / Chromium all honor these props through
+    // the standard PipeWire/Pulse compat layer.
     let props = pw::properties::properties! {
         *pw::keys::MEDIA_TYPE => "Audio",
         *pw::keys::MEDIA_CATEGORY => "Playback",
         *pw::keys::MEDIA_ROLE => "Communication",
+        *pw::keys::MEDIA_CLASS => "Audio/Source/Virtual",
         *pw::keys::NODE_NAME => node_name.clone(),
         *pw::keys::NODE_DESCRIPTION => description.clone(),
+        *pw::keys::NODE_VIRTUAL => "true",
+        "audio.position" => "FL,FR",
         *pw::keys::APP_NAME => "ansync",
     };
 
     let stream = pw::stream::Stream::new(&core, &label, props)?;
     let ring_cb = ring.clone();
+    let label_state = label.clone();
 
     let _listener = stream
         .add_local_listener_with_user_data::<()>(())
+        .state_changed(move |_, _, old, new| {
+            info!(label = %label_state, ?old, ?new, "pipewire virtual sink state");
+        })
         .process(move |stream, _| {
             let mut buffer = match stream.dequeue_buffer() {
                 Some(b) => b,
