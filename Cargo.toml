@@ -113,6 +113,14 @@ cpal = "0.15"
 # mic (32 kbps + FEC on), OpusAudio for PC audio (128 kbps).
 audiopus = "0.3.0-rc.0"
 
+# PipeWire backend (Step 18c). Uses the libpipewire bindings from the
+# upstream pipewire-rs project — no subprocess, all client-side via
+# FFI. libpipewire / libspa come from the system; pkg-config locates
+# them. nixpkgs ships them via the `pipewire` package already in the
+# dev shell's runtimeDeps.
+pipewire = "0.10"
+libspa = "0.10"
+
 # Camera (consumed in Step 10)
 v4l = "0.14"
 libc = "0.2"
