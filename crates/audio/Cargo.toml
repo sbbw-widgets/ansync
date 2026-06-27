@@ -17,12 +17,19 @@ tokio = { workspace = true, features = ["sync"] }
 tracing.workspace = true
 
 cpal = { workspace = true, optional = true }
-audiopus = { workspace = true, optional = true }
+opus-rs = { workspace = true, optional = true }
 pipewire = { workspace = true, optional = true }
 libspa = { workspace = true, optional = true }
 
 [features]
-default = ["opus", "cpal-backend", "pipewire-backend"]
+# `pipewire-backend` is OFF by default — bindgen's
+# `clang_macro_fallback` (libspa-sys 0.10.0) silently drops
+# `SPA_ID_INVALID` inside the nix sandbox, breaking the deps build
+# even with `BINDGEN_EXTRA_CLANG_ARGS` pointing at the clang resource
+# dir. The dev-shell path works (cargo build --features
+# pipewire-backend), and the daemon-core consumer turns it on
+# explicitly. Drop this opt-out once libspa-sys ships a fix.
+default = ["opus", "cpal-backend"]
 cpal-backend = ["dep:cpal"]
-opus = ["dep:audiopus"]
+opus = ["dep:opus-rs"]
 pipewire-backend = ["dep:pipewire", "dep:libspa"]

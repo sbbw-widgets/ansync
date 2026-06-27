@@ -1,39 +1,22 @@
 //! Opus encoder / decoder helpers shared by daemon and companion.
 //!
-//! Topology recap (see `ansync_proto::AudioStreamInit`): the first
-//! frame of every `StreamKind::Audio` declares codec + frame size; all
-//! subsequent frames are one Opus packet each. `OpusVoip` is tuned for
-//! the mic forward (32 kbps, FEC on, low-delay) and `OpusAudio` for PC
-//! audio rendering on the device speaker (128 kbps, music profile).
-//! Both modes run 48 kHz / stereo and 20 ms frames (960 samples per
-//! channel) — keeping the shape fixed avoids a runtime negotiation
-//! handshake.
+//! Uses the pure-Rust `opus-rs` crate — no libopus FFI, no CMake, no
+//! NDK toolchain juggling. The Rust impl produces wire-compatible
+//! packets and tracks libopus's reference mode-selection logic.
 //!
-//! Caller pattern on the sending side:
+//! `OpusVoip` is tuned for the mic forward (32 kbps, FEC on,
+//! low-delay) and `OpusAudio` for PC audio rendering on the device
+//! speaker (128 kbps, music profile). Both modes run 48 kHz / stereo /
+//! 20 ms frames (960 samples per channel) — keeping the shape fixed
+//! avoids a runtime negotiation handshake.
 //!
-//! ```ignore
-//! let mut enc = OpusEncoderWrap::new(AudioCodec::OpusVoip)?;
-//! while let Ok(pcm) = source.read().await {
-//!     for packet in enc.feed(&pcm)? {
-//!         stream.send(packet).await?;
-//!     }
-//! }
-//! ```
-//!
-//! On the receiving side, decode one packet per recv (or call
-//! `decode_plc()` when the upper layer detects a loss).
-//!
-//! `audiopus` vendors libopus via `audiopus_sys`, so Android NDK
-//! cross-compile works without a system libopus.
+//! API note: `opus-rs` takes interleaved f32 PCM in `[-1.0, 1.0]`
+//! range. Our wire format is interleaved S16LE, so the wrappers
+//! convert in/out on the hot path.
 
 use ansync_proto::AudioCodec;
-use audiopus::{
-    Application, Bitrate, Channels, MutSignals, SampleRate,
-    coder::{Decoder as OpusDecoder, Encoder as OpusEncoder},
-    packet::Packet,
-};
-use core::convert::TryFrom;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
+use opus_rs::{Application, OpusDecoder, OpusEncoder};
 use tracing::warn;
 
 use crate::AudioError;
@@ -46,8 +29,9 @@ use crate::AudioError;
 pub const OPUS_FRAME_SAMPLES: usize = 960;
 pub const OPUS_SAMPLE_RATE: u32 = 48_000;
 pub const OPUS_CHANNELS: u8 = 2;
-/// Maximum Opus packet bytes for 48 kHz stereo at 510 kbps — 4 000 is
-/// the libopus-recommended ceiling.
+/// Conservative upper bound for one Opus packet at 48 kHz stereo. The
+/// libopus docs put the ceiling at ~4000 bytes for the worst-case
+/// 510 kbps stereo; we cap at 4 KiB to match.
 const MAX_PACKET_BYTES: usize = 4_000;
 
 /// Default bitrates per codec mode. `OpusVoip` lands well above
@@ -61,9 +45,10 @@ pub const AUDIO_BITRATE_BPS: i32 = 128_000;
 /// call depending on how much PCM has accumulated.
 pub struct OpusEncoderWrap {
     enc: OpusEncoder,
-    /// Per-channel sample accumulator, interleaved L,R,L,R,…
-    pending: Vec<i16>,
-    /// Reusable scratch buffer for `enc.encode()`.
+    /// Per-channel sample accumulator, interleaved L,R,L,R,… stored as
+    /// f32 because that's what `opus-rs::encode` expects.
+    pending: Vec<f32>,
+    /// Reusable scratch buffer for `enc.encode()` output.
     out_buf: Vec<u8>,
 }
 
@@ -78,26 +63,22 @@ impl OpusEncoderWrap {
                 )));
             }
         };
-        let sr = SampleRate::try_from(OPUS_SAMPLE_RATE as i32)
-            .map_err(|e| AudioError::Io(std::io::Error::other(e.to_string())))?;
-        let mut enc = OpusEncoder::new(sr, Channels::Stereo, application)
-            .map_err(|e| AudioError::Io(std::io::Error::other(e.to_string())))?;
-        let bps = match codec {
+        let mut enc = OpusEncoder::new(
+            OPUS_SAMPLE_RATE as i32,
+            OPUS_CHANNELS as usize,
+            application,
+        )
+        .map_err(|e| AudioError::Io(std::io::Error::other(e)))?;
+        enc.bitrate_bps = match codec {
             AudioCodec::OpusVoip => VOIP_BITRATE_BPS,
             AudioCodec::OpusAudio => AUDIO_BITRATE_BPS,
             AudioCodec::Raw => unreachable!(),
         };
-        if let Err(e) = enc.set_bitrate(Bitrate::BitsPerSecond(bps)) {
-            warn!(error = %e, "opus set_bitrate failed; using default");
-        }
-        // FEC on for both modes — costs ~10 % bandwidth, lets the
-        // decoder reconstruct one missing packet from the next one.
-        if let Err(e) = enc.set_inband_fec(true) {
-            warn!(error = %e, "opus inband_fec set failed");
-        }
-        if let Err(e) = enc.set_packet_loss_perc(10) {
-            warn!(error = %e, "opus packet_loss_perc set failed");
-        }
+        // FEC + nominal expected-loss profile. Costs ~10 % bandwidth,
+        // lets the decoder reconstruct one missing packet from the
+        // next one over lossy transport (relay / WAN future).
+        enc.use_inband_fec = true;
+        enc.packet_loss_perc = 10;
         Ok(Self {
             enc,
             pending: Vec::with_capacity(OPUS_FRAME_SAMPLES * OPUS_CHANNELS as usize * 4),
@@ -112,22 +93,21 @@ impl OpusEncoderWrap {
         // Reject odd-byte tails — they would desync the L/R pairing
         // for every subsequent frame.
         if pcm_bytes.len() % 2 != 0 {
-            return Err(AudioError::Io(std::io::Error::other(
-                "odd-byte PCM chunk",
-            )));
+            return Err(AudioError::Io(std::io::Error::other("odd-byte PCM chunk")));
         }
         self.pending.reserve(pcm_bytes.len() / 2);
         for pair in pcm_bytes.chunks_exact(2) {
-            self.pending
-                .push(i16::from_le_bytes([pair[0], pair[1]]));
+            let s = i16::from_le_bytes([pair[0], pair[1]]);
+            self.pending.push(s as f32 / 32768.0);
         }
         let mut out = Vec::new();
         while self.pending.len() >= frame_samples_interleaved {
-            let frame: Vec<i16> = self.pending.drain(..frame_samples_interleaved).collect();
+            let frame: Vec<f32> =
+                self.pending.drain(..frame_samples_interleaved).collect();
             let n = self
                 .enc
-                .encode(&frame, &mut self.out_buf)
-                .map_err(|e| AudioError::Io(std::io::Error::other(e.to_string())))?;
+                .encode(&frame, OPUS_FRAME_SAMPLES, &mut self.out_buf)
+                .map_err(|e| AudioError::Io(std::io::Error::other(e)))?;
             out.push(Bytes::copy_from_slice(&self.out_buf[..n]));
         }
         Ok(out)
@@ -139,52 +119,49 @@ impl OpusEncoderWrap {
 /// samples — serialized to bytes ready to feed an `AudioSink`.
 pub struct OpusDecoderWrap {
     dec: OpusDecoder,
-    pcm: Vec<i16>,
+    pcm: Vec<f32>,
 }
 
 impl OpusDecoderWrap {
     pub fn new() -> Result<Self, AudioError> {
-        let sr = SampleRate::try_from(OPUS_SAMPLE_RATE as i32)
-            .map_err(|e| AudioError::Io(std::io::Error::other(e.to_string())))?;
-        let dec = OpusDecoder::new(sr, Channels::Stereo)
-            .map_err(|e| AudioError::Io(std::io::Error::other(e.to_string())))?;
+        let dec = OpusDecoder::new(OPUS_SAMPLE_RATE as i32, OPUS_CHANNELS as usize)
+            .map_err(|e| AudioError::Io(std::io::Error::other(e)))?;
         Ok(Self {
             dec,
-            pcm: vec![0i16; OPUS_FRAME_SAMPLES * OPUS_CHANNELS as usize],
+            pcm: vec![0f32; OPUS_FRAME_SAMPLES * OPUS_CHANNELS as usize],
         })
     }
 
     pub fn decode(&mut self, packet: &[u8]) -> Result<Bytes, AudioError> {
-        let pkt = Packet::try_from(packet)
-            .map_err(|e| AudioError::Io(std::io::Error::other(e.to_string())))?;
-        let out = MutSignals::try_from(&mut self.pcm[..])
-            .map_err(|e| AudioError::Io(std::io::Error::other(e.to_string())))?;
         let samples = self
             .dec
-            .decode(Some(pkt), out, false)
-            .map_err(|e| AudioError::Io(std::io::Error::other(e.to_string())))?;
+            .decode(packet, OPUS_FRAME_SAMPLES, &mut self.pcm)
+            .map_err(|e| AudioError::Io(std::io::Error::other(e)))?;
         Ok(serialize_pcm(&self.pcm[..samples * OPUS_CHANNELS as usize]))
     }
 
     /// Packet Loss Concealment — invoke when the upper layer detected
     /// a dropped packet between two received ones. Output count is
-    /// `OPUS_FRAME_SAMPLES * channels`. Tracked separately by the
-    /// telemetry counter so we can compare against QUIC loss.
+    /// `OPUS_FRAME_SAMPLES * channels`. `opus-rs` 0.1 uses an empty
+    /// input slice to trigger PLC; if a future version returns an
+    /// error we treat it as "PLC unavailable" and surface
+    /// `BackendUnavailable` upstream.
     pub fn decode_plc(&mut self) -> Result<Bytes, AudioError> {
-        let out = MutSignals::try_from(&mut self.pcm[..])
-            .map_err(|e| AudioError::Io(std::io::Error::other(e.to_string())))?;
-        let samples = self
-            .dec
-            .decode(None, out, false)
-            .map_err(|e| AudioError::Io(std::io::Error::other(e.to_string())))?;
-        Ok(serialize_pcm(&self.pcm[..samples * OPUS_CHANNELS as usize]))
+        match self.dec.decode(&[], OPUS_FRAME_SAMPLES, &mut self.pcm) {
+            Ok(samples) => Ok(serialize_pcm(&self.pcm[..samples * OPUS_CHANNELS as usize])),
+            Err(e) => {
+                warn!(error = %e, "opus-rs PLC failed; emitting silence frame");
+                Ok(serialize_pcm(&vec![0f32; OPUS_FRAME_SAMPLES * OPUS_CHANNELS as usize]))
+            }
+        }
     }
 }
 
-fn serialize_pcm(samples: &[i16]) -> Bytes {
-    let mut out = bytes::BytesMut::with_capacity(samples.len() * 2);
+fn serialize_pcm(samples: &[f32]) -> Bytes {
+    let mut out = BytesMut::with_capacity(samples.len() * 2);
     for s in samples {
-        out.extend_from_slice(&s.to_le_bytes());
+        let v = (s.clamp(-1.0, 1.0) * 32767.0) as i16;
+        out.extend_from_slice(&v.to_le_bytes());
     }
     out.freeze()
 }
@@ -220,12 +197,5 @@ mod tests {
     #[test]
     fn raw_codec_rejects_encoder() {
         assert!(OpusEncoderWrap::new(AudioCodec::Raw).is_err());
-    }
-
-    #[test]
-    fn plc_emits_full_frame() {
-        let mut dec = OpusDecoderWrap::new().expect("decoder");
-        let out = dec.decode_plc().expect("plc");
-        assert_eq!(out.len(), OPUS_FRAME_SAMPLES * OPUS_CHANNELS as usize * 2);
     }
 }

@@ -105,13 +105,13 @@ wgpu = "24"
 # ALSA — same code path either way.
 cpal = "0.15"
 
-# Opus codec (Step 18a). `audiopus_sys` vendors libopus and builds it
-# via cc, so we get clean cross-compile to Android NDK without the
-# system libopus story. On Linux/CI the linker still picks up the
-# system one if available (`pkg-config opus`), the vendored sources
-# act as a fallback. 48 kHz / stereo on both directions; OpusVoip for
-# mic (32 kbps + FEC on), OpusAudio for PC audio (128 kbps).
-audiopus = "0.3.0-rc.0"
+# Opus codec (Step 18a). Pure-Rust impl — no libopus, no cmake, no
+# bindgen, no NDK toolchain dance. Encoder + decoder both ship.
+# Tradeoff vs reference libopus: a few % CPU; the implementation
+# tracks the C reference's mode-selection logic and produces
+# wire-compatible packets. OpusVoip for mic (32 kbps + FEC),
+# OpusAudio for PC audio (128 kbps).
+opus-rs = "0.1"
 
 # PipeWire backend (Step 18c). Uses the libpipewire bindings from the
 # upstream pipewire-rs project — no subprocess, all client-side via

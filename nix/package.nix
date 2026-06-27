@@ -66,6 +66,28 @@ let
     ];
 
     LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+
+    # bindgen-rs needs the system include paths (`stdint.h`, etc.) so
+    # `clang_macro_fallback` can evaluate macros like
+    # `#define SPA_ID_INVALID ((uint32_t)0xffffffff)`. Without these
+    # the cast fails, bindgen silently drops the constant, and
+    # libspa's `pub const ID_INVALID: u32 = spa_sys::SPA_ID_INVALID;`
+    # fails with `not found in crate \`spa_sys\``. The clang resource
+    # dir layout uses the major version only (`lib/clang/21/include`).
+    # `-resource-dir` is what teaches clang where its own intrinsics
+    # live; without it the bindgen-launched clang can't find
+    # `__stddef_max_align_t.h` and falls back to system gcc headers
+    # (which lack the macro guards bindgen relies on).
+    BINDGEN_EXTRA_CLANG_ARGS =
+      let
+        clangMajor = lib.head (lib.splitString "." pkgs.clang.version);
+        resourceDir = "${pkgs.libclang.lib}/lib/clang/${clangMajor}";
+      in
+      lib.concatStringsSep " " [
+        "-resource-dir ${resourceDir}"
+        "-isystem ${resourceDir}/include"
+        "-isystem ${pkgs.glibc.dev}/include"
+      ];
   };
 
   cargoArtifacts = craneLib.buildDepsOnly commonArgs;
