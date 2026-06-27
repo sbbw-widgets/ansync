@@ -116,10 +116,13 @@ opus-rs = "0.1"
 # PipeWire backend (Step 18c). Uses the libpipewire bindings from the
 # upstream pipewire-rs project — no subprocess, all client-side via
 # FFI. libpipewire / libspa come from the system; pkg-config locates
-# them. nixpkgs ships them via the `pipewire` package already in the
-# dev shell's runtimeDeps.
-pipewire = "0.10"
-libspa = "0.10"
+# them. Pinned to 0.8 (matching ferricast-capture): 0.10 added
+# `clang_macro_fallback` for `SPA_ID_INVALID` evaluation, which fails
+# silently in the nix sandbox and tanks the deps build. 0.8 emits the
+# constant the old-school way (enum constant) so bindgen sees it
+# unconditionally.
+pipewire = { version = "0.8", features = ["v0_3_77"] }
+libspa = { version = "0.8", features = ["v0_3_75"] }
 
 # Camera (consumed in Step 10)
 v4l = "0.14"

@@ -61,9 +61,9 @@ impl PipewireBackend {
         let probe = std::thread::Builder::new()
             .name("ansync-pw-probe".into())
             .spawn(|| -> Result<(), pw::Error> {
-                let ml = pw::main_loop::MainLoopRc::new(None)?;
-                let ctx = pw::context::ContextRc::new(&ml, None)?;
-                let _core = ctx.connect_rc(None)?;
+                let ml = pw::main_loop::MainLoop::new(None)?;
+                let ctx = pw::context::Context::new(&ml)?;
+                let _core = ctx.connect(None)?;
                 Ok(())
             })
             .map_err(AudioError::Io)?;
@@ -260,9 +260,9 @@ fn run_virtual_sink(
     shutdown: Arc<AtomicBool>,
 ) -> Result<(), pw::Error> {
     pw::init();
-    let mainloop = pw::main_loop::MainLoopRc::new(None)?;
-    let context = pw::context::ContextRc::new(&mainloop, None)?;
-    let core = context.connect_rc(None)?;
+    let mainloop = pw::main_loop::MainLoop::new(None)?;
+    let context = pw::context::Context::new(&mainloop)?;
+    let core = context.connect(None)?;
 
     let props = pw::properties::properties! {
         *pw::keys::MEDIA_TYPE => "Audio",
@@ -273,7 +273,7 @@ fn run_virtual_sink(
         *pw::keys::APP_NAME => "ansync",
     };
 
-    let stream = pw::stream::StreamBox::new(&core, &label, props)?;
+    let stream = pw::stream::Stream::new(&core, &label, props)?;
     let ring_cb = ring.clone();
 
     let _listener = stream
@@ -431,9 +431,9 @@ fn run_capture_source(
     shutdown: Arc<AtomicBool>,
 ) -> Result<(), pw::Error> {
     pw::init();
-    let mainloop = pw::main_loop::MainLoopRc::new(None)?;
-    let context = pw::context::ContextRc::new(&mainloop, None)?;
-    let core = context.connect_rc(None)?;
+    let mainloop = pw::main_loop::MainLoop::new(None)?;
+    let context = pw::context::Context::new(&mainloop)?;
+    let core = context.connect(None)?;
 
     let props = pw::properties::properties! {
         *pw::keys::MEDIA_TYPE => "Audio",
@@ -448,7 +448,7 @@ fn run_capture_source(
         *pw::keys::STREAM_CAPTURE_SINK => "true",
     };
 
-    let stream = pw::stream::StreamBox::new(&core, &label, props)?;
+    let stream = pw::stream::Stream::new(&core, &label, props)?;
     let ring_cb = ring.clone();
 
     let _listener = stream

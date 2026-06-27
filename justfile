@@ -45,7 +45,7 @@ sign:
 install:
     adb install android/app/build/outputs/apk/release/app-release-signed.apk
 
-run: (build) (sign) (install)
+run: (clean) (build) (sign) (install)
 
 # Cut a release. Usage: just publish <bump>
 #
