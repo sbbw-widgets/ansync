@@ -44,6 +44,10 @@ ansync-files = { path = "../crates/files" }
 ansync-pairing = { path = "../crates/pairing", default-features = false }
 ansync-permissions = { path = "../crates/permissions" }
 ansync-transport = { path = "../crates/transport" }
+# Opus codec — feature `opus` brings in `audiopus` which vendors
+# libopus C source via `audiopus_sys` and builds it with cc, so the
+# NDK cross-compile works without a system libopus.
+ansync-audio = { path = "../crates/audio", default-features = false, features = ["opus"] }
 
 # QUIC client mirrors the host's `quinn` + `rustls` stack — same
 # wire bytes, zero compat work. `default-features = false` keeps

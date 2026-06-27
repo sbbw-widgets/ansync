@@ -180,6 +180,7 @@
             # Audio
             pipewire
             alsa-lib
+            libopus
 
             # Video (Steps 5 / 6)
             libva

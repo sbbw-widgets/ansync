@@ -105,6 +105,14 @@ wgpu = "24"
 # ALSA — same code path either way.
 cpal = "0.15"
 
+# Opus codec (Step 18a). `audiopus_sys` vendors libopus and builds it
+# via cc, so we get clean cross-compile to Android NDK without the
+# system libopus story. On Linux/CI the linker still picks up the
+# system one if available (`pkg-config opus`), the vendored sources
+# act as a fallback. 48 kHz / stereo on both directions; OpusVoip for
+# mic (32 kbps + FEC on), OpusAudio for PC audio (128 kbps).
+audiopus = "0.3.0-rc.0"
+
 # Camera (consumed in Step 10)
 v4l = "0.14"
 libc = "0.2"

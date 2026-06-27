@@ -14,7 +14,10 @@ use std::sync::Arc;
 use std::collections::HashMap;
 use std::sync::Mutex as StdMutex;
 
-use ansync_audio::{AudioBackend, AudioFormat, AudioSink, AudioSource, CpalBackend, SampleFormat};
+use ansync_audio::{
+    AudioBackend, AudioFormat, AudioSink, AudioSource, CpalBackend, OPUS_FRAME_SAMPLES,
+    OpusDecoderWrap, OpusEncoderWrap, SampleFormat,
+};
 use ansync_camera::{CameraFormat, CameraPixelFormat, VirtualCameraSink};
 use ansync_clipboard::{ClipboardBackend, ClipboardContent, WaylandClipboard};
 use ansync_core::{Capabilities, DeviceId, DeviceName, Permission};
@@ -29,8 +32,8 @@ use ansync_input::{InputDeviceFactory, InputSession, UinputFactory};
 use ansync_pairing::PeerStore;
 use perms_backend::PeerStorePermissions;
 use ansync_proto::{
-    AudioDirection, AudioStreamInit, CameraConfig, ClipboardMessage, ControlMessage, Envelope,
-    Hello, InputMessage, Message, NotificationMessage, PROTOCOL_VERSION, UrlMessage,
+    AudioCodec, AudioDirection, AudioStreamInit, CameraConfig, ClipboardMessage, ControlMessage,
+    Envelope, Hello, InputMessage, Message, NotificationMessage, PROTOCOL_VERSION, UrlMessage,
     VideoCodec as ProtoVideoCodec,
 };
 use ansync_transport::pinning::TrustedPeers;
@@ -1686,12 +1689,11 @@ async fn handle_start_audio(
     ctrl.send(bytes::Bytes::from(bytes)).await?;
     info!(%device, ?direction, "StartAudioRoute control sent");
 
-    // Inbound: wait for the companion to open a StreamKind::Audio
-    // back at us. `audio_inbound_loop` consumes it and pushes into
-    // the entry's mpsc; `audio_render_loop` drains into the CpalSink.
+    // Inbound: provision sink + tile slot now; the render task is
+    // spawned by `audio_inbound_loop` once the wire `AudioStreamInit`
+    // header arrives — that's when we know the codec the companion
+    // picked (OpusVoip vs Raw fallback).
     if need_in {
-        let (tx, rx) = unbounded_channel::<bytes::Bytes>();
-        *entry.inbound_tx.lock().expect("audio inbound tx poisoned") = Some(tx);
         *entry
             .inbound_tile_kind
             .lock()
@@ -1702,40 +1704,36 @@ async fn handle_start_audio(
         // every time creates a fresh device node and apps fall back
         // to whatever default was active before.
         let mut sink_guard = entry.sink.lock().await;
-        let sink = match sink_guard.clone() {
-            Some(existing) => existing,
-            None => {
-                let label = format!("ansync-in-{}", entry.peer_name);
-                let format = AudioFormat {
-                    sample_rate: 48_000,
-                    channels: 2,
-                    format: SampleFormat::S16Le,
-                };
-                let built = match CpalBackend::new().create_sink(&label, format).await {
-                    Ok(s) => Arc::new(tokio::sync::Mutex::new(s)),
-                    Err(e) => {
-                        warn!(%device, error = %e, "open CpalSink failed");
-                        return Ok(());
-                    }
-                };
-                *sink_guard = Some(built.clone());
-                built
-            }
-        };
-        drop(sink_guard);
-        let handle = tokio::spawn(audio_render_loop(rx, sink));
-        *entry
-            .inbound_handle
-            .lock()
-            .expect("audio inbound slot poisoned") = Some(handle);
+        if sink_guard.is_none() {
+            let label = format!("ansync-in-{}", entry.peer_name);
+            let format = AudioFormat {
+                sample_rate: 48_000,
+                channels: 2,
+                format: SampleFormat::S16Le,
+            };
+            let built = match CpalBackend::new().create_sink(&label, format).await {
+                Ok(s) => Arc::new(tokio::sync::Mutex::new(s)),
+                Err(e) => {
+                    warn!(%device, error = %e, "open CpalSink failed");
+                    return Ok(());
+                }
+            };
+            *sink_guard = Some(built);
+        }
     }
 
     if need_out {
         let mut stream = conn.open(StreamKind::Audio).await?;
+        // Host → device renders general audio (music, game sound, VOIP
+        // mixed in PipeWire). OpusAudio profile @ 128 kbps gives clean
+        // music; bandwidth still fits LAN comfortably.
+        let codec = AudioCodec::OpusAudio;
         let init = AudioStreamInit {
             sample_rate: 48_000,
             channels: 2,
             direction: AudioDirection::HostToDevice,
+            codec,
+            frame_samples: OPUS_FRAME_SAMPLES as u16,
         };
         let header = postcard::to_allocvec(&init)
             .map_err(|e| DaemonError::Startup(format!("encode AudioStreamInit: {e}")))?;
@@ -1753,9 +1751,11 @@ async fn handle_start_audio(
                 return Ok(());
             }
         };
+        let encoder = OpusEncoderWrap::new(codec)
+            .map_err(|e| DaemonError::Startup(format!("opus encoder: {e}")))?;
         let perms_pump = permissions.clone();
         let peer_pump = device.clone();
-        let handle = tokio::spawn(audio_pump_loop(stream, source, peer_pump, perms_pump));
+        let handle = tokio::spawn(audio_pump_loop(stream, source, encoder, peer_pump, perms_pump));
         *entry
             .pump_handle
             .lock()
@@ -1797,10 +1797,31 @@ async fn handle_stop_audio(audios: &AudioRegistry, device: &DeviceId) {
 async fn audio_render_loop(
     mut rx: UnboundedReceiver<bytes::Bytes>,
     sink: Arc<tokio::sync::Mutex<ansync_audio::CpalSink>>,
+    codec: AudioCodec,
 ) {
+    let mut decoder = match codec {
+        AudioCodec::Raw => None,
+        AudioCodec::OpusVoip | AudioCodec::OpusAudio => match OpusDecoderWrap::new() {
+            Ok(d) => Some(d),
+            Err(e) => {
+                warn!(error = %e, "audio_render_loop: opus decoder init failed");
+                return;
+            }
+        },
+    };
     while let Some(bytes) = rx.recv().await {
+        let pcm = match decoder.as_mut() {
+            Some(dec) => match dec.decode(&bytes) {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!(error = %e, "audio_render_loop: opus decode failed; dropping packet");
+                    continue;
+                }
+            },
+            None => bytes,
+        };
         let mut guard = sink.lock().await;
-        if let Err(e) = guard.write(bytes).await {
+        if let Err(e) = guard.write(pcm).await {
             warn!(error = %e, "audio_render_loop: sink write failed");
             return;
         }
@@ -1810,12 +1831,13 @@ async fn audio_render_loop(
 async fn audio_pump_loop(
     mut stream: QuicStream,
     mut source: ansync_audio::CpalSource,
+    mut encoder: OpusEncoderWrap,
     peer_id: DeviceId,
     permissions: Arc<dyn ansync_permissions::PermissionsStore>,
 ) {
     loop {
         match source.read().await {
-            Ok(bytes) => {
+            Ok(pcm) => {
                 match permissions.check(&peer_id, Permission::AudioOut).await {
                     Ok(true) => {}
                     Ok(false) => continue,
@@ -1824,9 +1846,18 @@ async fn audio_pump_loop(
                         continue;
                     }
                 }
-                if let Err(e) = stream.send(bytes).await {
-                    warn!(error = %e, "audio_pump_loop: stream send failed");
-                    return;
+                let packets = match encoder.feed(&pcm) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        warn!(error = %e, "audio_pump_loop: opus encode failed");
+                        continue;
+                    }
+                };
+                for packet in packets {
+                    if let Err(e) = stream.send(packet).await {
+                        warn!(error = %e, "audio_pump_loop: stream send failed");
+                        return;
+                    }
                 }
             }
             Err(e) => {
@@ -1883,16 +1914,49 @@ async fn audio_inbound_loop(
         peer_id: peer_id.clone(),
         dbus_conn,
     };
-    // First frame: the AudioStreamInit header. We log it but use the
-    // host-side sink format the action handler already provisioned.
-    let _header = match stream.recv().await {
+    // First frame: AudioStreamInit. The codec field tells us whether
+    // subsequent bytes are raw PCM (legacy companion) or Opus packets
+    // (one per recv). We spawn `audio_render_loop` here — not in
+    // `handle_start_audio` — so the decoder is wired with the exact
+    // codec the companion actually picked.
+    let header_bytes = match stream.recv().await {
         Ok(b) => b,
         Err(_) => {
             info!(%peer_id, "audio_inbound_loop: stream closed before header");
             return;
         }
     };
-    info!(%peer_id, "audio inbound stream wired");
+    let header: AudioStreamInit = match postcard::from_bytes(&header_bytes) {
+        Ok(h) => h,
+        Err(e) => {
+            warn!(%peer_id, error = %e, "audio_inbound_loop: bad header");
+            return;
+        }
+    };
+    info!(%peer_id, codec = ?header.codec, "audio inbound stream wired");
+    // Provision the render task now that we know the codec. The
+    // `inbound_tx` slot was set up by `handle_start_audio`; we drain
+    // through it into `audio_render_loop`.
+    {
+        let (tx, rx) = unbounded_channel::<bytes::Bytes>();
+        *entry.inbound_tx.lock().expect("audio inbound tx poisoned") = Some(tx);
+        let sink = match entry.sink.lock().await.clone() {
+            Some(s) => s,
+            None => {
+                warn!(%peer_id, "audio_inbound_loop: sink missing; aborting render");
+                return;
+            }
+        };
+        let handle = tokio::spawn(audio_render_loop(rx, sink, header.codec));
+        if let Some(prev) = entry
+            .inbound_handle
+            .lock()
+            .expect("audio inbound slot poisoned")
+            .replace(handle)
+        {
+            prev.abort();
+        }
+    }
     loop {
         let bytes = match stream.recv().await {
             Ok(b) => b,

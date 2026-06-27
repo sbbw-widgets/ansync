@@ -9,6 +9,7 @@ description = "ansync — virtual audio sources / sinks (cpal default, ALSA/JACK
 
 [dependencies]
 ansync-core.workspace = true
+ansync-proto.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
 thiserror.workspace = true
@@ -16,7 +17,9 @@ tokio = { workspace = true, features = ["sync"] }
 tracing.workspace = true
 
 cpal = { workspace = true, optional = true }
+audiopus = { workspace = true, optional = true }
 
 [features]
-default = []
+default = ["opus"]
 cpal-backend = ["dep:cpal"]
+opus = ["dep:audiopus"]

@@ -13,6 +13,15 @@ pub mod cpal_backend;
 #[cfg(feature = "cpal-backend")]
 pub use cpal_backend::{CpalBackend, CpalSink, CpalSource};
 
+#[cfg(feature = "opus")]
+pub mod opus_codec;
+
+#[cfg(feature = "opus")]
+pub use opus_codec::{
+    AUDIO_BITRATE_BPS, OPUS_CHANNELS, OPUS_FRAME_SAMPLES, OPUS_SAMPLE_RATE, OpusDecoderWrap,
+    OpusEncoderWrap, VOIP_BITRATE_BPS,
+};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SampleFormat {
     S16Le,

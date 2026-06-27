@@ -14,7 +14,7 @@ pub use frame::{
     read_frame, read_typed, write_envelope, write_frame, write_typed,
 };
 
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Envelope {
@@ -134,15 +134,37 @@ pub enum AudioDirection {
     Both,
 }
 
-/// PCM format declared on the first frame of every `StreamKind::Audio`
-/// stream. After this header, the stream carries raw little-endian
-/// S16 samples interleaved (L,R,L,R,...) — no per-frame envelope so
-/// the hot path stays a straight `recv → write_sink` copy.
+/// Audio compression codec carried on `StreamKind::Audio`. `Raw` keeps
+/// the legacy interleaved S16LE wire (variable-size chunks). `OpusVoip`
+/// / `OpusAudio` switch to one Opus packet per frame at exactly
+/// `AudioStreamInit::frame_samples` samples per channel — both sides
+/// must agree because Opus only accepts a fixed set of frame sizes
+/// (2.5/5/10/20/40/60 ms).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AudioCodec {
+    /// Uncompressed S16LE PCM. Fallback for legacy peers and dev.
+    Raw,
+    /// Opus tuned for speech (low bitrate, FEC on). Used for mic
+    /// forwarding (companion → host).
+    OpusVoip,
+    /// Opus tuned for general audio / music (higher bitrate). Used for
+    /// host audio rendering on the device speaker.
+    OpusAudio,
+}
+
+/// Header declared on the first frame of every `StreamKind::Audio`
+/// stream. Subsequent frames are either raw S16LE PCM (codec `Raw`) or
+/// individual Opus packets (`OpusVoip` / `OpusAudio`). `frame_samples`
+/// is the number of samples per channel per packet — meaningless for
+/// `Raw` (set to 0), required for Opus so the decoder knows the output
+/// buffer size in advance.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct AudioStreamInit {
     pub sample_rate: u32,
     pub channels: u8,
     pub direction: AudioDirection,
+    pub codec: AudioCodec,
+    pub frame_samples: u16,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

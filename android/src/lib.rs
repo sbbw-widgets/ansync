@@ -44,9 +44,12 @@ use ansync_files::{
 use ansync_pairing::cable::bootstrap_companion;
 use ansync_pairing::wifi::{read_pair_hello, respond_pair_pin, CompanionWifiOutcome};
 use ansync_permissions::{PermissionsError, PermissionsStore};
+use ansync_audio::{
+    OPUS_FRAME_SAMPLES, OpusDecoderWrap, OpusEncoderWrap,
+};
 use ansync_proto::{
-    ClipboardMessage, ControlMessage, Envelope, GamepadState, Hello, InputMessage, Message,
-    NotificationMessage, PROTOCOL_VERSION, UrlMessage,
+    AudioCodec, AudioStreamInit, ClipboardMessage, ControlMessage, Envelope, GamepadState, Hello,
+    InputMessage, Message, NotificationMessage, PROTOCOL_VERSION, UrlMessage,
 };
 use ansync_transport::{
     Connection, QuicConnection, QuicStream, QuicTransport, Stream as _, StreamKind,
@@ -251,6 +254,11 @@ struct ActiveSession {
     /// Outbound device→host Audio stream for mic forwarding.
     /// Lazy-opened on the first `nativeSendAudioChunk` (device-side).
     outbound_audio: Arc<AsyncMutex<Option<QuicStream>>>,
+    /// Stateful Opus encoder for the outbound mic stream. Lazy-built
+    /// alongside `outbound_audio`. `OpusVoip` profile (32 kbps + FEC)
+    /// is the right shape for speech — host renders the decoded PCM on
+    /// PipeWire / PulseAudio.
+    outbound_audio_encoder: Arc<AsyncMutex<Option<OpusEncoderWrap>>>,
     /// Receiver side of host→device PCM. Kotlin polls it via
     /// `nativePollAudioChunk` and writes to AudioTrack.
     audio_in_rx: Arc<AsyncMutex<UnboundedReceiver<Vec<u8>>>>,
@@ -588,6 +596,7 @@ pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativeOpenConnection
         camera_ctrl_rx: Arc::new(AsyncMutex::new(camera_ctrl_rx)),
         audio_ctrl_rx: Arc::new(AsyncMutex::new(audio_ctrl_rx)),
         outbound_audio: Arc::new(AsyncMutex::new(None)),
+        outbound_audio_encoder: Arc::new(AsyncMutex::new(None)),
         audio_in_rx: Arc::new(AsyncMutex::new(audio_in_rx)),
         clipboard_in_rx: Arc::new(AsyncMutex::new(clip_in_rx)),
         clipboard_in_blob_rx: Arc::new(AsyncMutex::new(clip_blob_rx)),
@@ -965,20 +974,48 @@ async fn control_recv_loop(
 }
 
 /// Inbound `StreamKind::Audio` from the host. First frame is the
-/// `AudioStreamInit` header (postcard), subsequent frames are raw
-/// little-endian S16 PCM. We forward the raw PCM straight to Kotlin
-/// via the `audio_in_tx` channel — the header is logged + discarded
-/// because both sides hardcode 48 kHz stereo today.
+/// `AudioStreamInit` header (postcard); subsequent frames are either
+/// raw S16LE PCM (legacy `Raw` codec — pass through) or one Opus
+/// packet each (`OpusAudio` / `OpusVoip` — decode to PCM before
+/// forwarding to Kotlin). Kotlin always sees raw PCM ready to feed
+/// `AudioTrack`.
 async fn audio_in_loop(mut stream: QuicStream, tx: UnboundedSender<Vec<u8>>) {
-    let _header = match stream.recv().await {
+    let header_bytes = match stream.recv().await {
         Ok(b) => b,
         Err(_) => return,
     };
-    info!("audio_in_loop: header received, streaming PCM");
+    let header: AudioStreamInit = match postcard::from_bytes(&header_bytes) {
+        Ok(h) => h,
+        Err(e) => {
+            warn!("audio_in_loop: bad header: {e}");
+            return;
+        }
+    };
+    info!("audio_in_loop: header received codec={:?}", header.codec);
+    let mut decoder = match header.codec {
+        AudioCodec::Raw => None,
+        AudioCodec::OpusVoip | AudioCodec::OpusAudio => match OpusDecoderWrap::new() {
+            Ok(d) => Some(d),
+            Err(e) => {
+                warn!("audio_in_loop: opus decoder init failed: {e}");
+                return;
+            }
+        },
+    };
     loop {
         match stream.recv().await {
             Ok(bytes) => {
-                if tx.send(bytes.to_vec()).is_err() {
+                let pcm = match decoder.as_mut() {
+                    Some(dec) => match dec.decode(&bytes) {
+                        Ok(p) => p.to_vec(),
+                        Err(e) => {
+                            warn!("audio_in_loop: opus decode failed: {e}");
+                            continue;
+                        }
+                    },
+                    None => bytes.to_vec(),
+                };
+                if tx.send(pcm).is_err() {
                     info!("audio_in_loop: receiver dropped; exiting");
                     return;
                 }
@@ -1687,35 +1724,53 @@ pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativeSendAudioChunk
             return jni::sys::JNI_FALSE;
         }
     };
-    let (conn, outbound_audio) = {
+    let (conn, outbound_audio, outbound_encoder) = {
         let slot = state_slot().lock().expect("state mutex poisoned");
         match slot.as_ref().and_then(|s| s.session.as_ref()) {
-            Some(sess) => (sess.conn.clone(), sess.outbound_audio.clone()),
+            Some(sess) => (
+                sess.conn.clone(),
+                sess.outbound_audio.clone(),
+                sess.outbound_audio_encoder.clone(),
+            ),
             None => {
                 warn!("nativeSendAudioChunk: no active session");
                 return jni::sys::JNI_FALSE;
             }
         }
     };
+    // Mic forward uses OpusVoip — 32 kbps + FEC + low-delay tuned for
+    // speech. Both directions live at 48 kHz / stereo / 20 ms frames.
+    let codec = AudioCodec::OpusVoip;
     let result = runtime().block_on(async move {
-        let mut guard = outbound_audio.lock().await;
-        if guard.is_none() {
+        let mut stream_guard = outbound_audio.lock().await;
+        let mut enc_guard = outbound_encoder.lock().await;
+        if stream_guard.is_none() {
             let mut stream = conn.open(StreamKind::Audio).await?;
-            let init = ansync_proto::AudioStreamInit {
+            let init = AudioStreamInit {
                 sample_rate: 48_000,
                 channels: 2,
                 direction: ansync_proto::AudioDirection::DeviceToHost,
+                codec,
+                frame_samples: OPUS_FRAME_SAMPLES as u16,
             };
-            let header = postcard::to_allocvec(&init)
-                .map_err(|e| ansync_transport::TransportError::Handshake(format!("encode header: {e}")))?;
+            let header = postcard::to_allocvec(&init).map_err(|e| {
+                ansync_transport::TransportError::Handshake(format!("encode header: {e}"))
+            })?;
             stream.send(Bytes::from(header)).await?;
-            *guard = Some(stream);
+            *stream_guard = Some(stream);
+            *enc_guard = Some(OpusEncoderWrap::new(codec).map_err(|e| {
+                ansync_transport::TransportError::Handshake(format!("opus encoder: {e}"))
+            })?);
         }
-        guard
-            .as_mut()
-            .expect("just inserted")
-            .send(Bytes::from(bytes))
-            .await
+        let encoder = enc_guard.as_mut().expect("encoder just inserted");
+        let packets = encoder.feed(&bytes).map_err(|e| {
+            ansync_transport::TransportError::Handshake(format!("opus encode: {e}"))
+        })?;
+        let stream = stream_guard.as_mut().expect("stream just inserted");
+        for packet in packets {
+            stream.send(packet).await?;
+        }
+        Ok::<(), ansync_transport::TransportError>(())
     });
     match result {
         Ok(()) => jni::sys::JNI_TRUE,
@@ -1731,16 +1786,21 @@ pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativeStopAudioStrea
     _env: JNIEnv<'local>,
     _class: JClass<'local>,
 ) -> jboolean {
-    let outbound_audio = {
+    let (outbound_audio, outbound_encoder) = {
         let slot = state_slot().lock().expect("state mutex poisoned");
         match slot.as_ref().and_then(|s| s.session.as_ref()) {
-            Some(sess) => sess.outbound_audio.clone(),
+            Some(sess) => (
+                sess.outbound_audio.clone(),
+                sess.outbound_audio_encoder.clone(),
+            ),
             None => return jni::sys::JNI_FALSE,
         }
     };
     runtime().block_on(async move {
-        let mut guard = outbound_audio.lock().await;
-        *guard = None;
+        let mut stream_guard = outbound_audio.lock().await;
+        *stream_guard = None;
+        let mut enc_guard = outbound_encoder.lock().await;
+        *enc_guard = None;
     });
     jni::sys::JNI_TRUE
 }
