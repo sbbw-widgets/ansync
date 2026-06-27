@@ -20,6 +20,10 @@ cpal = { workspace = true, optional = true }
 audiopus = { workspace = true, optional = true }
 
 [features]
-default = ["opus"]
+default = ["opus", "cpal-backend", "pipewire-backend", "aloop-backend"]
 cpal-backend = ["dep:cpal"]
 opus = ["dep:audiopus"]
+# Pipewire / aloop backends are stubbed in 18b — feature flag exists so
+# the selector compiles them in by default; the impl lands in 18c/18d.
+pipewire-backend = []
+aloop-backend = []

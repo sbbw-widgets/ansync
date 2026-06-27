@@ -15,8 +15,8 @@ use std::collections::HashMap;
 use std::sync::Mutex as StdMutex;
 
 use ansync_audio::{
-    AudioBackend, AudioFormat, AudioSink, AudioSource, CpalBackend, OPUS_FRAME_SAMPLES,
-    OpusDecoderWrap, OpusEncoderWrap, SampleFormat,
+    AudioBackend, AudioFormat, BoxedSink, BoxedSource, OPUS_FRAME_SAMPLES, OpusDecoderWrap,
+    OpusEncoderWrap, SampleFormat, SharedAudioBackend, select_audio_backend,
 };
 use ansync_camera::{CameraFormat, CameraPixelFormat, VirtualCameraSink};
 use ansync_clipboard::{ClipboardBackend, ClipboardContent, WaylandClipboard};
@@ -69,6 +69,8 @@ pub enum DaemonError {
     Transport(#[from] ansync_transport::TransportError),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+    #[error("audio: {0}")]
+    Audio(#[from] ansync_audio::AudioError),
     #[error("startup: {0}")]
     Startup(String),
 }
@@ -213,12 +215,18 @@ impl Daemon {
         let audios = Arc::new(AudioRegistry::default());
         let inputs = Arc::new(InputRegistry::default());
         let clipboard_sync = ClipboardSync::default();
+        // Backend chosen once at startup so every per-peer sink/source
+        // shares the same kind. ANSYNC_AUDIO_BACKEND overrides the
+        // auto-detect chain (pipewire → aloop → cpal).
+        let audio_backend = select_audio_backend()?;
+        info!(backend = %audio_backend.kind(), "audio backend selected");
         let action_handle = tokio::spawn(action_loop(
             action_rx,
             action_tx.clone(),
             mirrors.clone(),
             cameras.clone(),
             audios.clone(),
+            audio_backend.clone(),
             permissions.clone(),
             clipboard_sync.clone(),
             dbus_conn_arc.clone(),
@@ -435,8 +443,11 @@ pub struct AudioRegistry {
 
 pub struct AudioEntry {
     pub peer_name: String,
-    /// Plays *into* the host (peer → host direction).
-    sink: tokio::sync::Mutex<Option<Arc<tokio::sync::Mutex<ansync_audio::CpalSink>>>>,
+    /// Plays *into* the host (peer → host direction). Boxed so the
+    /// concrete backend (pipewire / aloop / cpal) lives behind the
+    /// `AudioSink` trait — switched at daemon init via
+    /// `ANSYNC_AUDIO_BACKEND` and re-used across reconnects.
+    sink: tokio::sync::Mutex<Option<Arc<tokio::sync::Mutex<BoxedSink>>>>,
     /// Captures *from* the host (host → peer direction). The
     /// background pump task moves bytes out of this source onto the
     /// outbound stream.
@@ -640,6 +651,7 @@ async fn action_loop(
     mirrors: Arc<MirrorRegistry>,
     cameras: Arc<CameraRegistry>,
     audios: Arc<AudioRegistry>,
+    audio_backend: SharedAudioBackend,
     permissions: Arc<dyn ansync_permissions::PermissionsStore>,
     clipboard_sync: ClipboardSync,
     dbus_conn: Arc<zbus::Connection>,
@@ -650,6 +662,7 @@ async fn action_loop(
                 match handle_start_audio(
                     &mirrors,
                     &audios,
+                    audio_backend.as_ref(),
                     &permissions,
                     &device,
                     direction,
@@ -669,6 +682,7 @@ async fn action_loop(
                 match handle_start_audio(
                     &mirrors,
                     &audios,
+                    audio_backend.as_ref(),
                     &permissions,
                     &device,
                     AudioDirection::DeviceToHost,
@@ -1638,6 +1652,7 @@ async fn push_clipboard_to_peer(
 async fn handle_start_audio(
     mirrors: &MirrorRegistry,
     audios: &AudioRegistry,
+    audio_backend: &dyn AudioBackend,
     permissions: &Arc<dyn ansync_permissions::PermissionsStore>,
     device: &DeviceId,
     direction: AudioDirection,
@@ -1711,10 +1726,10 @@ async fn handle_start_audio(
                 channels: 2,
                 format: SampleFormat::S16Le,
             };
-            let built = match CpalBackend::new().create_sink(&label, format).await {
+            let built = match audio_backend.create_sink(&label, format).await {
                 Ok(s) => Arc::new(tokio::sync::Mutex::new(s)),
                 Err(e) => {
-                    warn!(%device, error = %e, "open CpalSink failed");
+                    warn!(%device, error = %e, "open audio sink failed");
                     return Ok(());
                 }
             };
@@ -1744,10 +1759,10 @@ async fn handle_start_audio(
             channels: 2,
             format: SampleFormat::S16Le,
         };
-        let source = match CpalBackend::new().create_source(&label, format).await {
+        let source = match audio_backend.create_source(&label, format).await {
             Ok(s) => s,
             Err(e) => {
-                warn!(%device, error = %e, "open CpalSource failed");
+                warn!(%device, error = %e, "open audio source failed");
                 return Ok(());
             }
         };
@@ -1796,7 +1811,7 @@ async fn handle_stop_audio(audios: &AudioRegistry, device: &DeviceId) {
 
 async fn audio_render_loop(
     mut rx: UnboundedReceiver<bytes::Bytes>,
-    sink: Arc<tokio::sync::Mutex<ansync_audio::CpalSink>>,
+    sink: Arc<tokio::sync::Mutex<BoxedSink>>,
     codec: AudioCodec,
 ) {
     let mut decoder = match codec {
@@ -1830,7 +1845,7 @@ async fn audio_render_loop(
 
 async fn audio_pump_loop(
     mut stream: QuicStream,
-    mut source: ansync_audio::CpalSource,
+    mut source: BoxedSource,
     mut encoder: OpusEncoderWrap,
     peer_id: DeviceId,
     permissions: Arc<dyn ansync_permissions::PermissionsStore>,

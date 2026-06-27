@@ -23,7 +23,10 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
-use crate::{AudioBackend, AudioError, AudioFormat, AudioSink, AudioSource, SampleFormat};
+use crate::{
+    AudioBackend, AudioBackendKind, AudioError, AudioFormat, AudioSink, AudioSource, BoxedSink,
+    BoxedSource, SampleFormat,
+};
 
 /// Host backend. Cheap to construct; the cpal `Host` handle lives
 /// inside each created stream rather than on the backend itself so
@@ -45,23 +48,24 @@ impl Default for CpalBackend {
 
 #[async_trait]
 impl AudioBackend for CpalBackend {
-    type Source = CpalSource;
-    type Sink = CpalSink;
-
     async fn create_source(
         &self,
         name: &str,
         format: AudioFormat,
-    ) -> Result<Self::Source, AudioError> {
-        CpalSource::open(name, format)
+    ) -> Result<BoxedSource, AudioError> {
+        Ok(Box::new(CpalSource::open(name, format)?))
     }
 
     async fn create_sink(
         &self,
         name: &str,
         format: AudioFormat,
-    ) -> Result<Self::Sink, AudioError> {
-        CpalSink::open(name, format)
+    ) -> Result<BoxedSink, AudioError> {
+        Ok(Box::new(CpalSink::open(name, format)?))
+    }
+
+    fn kind(&self) -> AudioBackendKind {
+        AudioBackendKind::Cpal
     }
 }
 
