@@ -236,7 +236,6 @@ dependencies = [
  "audiopus",
  "bytes",
  "cpal",
- "libc",
  "libspa",
  "pipewire",
  "thiserror 2.0.18",

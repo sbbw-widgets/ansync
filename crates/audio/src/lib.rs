@@ -4,12 +4,11 @@
 //!   * `pipewire` — creates a native PipeWire virtual source/sink per
 //!     paired device, labelled `<peer> (Ansync)`. Default on NixOS /
 //!     modern desktops.
-//!   * `aloop` — kernel-level `snd-aloop` loopback. Same UX as
-//!     v4l2loopback but for audio. Fallback when PipeWire isn't on
-//!     the box.
 //!   * `cpal` — talks to the system default device via cpal's ALSA
 //!     shim. Portable but doesn't create virtual nodes (mic forwarding
-//!     plays through the host's existing default output).
+//!     plays through the host's existing default output). Floor of the
+//!     fallback chain — works on PipeWire-via-ALSA, PulseAudio, and
+//!     vanilla ALSA hosts alike.
 //!
 //! The trait is dyn-friendly (`Box<dyn AudioBackend>`) so the
 //! daemon picks one at init and the rest of the codebase doesn't care
@@ -40,12 +39,6 @@ pub mod pipewire_backend;
 
 #[cfg(feature = "pipewire-backend")]
 pub use pipewire_backend::PipewireBackend;
-
-#[cfg(feature = "aloop-backend")]
-pub mod aloop_backend;
-
-#[cfg(feature = "aloop-backend")]
-pub use aloop_backend::AloopBackend;
 
 pub mod select;
 pub use select::{AudioBackendKind, select_audio_backend};

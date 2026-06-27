@@ -20,11 +20,9 @@ cpal = { workspace = true, optional = true }
 audiopus = { workspace = true, optional = true }
 pipewire = { workspace = true, optional = true }
 libspa = { workspace = true, optional = true }
-libc = { workspace = true, optional = true }
 
 [features]
-default = ["opus", "cpal-backend", "pipewire-backend", "aloop-backend"]
+default = ["opus", "cpal-backend", "pipewire-backend"]
 cpal-backend = ["dep:cpal"]
 opus = ["dep:audiopus"]
 pipewire-backend = ["dep:pipewire", "dep:libspa"]
-aloop-backend = ["dep:libc"]
