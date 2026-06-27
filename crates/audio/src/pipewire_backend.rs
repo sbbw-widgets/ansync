@@ -289,6 +289,12 @@ fn run_virtual_sink(
         *pw::keys::NODE_DESCRIPTION => description.clone(),
         *pw::keys::NODE_VIRTUAL => "true",
         *pw::keys::NODE_ALWAYS_PROCESS => "true",
+        // Block PipeWire's idle-suspend logic — `state=suspended` keeps
+        // the process callback from firing, so the ring fills up
+        // until apps actively connect. With this off + always-process,
+        // PipeWire keeps polling us so audio is fresh when a consumer
+        // arrives.
+        *pw::keys::NODE_SUSPEND_ON_IDLE => "false",
         "audio.position" => "FL,FR",
         *pw::keys::APP_NAME => "ansync",
     };
@@ -352,9 +358,19 @@ fn run_virtual_sink(
     stream.connect(
         spa::utils::Direction::Output,
         None,
-        pw::stream::StreamFlags::AUTOCONNECT | pw::stream::StreamFlags::MAP_BUFFERS,
+        pw::stream::StreamFlags::AUTOCONNECT
+            | pw::stream::StreamFlags::MAP_BUFFERS
+            | pw::stream::StreamFlags::RT_PROCESS,
         &mut params,
     )?;
+
+    // Virtual sources stay Paused by default — there's no consumer
+    // when no app has the mic open yet. `set_active(true)` flips the
+    // node into Streaming so the process callback fires immediately
+    // (so the PCM ring drains and pavucontrol's level meter moves).
+    if let Err(e) = stream.set_active(true) {
+        warn!(label, error = %e, "pipewire stream.set_active failed");
+    }
 
     info!(label, node_name, "pipewire virtual sink up");
 
