@@ -271,6 +271,11 @@ fn run_virtual_sink(
     //     mic pickers).
     //   * `node.virtual = true` tells wireplumber not to expect a
     //     hardware device backing it.
+    //   * `node.always-process = true` keeps the `process` callback
+    //     firing even when no consumer is connected. Without this,
+    //     PipeWire is lazy: it stops pulling data from us until an
+    //     app opens the mic — so the ring buffer fills up and the
+    //     first packet a consumer reads is stale by seconds.
     //   * `audio.position = [FL,FR]` pins the stereo layout so apps
     //     don't see "unknown" channels.
     // Discord, OBS, Firefox / Chromium all honor these props through
@@ -283,6 +288,7 @@ fn run_virtual_sink(
         *pw::keys::NODE_NAME => node_name.clone(),
         *pw::keys::NODE_DESCRIPTION => description.clone(),
         *pw::keys::NODE_VIRTUAL => "true",
+        *pw::keys::NODE_ALWAYS_PROCESS => "true",
         "audio.position" => "FL,FR",
         *pw::keys::APP_NAME => "ansync",
     };
