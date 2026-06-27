@@ -31,6 +31,19 @@ static CONNECTED: AtomicBool = AtomicBool::new(false);
 /// failure on the wire.
 static INPUT_TX_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Audio mic packets pumped onto the outbound `StreamKind::Audio`
+/// stream (companion → host). Logged in `stats_telemetry_loop` next
+/// to the QUIC counters; cross-check against the daemon's `pkts_in`
+/// audio stat to spot stream-level loss.
+static AUDIO_TX_PKTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static AUDIO_TX_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static AUDIO_TX_ENCODE_FAIL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Audio packets received off the inbound stream (host → companion,
+/// PC audio destined for the device speaker).
+static AUDIO_RX_PKTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static AUDIO_RX_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static AUDIO_RX_DECODE_FAIL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn mark_connected(state: bool) {
     CONNECTED.store(state, Ordering::Relaxed);
 }
@@ -641,6 +654,10 @@ async fn stats_telemetry_loop(conn: std::sync::Weak<QuicConnection>) {
     let mut prev_sent: u64 = 0;
     let mut prev_lost: u64 = 0;
     let mut prev_input: u64 = 0;
+    let mut prev_audio_tx_pkts: u64 = 0;
+    let mut prev_audio_tx_bytes: u64 = 0;
+    let mut prev_audio_rx_pkts: u64 = 0;
+    let mut prev_audio_rx_bytes: u64 = 0;
     loop {
         tick.tick().await;
         let Some(conn) = conn.upgrade() else {
@@ -658,11 +675,30 @@ async fn stats_telemetry_loop(conn: std::sync::Weak<QuicConnection>) {
         } else {
             (dlost as f64 / dsent as f64) * 100.0
         };
-        let input_total = INPUT_TX_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+        let input_total = INPUT_TX_COUNT.load(Ordering::Relaxed);
         let dinput = input_total.saturating_sub(prev_input);
         prev_input = input_total;
+
+        let atx_pkts = AUDIO_TX_PKTS.load(Ordering::Relaxed);
+        let atx_bytes = AUDIO_TX_BYTES.load(Ordering::Relaxed);
+        let arx_pkts = AUDIO_RX_PKTS.load(Ordering::Relaxed);
+        let arx_bytes = AUDIO_RX_BYTES.load(Ordering::Relaxed);
+        let datx_pkts = atx_pkts.saturating_sub(prev_audio_tx_pkts);
+        let datx_bytes = atx_bytes.saturating_sub(prev_audio_tx_bytes);
+        let darx_pkts = arx_pkts.saturating_sub(prev_audio_rx_pkts);
+        let darx_bytes = arx_bytes.saturating_sub(prev_audio_rx_bytes);
+        prev_audio_tx_pkts = atx_pkts;
+        prev_audio_tx_bytes = atx_bytes;
+        prev_audio_rx_pkts = arx_pkts;
+        prev_audio_rx_bytes = arx_bytes;
+        // 5 s window → kbps
+        let atx_kbps = (datx_bytes as f64) * 8.0 / 5_000.0;
+        let arx_kbps = (darx_bytes as f64) * 8.0 / 5_000.0;
+        let enc_fail = AUDIO_TX_ENCODE_FAIL.load(Ordering::Relaxed);
+        let dec_fail = AUDIO_RX_DECODE_FAIL.load(Ordering::Relaxed);
+
         debug!(
-            "quic stats: rtt={}ms sent={} lost={} loss={:.2}% cwnd={} black_holes={} input_tx={}",
+            "quic stats: rtt={}ms sent={} lost={} loss={:.2}% cwnd={} black_holes={} input_tx={} audio_tx_pkts={} audio_tx_kbps={:.1} audio_rx_pkts={} audio_rx_kbps={:.1} enc_fail={} dec_fail={}",
             conn.rtt().as_millis() as u64,
             dsent,
             dlost,
@@ -670,6 +706,12 @@ async fn stats_telemetry_loop(conn: std::sync::Weak<QuicConnection>) {
             s.path.cwnd,
             s.path.black_holes_detected,
             dinput,
+            datx_pkts,
+            atx_kbps,
+            darx_pkts,
+            arx_kbps,
+            enc_fail,
+            dec_fail,
         );
     }
 }
@@ -1005,10 +1047,13 @@ async fn audio_in_loop(mut stream: QuicStream, tx: UnboundedSender<Vec<u8>>) {
     loop {
         match stream.recv().await {
             Ok(bytes) => {
+                AUDIO_RX_PKTS.fetch_add(1, Ordering::Relaxed);
+                AUDIO_RX_BYTES.fetch_add(bytes.len() as u64, Ordering::Relaxed);
                 let pcm = match decoder.as_mut() {
                     Some(dec) => match dec.decode(&bytes) {
                         Ok(p) => p.to_vec(),
                         Err(e) => {
+                            AUDIO_RX_DECODE_FAIL.fetch_add(1, Ordering::Relaxed);
                             warn!("audio_in_loop: opus decode failed: {e}");
                             continue;
                         }
@@ -1764,11 +1809,15 @@ pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativeSendAudioChunk
         }
         let encoder = enc_guard.as_mut().expect("encoder just inserted");
         let packets = encoder.feed(&bytes).map_err(|e| {
+            AUDIO_TX_ENCODE_FAIL.fetch_add(1, Ordering::Relaxed);
             ansync_transport::TransportError::Handshake(format!("opus encode: {e}"))
         })?;
         let stream = stream_guard.as_mut().expect("stream just inserted");
         for packet in packets {
+            let n = packet.len();
             stream.send(packet).await?;
+            AUDIO_TX_PKTS.fetch_add(1, Ordering::Relaxed);
+            AUDIO_TX_BYTES.fetch_add(n as u64, Ordering::Relaxed);
         }
         Ok::<(), ansync_transport::TransportError>(())
     });

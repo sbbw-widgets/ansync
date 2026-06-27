@@ -15,8 +15,8 @@ use std::collections::HashMap;
 use std::sync::Mutex as StdMutex;
 
 use ansync_audio::{
-    AudioBackend, AudioFormat, BoxedSink, BoxedSource, OPUS_FRAME_SAMPLES, OpusDecoderWrap,
-    OpusEncoderWrap, SampleFormat, SharedAudioBackend, select_audio_backend,
+    AudioBackend, AudioFormat, AudioStats, BoxedSink, BoxedSource, OPUS_FRAME_SAMPLES,
+    OpusDecoderWrap, OpusEncoderWrap, SampleFormat, SharedAudioBackend, select_audio_backend,
 };
 use ansync_camera::{CameraFormat, CameraPixelFormat, VirtualCameraSink};
 use ansync_clipboard::{ClipboardBackend, ClipboardContent, WaylandClipboard};
@@ -444,10 +444,17 @@ pub struct AudioRegistry {
 pub struct AudioEntry {
     pub peer_name: String,
     /// Plays *into* the host (peer → host direction). Boxed so the
-    /// concrete backend (pipewire / aloop / cpal) lives behind the
+    /// concrete backend (pipewire / cpal) lives behind the
     /// `AudioSink` trait — switched at daemon init via
     /// `ANSYNC_AUDIO_BACKEND` and re-used across reconnects.
     sink: tokio::sync::Mutex<Option<Arc<tokio::sync::Mutex<BoxedSink>>>>,
+    /// Encode/decode counters surfaced by the per-peer audio stats
+    /// loop (Step 18e). Shared with both inbound + outbound loops via
+    /// `Arc` so atomics are global to the entry.
+    stats: Arc<AudioStats>,
+    /// Stats logger handle. Spawned in `handle_start_audio`, aborted
+    /// in `handle_stop_audio`.
+    stats_handle: StdMutex<Option<tokio::task::JoinHandle<()>>>,
     /// Captures *from* the host (host → peer direction). The
     /// background pump task moves bytes out of this source onto the
     /// outbound stream.
@@ -477,6 +484,8 @@ impl AudioRegistry {
                     inbound_tx: StdMutex::new(None),
                     inbound_handle: StdMutex::new(None),
                     inbound_tile_kind: StdMutex::new(None),
+                    stats: Arc::new(AudioStats::default()),
+                    stats_handle: StdMutex::new(None),
                 })
             })
             .clone()
@@ -1692,6 +1701,21 @@ async fn handle_start_audio(
         .ok_or_else(|| DaemonError::Startup(format!("peer {device} not connected")))?;
     let entry = audios.ensure(device, &mirror.peer_name);
 
+    // Stats logger — first call only. Replace-on-restart so the
+    // counters keep accumulating across pause/resume cycles.
+    {
+        let mut slot = entry
+            .stats_handle
+            .lock()
+            .expect("audio stats slot poisoned");
+        if slot.as_ref().map(|h| h.is_finished()).unwrap_or(true) {
+            let h = tokio::spawn(audio_stats_loop(device.clone(), entry.clone()));
+            if let Some(prev) = slot.replace(h) {
+                prev.abort();
+            }
+        }
+    }
+
     // Send the control message so the companion knows which
     // direction to bring up on its side.
     let mut ctrl = conn.open(StreamKind::Control).await?;
@@ -1770,7 +1794,10 @@ async fn handle_start_audio(
             .map_err(|e| DaemonError::Startup(format!("opus encoder: {e}")))?;
         let perms_pump = permissions.clone();
         let peer_pump = device.clone();
-        let handle = tokio::spawn(audio_pump_loop(stream, source, encoder, peer_pump, perms_pump));
+        let stats_pump = entry.stats.clone();
+        let handle = tokio::spawn(audio_pump_loop(
+            stream, source, encoder, peer_pump, perms_pump, stats_pump,
+        ));
         *entry
             .pump_handle
             .lock()
@@ -1806,6 +1833,14 @@ async fn handle_stop_audio(audios: &AudioRegistry, device: &DeviceId) {
         .lock()
         .expect("audio inbound tile slot poisoned") = None;
     *entry.sink.lock().await = None;
+    if let Some(h) = entry
+        .stats_handle
+        .lock()
+        .expect("audio stats slot poisoned")
+        .take()
+    {
+        h.abort();
+    }
     info!(%device, "StopAudioRoute done");
 }
 
@@ -1813,6 +1848,7 @@ async fn audio_render_loop(
     mut rx: UnboundedReceiver<bytes::Bytes>,
     sink: Arc<tokio::sync::Mutex<BoxedSink>>,
     codec: AudioCodec,
+    stats: Arc<AudioStats>,
 ) {
     let mut decoder = match codec {
         AudioCodec::Raw => None,
@@ -1829,6 +1865,7 @@ async fn audio_render_loop(
             Some(dec) => match dec.decode(&bytes) {
                 Ok(p) => p,
                 Err(e) => {
+                    stats.record_decode_fail();
                     warn!(error = %e, "audio_render_loop: opus decode failed; dropping packet");
                     continue;
                 }
@@ -1849,6 +1886,7 @@ async fn audio_pump_loop(
     mut encoder: OpusEncoderWrap,
     peer_id: DeviceId,
     permissions: Arc<dyn ansync_permissions::PermissionsStore>,
+    stats: Arc<AudioStats>,
 ) {
     loop {
         match source.read().await {
@@ -1864,15 +1902,18 @@ async fn audio_pump_loop(
                 let packets = match encoder.feed(&pcm) {
                     Ok(p) => p,
                     Err(e) => {
+                        stats.record_encode_fail();
                         warn!(error = %e, "audio_pump_loop: opus encode failed");
                         continue;
                     }
                 };
                 for packet in packets {
+                    let packet_len = packet.len();
                     if let Err(e) = stream.send(packet).await {
                         warn!(error = %e, "audio_pump_loop: stream send failed");
                         return;
                     }
+                    stats.record_out(packet_len);
                 }
             }
             Err(e) => {
@@ -1962,7 +2003,8 @@ async fn audio_inbound_loop(
                 return;
             }
         };
-        let handle = tokio::spawn(audio_render_loop(rx, sink, header.codec));
+        let stats_render = entry.stats.clone();
+        let handle = tokio::spawn(audio_render_loop(rx, sink, header.codec, stats_render));
         if let Some(prev) = entry
             .inbound_handle
             .lock()
@@ -2005,10 +2047,51 @@ async fn audio_inbound_loop(
             Some(tx) => tx,
             None => continue,
         };
+        entry.stats.record_in(bytes.len());
         if tx.send(bytes).is_err() {
             info!(%peer_id, "audio inbound receiver dropped; exiting");
             return;
         }
+    }
+}
+
+async fn audio_stats_loop(device: DeviceId, entry: Arc<AudioEntry>) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut prev_pkts_in = 0u64;
+    let mut prev_pkts_out = 0u64;
+    let mut prev_bytes_in = 0u64;
+    let mut prev_bytes_out = 0u64;
+    loop {
+        tick.tick().await;
+        let pkts_in = entry.stats.pkts_in.load(Relaxed);
+        let pkts_out = entry.stats.pkts_out.load(Relaxed);
+        let bytes_in = entry.stats.bytes_in.load(Relaxed);
+        let bytes_out = entry.stats.bytes_out.load(Relaxed);
+        let decode_fail = entry.stats.decode_fail.load(Relaxed);
+        let encode_fail = entry.stats.encode_fail.load(Relaxed);
+        let dp_in = pkts_in.saturating_sub(prev_pkts_in);
+        let dp_out = pkts_out.saturating_sub(prev_pkts_out);
+        let db_in = bytes_in.saturating_sub(prev_bytes_in);
+        let db_out = bytes_out.saturating_sub(prev_bytes_out);
+        prev_pkts_in = pkts_in;
+        prev_pkts_out = pkts_out;
+        prev_bytes_in = bytes_in;
+        prev_bytes_out = bytes_out;
+        // 5 s window — kbps shorthand: bytes/s * 8 / 1000.
+        let kbps_in = (db_in as f64) * 8.0 / 5_000.0;
+        let kbps_out = (db_out as f64) * 8.0 / 5_000.0;
+        debug!(
+            %device,
+            in_pkts = dp_in,
+            in_kbps = format!("{:.1}", kbps_in),
+            out_pkts = dp_out,
+            out_kbps = format!("{:.1}", kbps_out),
+            decode_fail,
+            encode_fail,
+            "audio stats",
+        );
     }
 }
 

@@ -97,3 +97,46 @@ pub trait AudioSink: Send {
 /// Convenience shared backend handle. Cloned by every audio entry that
 /// needs to allocate a source / sink.
 pub type SharedAudioBackend = Arc<dyn AudioBackend>;
+
+/// Per-peer audio telemetry. Both directions share one struct so the
+/// stats logger emits one tidy line per peer. Increments happen from
+/// the hot path (pump / render / inbound) so each field is an
+/// `AtomicU64`; the logger reads + computes deltas every 5 s, mirroring
+/// the QUIC stats telemetry pattern.
+#[derive(Default, Debug)]
+pub struct AudioStats {
+    /// Opus packets pumped onto the outbound stream (host → peer).
+    pub pkts_out: std::sync::atomic::AtomicU64,
+    /// Total bytes pushed on the outbound stream.
+    pub bytes_out: std::sync::atomic::AtomicU64,
+    /// Encoder failures on the outbound side — usually a sign of an
+    /// upstream PCM glitch (odd-byte chunk, encoder reset).
+    pub encode_fail: std::sync::atomic::AtomicU64,
+    /// Opus packets read from the inbound stream (peer → host).
+    pub pkts_in: std::sync::atomic::AtomicU64,
+    /// Total bytes seen on the inbound stream.
+    pub bytes_in: std::sync::atomic::AtomicU64,
+    /// Decoder failures — corrupt opus payload, version skew, etc.
+    pub decode_fail: std::sync::atomic::AtomicU64,
+}
+
+impl AudioStats {
+    pub fn record_out(&self, packet_bytes: usize) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.pkts_out.fetch_add(1, Relaxed);
+        self.bytes_out.fetch_add(packet_bytes as u64, Relaxed);
+    }
+    pub fn record_in(&self, packet_bytes: usize) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.pkts_in.fetch_add(1, Relaxed);
+        self.bytes_in.fetch_add(packet_bytes as u64, Relaxed);
+    }
+    pub fn record_encode_fail(&self) {
+        self.encode_fail
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    pub fn record_decode_fail(&self) {
+        self.decode_fail
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
