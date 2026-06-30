@@ -50,6 +50,21 @@ use crate::{
 /// this watermark.
 const RING_CAPACITY: usize = 64;
 
+/// Byte-level ring cap for the sink path. 48 kHz stereo S16 = 192 KB/s.
+/// 512 KiB ≈ 2.66 s — enough headroom for any sane jitter; older bytes
+/// get evicted past this watermark.
+const SINK_BYTE_CAP: usize = 512 * 1024;
+
+/// Sink prebuffer target: hold playback until this many bytes are
+/// queued, then drain freely. 7 680 B = 2 × Opus frame (40 ms) — masks
+/// network jitter without adding perceptible latency.
+const SINK_PREBUFFER_BYTES: usize = 7_680;
+
+/// Opus frame samples in a single packet. Used to pin PipeWire quantum
+/// via `node.latency = "<samples>/<rate>"` so the process callback
+/// pulls in exact frame-aligned chunks (no straddling).
+const OPUS_FRAME_SAMPLES_PW: u32 = 960;
+
 pub struct PipewireBackend;
 
 impl PipewireBackend {
@@ -156,6 +171,72 @@ impl PcmRing {
     }
 }
 
+/// Byte-level continuous ring used by the sink path. The PipeWire
+/// process callback drains exact `slot.len()` bytes per quantum — no
+/// chunk boundaries to straddle, no time scramble. A prebuffer
+/// threshold gates the first drain: until the buffer reaches
+/// `SINK_PREBUFFER_BYTES`, the callback emits `size = 0` (PipeWire
+/// treats that as no-data, no audible click). After priming, drains
+/// run continuous; if the buffer ever empties we re-arm the prebuffer
+/// gate, hiding underrun glitches as silence.
+struct ByteRing {
+    buf: Mutex<VecDeque<u8>>,
+    closed: AtomicBool,
+    primed: AtomicBool,
+}
+
+impl ByteRing {
+    fn new() -> Self {
+        Self {
+            buf: Mutex::new(VecDeque::with_capacity(SINK_BYTE_CAP)),
+            closed: AtomicBool::new(false),
+            primed: AtomicBool::new(false),
+        }
+    }
+
+    fn extend(&self, bytes: &[u8]) {
+        let mut q = self.buf.lock().expect("byte ring poisoned");
+        q.extend(bytes.iter().copied());
+        // Drop oldest bytes if over cap — keeps memory bounded under a
+        // slow consumer. Chops in 4 KiB swings so we don't pay the
+        // pop_front cost per byte.
+        while q.len() > SINK_BYTE_CAP {
+            let drop_n = (q.len() - SINK_BYTE_CAP).min(4096);
+            q.drain(..drop_n);
+        }
+        if !self.primed.load(Ordering::Acquire) && q.len() >= SINK_PREBUFFER_BYTES {
+            self.primed.store(true, Ordering::Release);
+        }
+    }
+
+    /// Drain exactly `slot.len()` bytes if primed and available;
+    /// returns bytes actually written (0 when not primed or empty).
+    fn drain_into(&self, slot: &mut [u8]) -> usize {
+        if !self.primed.load(Ordering::Acquire) {
+            return 0;
+        }
+        let mut q = self.buf.lock().expect("byte ring poisoned");
+        let want = slot.len();
+        let have = q.len();
+        if have == 0 {
+            // Re-arm prebuffer gate so the next quantum waits for
+            // more data — avoids tiny dribbles that glitch.
+            drop(q);
+            self.primed.store(false, Ordering::Release);
+            return 0;
+        }
+        let take = want.min(have);
+        for (i, b) in q.drain(..take).enumerate() {
+            slot[i] = b;
+        }
+        take
+    }
+
+    fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+    }
+}
+
 fn spa_format(fmt: SampleFormat) -> spa::param::audio::AudioFormat {
     match fmt {
         SampleFormat::S16Le => spa::param::audio::AudioFormat::S16LE,
@@ -211,14 +292,14 @@ fn audio_format_pod(
 /// `<label> (Ansync)` see the PCM we write into the ring.
 pub struct PwVirtualSink {
     label: String,
-    ring: Arc<PcmRing>,
+    ring: Arc<ByteRing>,
     shutdown: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
 
 impl PwVirtualSink {
     fn open(label: &str, format: AudioFormat) -> Result<Self, AudioError> {
-        let ring = Arc::new(PcmRing::new());
+        let ring = Arc::new(ByteRing::new());
         let shutdown = Arc::new(AtomicBool::new(false));
         let label_owned = label.to_string();
         let pcm_bytes_per_frame = bytes_per_frame(format.format, format.channels);
@@ -256,7 +337,7 @@ fn run_virtual_sink(
     description: String,
     format: AudioFormat,
     bytes_per_frame: usize,
-    ring: Arc<PcmRing>,
+    ring: Arc<ByteRing>,
     shutdown: Arc<AtomicBool>,
 ) -> Result<(), pw::Error> {
     pw::init();
@@ -264,42 +345,98 @@ fn run_virtual_sink(
     let context = pw::context::Context::new(&mainloop)?;
     let core = context.connect(None)?;
 
-    // Magic prop combo to make a Playback stream appear in app
-    // device pickers as a virtual audio source (= virtual mic):
-    //   * `media.class = Audio/Source/Virtual` registers the node as
-    //     a Source, not a Stream/Output/Audio (which apps ignore for
-    //     mic pickers).
-    //   * `node.virtual = true` tells wireplumber not to expect a
-    //     hardware device backing it.
-    //   * `node.always-process = true` keeps the `process` callback
-    //     firing even when no consumer is connected. Without this,
-    //     PipeWire is lazy: it stops pulling data from us until an
-    //     app opens the mic — so the ring buffer fills up and the
-    //     first packet a consumer reads is stale by seconds.
-    //   * `audio.position = [FL,FR]` pins the stereo layout so apps
-    //     don't see "unknown" channels.
-    // Discord, OBS, Firefox / Chromium all honor these props through
-    // the standard PipeWire/Pulse compat layer.
-    let props = pw::properties::properties! {
+    // Stage 1: ask the core to materialize a persistent
+    // `support.null-audio-sink` node and publish it as `Audio/Sink`.
+    //
+    // Why not `Audio/Source/Virtual` directly: when the null-sink is
+    // published as a pure Source, the adapter only exposes its
+    // *output* ports (capture_FL/FR). The session manager then has no
+    // input ports to route a Playback stream into, so `target.object`
+    // on the feeder gets ignored and wireplumber falls back to the
+    // default sink (= sound comes out the user's speakers, virtual
+    // mic stays silent).
+    //
+    // Publishing as `Audio/Sink` instead gives the node real input
+    // ports (`playback_FL/FR`) plus an auto-generated monitor source
+    // (`<node>.monitor` → capture_FL/FR) that apps record from. The
+    // feeder writes into the input ports; the monitor produces the
+    // same PCM as a recordable source. Equivalent to
+    // `pactl load-module module-null-sink sink_name=…`.
+    let null_sink_props = pw::properties::properties! {
+        "factory.name" => "support.null-audio-sink",
+        "node.name" => node_name.clone(),
+        "node.description" => description.clone(),
+        "media.class" => "Audio/Sink",
+        "audio.position" => "FL,FR",
+        "audio.channels" => format!("{}", format.channels),
+        "audio.rate" => format!("{}", format.sample_rate),
+        // Surface the monitor source so apps can pick it up under a
+        // pretty name (`<description> Monitor`) instead of having to
+        // toggle "show monitors" in pavucontrol.
+        "monitor.channel-volumes" => "true",
+        // Drop the node when the proxy goes away — keeps tear-down
+        // clean across daemon restarts. Real lifecycle is owned by
+        // the worker thread.
+        "object.linger" => "false",
+    };
+    let _null_sink_node: pw::node::Node = core
+        .create_object("adapter", &null_sink_props)
+        .map_err(|e| {
+            warn!(label = %label, error = %e, "create_object null-audio-sink failed");
+            pw::Error::CreationFailed
+        })?;
+
+    // Roundtrip so the server actually instantiates the node before
+    // the feeder stream tries to target it by name.
+    {
+        use std::cell::Cell;
+        use std::rc::Rc;
+        let done = Rc::new(Cell::new(false));
+        let pending = core.sync(0).map_err(|_| pw::Error::CreationFailed)?;
+        let done_cb = done.clone();
+        let ml_cb = mainloop.clone();
+        let _l = core
+            .add_listener_local()
+            .done(move |id, seq| {
+                if id == pw::core::PW_ID_CORE && seq == pending {
+                    done_cb.set(true);
+                    ml_cb.quit();
+                }
+            })
+            .register();
+        while !done.get() {
+            mainloop.run();
+        }
+    }
+    info!(label, node_name, "pipewire null-audio-sink registered");
+
+    // Stage 2: open a playback Stream that feeds the null-sink. The
+    // sink itself does the heavy lifting (it's a proper node), this
+    // stream just shovels PCM into it. `target.object` pins routing
+    // so the feeder never lands on the default speakers if no app is
+    // capturing yet.
+    let latency = format!("{}/{}", OPUS_FRAME_SAMPLES_PW, format.sample_rate);
+    let stream_props = pw::properties::properties! {
         *pw::keys::MEDIA_TYPE => "Audio",
         *pw::keys::MEDIA_CATEGORY => "Playback",
-        *pw::keys::MEDIA_ROLE => "Communication",
-        *pw::keys::MEDIA_CLASS => "Audio/Source/Virtual",
-        *pw::keys::NODE_NAME => node_name.clone(),
-        *pw::keys::NODE_DESCRIPTION => description.clone(),
-        *pw::keys::NODE_VIRTUAL => "true",
-        *pw::keys::NODE_ALWAYS_PROCESS => "true",
-        // Block PipeWire's idle-suspend logic — `state=suspended` keeps
-        // the process callback from firing, so the ring fills up
-        // until apps actively connect. With this off + always-process,
-        // PipeWire keeps polling us so audio is fresh when a consumer
-        // arrives.
-        *pw::keys::NODE_SUSPEND_ON_IDLE => "false",
-        "audio.position" => "FL,FR",
+        *pw::keys::MEDIA_ROLE => "Music",
+        *pw::keys::NODE_NAME => format!("{node_name}_feeder"),
+        *pw::keys::NODE_DESCRIPTION => format!("{description} feeder"),
         *pw::keys::APP_NAME => "ansync",
+        "target.object" => node_name.clone(),
+        // Keep emitting silence when the ring is empty so the feeder
+        // never goes idle — wireplumber would otherwise re-route the
+        // sink to a different source.
+        *pw::keys::NODE_ALWAYS_PROCESS => "true",
+        // Pin the PipeWire quantum to the Opus frame size (960 / 48000
+        // = 20 ms). Without this PipeWire defaults to 1024-sample
+        // quanta — every process callback strides past the 960-sample
+        // packet boundary, dragging in a partial of the next packet
+        // and creating audible buzz at the ~46 Hz boundary rate.
+        *pw::keys::NODE_LATENCY => latency.clone(),
     };
 
-    let stream = pw::stream::Stream::new(&core, &label, props)?;
+    let stream = pw::stream::Stream::new(&core, &label, stream_props)?;
     let ring_cb = ring.clone();
     let label_state = label.clone();
 
@@ -322,32 +459,30 @@ fn run_virtual_sink(
                 return;
             };
             let capacity = slot.len();
-            let mut written = 0usize;
-            // Pull as many ring frames as fit; pad with silence on
-            // shortfall to avoid skipping (PipeWire treats short
-            // chunks as glitches).
-            while written < capacity {
-                let chunk = match ring_cb.try_pop() {
-                    Some(c) => c,
-                    None => break,
-                };
-                let take = chunk.len().min(capacity - written);
-                slot[written..written + take].copy_from_slice(&chunk[..take]);
-                written += take;
-                if take < chunk.len() {
-                    // Push back the leftover; this happens when a
-                    // ring frame straddles the PipeWire buffer
-                    // boundary.
-                    let rest = chunk.slice(take..);
-                    ring_cb.push(rest);
-                }
+            // Continuous byte drain — no chunk straddling. Returns 0
+            // until prebuffer primes, then drains exactly `capacity`
+            // bytes per quantum as long as data is available.
+            let drained = ring_cb.drain_into(slot);
+            if drained == 0 {
+                // No data: report empty chunk so PipeWire stays idle
+                // for this quantum instead of replaying stale buffer
+                // contents. ALWAYS_PROCESS keeps the node alive.
+                let chunk = data.chunk_mut();
+                *chunk.offset_mut() = 0;
+                *chunk.size_mut() = 0;
+                *chunk.stride_mut() = bytes_per_frame as i32;
+                return;
             }
-            if written < capacity {
-                slot[written..].fill(0);
+            if drained < capacity {
+                // Partial drain after priming — zero the tail so we
+                // never replay stale memory from the SHM slot. Reports
+                // only `drained` bytes to PipeWire so the silence
+                // doesn't get treated as PCM.
+                slot[drained..].fill(0);
             }
             let chunk = data.chunk_mut();
             *chunk.offset_mut() = 0;
-            *chunk.size_mut() = capacity as u32;
+            *chunk.size_mut() = drained as u32;
             *chunk.stride_mut() = bytes_per_frame as i32;
         })
         .register()?;
@@ -364,15 +499,7 @@ fn run_virtual_sink(
         &mut params,
     )?;
 
-    // Virtual sources stay Paused by default — there's no consumer
-    // when no app has the mic open yet. `set_active(true)` flips the
-    // node into Streaming so the process callback fires immediately
-    // (so the PCM ring drains and pavucontrol's level meter moves).
-    if let Err(e) = stream.set_active(true) {
-        warn!(label, error = %e, "pipewire stream.set_active failed");
-    }
-
-    info!(label, node_name, "pipewire virtual sink up");
+    info!(label, node_name, "pipewire virtual mic feeder up");
 
     // Watch the shutdown flag in 50 ms ticks — gives Drop a clean
     // path without poking the loop from outside.
@@ -405,7 +532,7 @@ impl AudioSink for PwVirtualSink {
         if self.ring.closed.load(Ordering::Acquire) {
             return Err(AudioError::BackendUnavailable);
         }
-        self.ring.push(samples);
+        self.ring.extend(&samples);
         Ok(())
     }
 }

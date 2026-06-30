@@ -267,6 +267,7 @@ impl Daemon {
             mirrors: mirrors.clone(),
             cameras: cameras.clone(),
             audios: audios.clone(),
+            audio_backend: audio_backend.clone(),
             inputs: inputs.clone(),
             dbus_conn: dbus_conn_arc.clone(),
             device_name: self.config.device_name.clone(),
@@ -327,6 +328,12 @@ struct AcceptCtx {
     mirrors: Arc<MirrorRegistry>,
     cameras: Arc<CameraRegistry>,
     audios: Arc<AudioRegistry>,
+    /// Backend handle shared across per-peer audio loops. Plumbed
+    /// through here (instead of only sitting inside `handle_start_audio`)
+    /// so `audio_inbound_loop` can lazy-build a sink when the companion
+    /// brings up `StreamKind::Audio` without the host having called
+    /// `StartAudioRoute` first (e.g. the QSTile-driven mic share flow).
+    audio_backend: SharedAudioBackend,
     inputs: Arc<InputRegistry>,
     dbus_conn: Arc<zbus::Connection>,
     /// Local host's human-readable name (e.g. `gethostname(2)` output).
@@ -898,6 +905,7 @@ async fn accept_loop(ctx: AcceptCtx) {
                 let mirrors = ctx.mirrors.clone();
                 let cameras = ctx.cameras.clone();
                 let audios = ctx.audios.clone();
+                let audio_backend = ctx.audio_backend.clone();
                 let inputs = ctx.inputs.clone();
                 let dbus_conn = ctx.dbus_conn.clone();
                 let device_name = ctx.device_name.clone();
@@ -916,6 +924,7 @@ async fn accept_loop(ctx: AcceptCtx) {
                         mirrors,
                         cameras,
                         audios,
+                        audio_backend,
                         inputs,
                         dbus_conn,
                         device_name,
@@ -948,6 +957,7 @@ async fn handle_connection(
     mirrors: Arc<MirrorRegistry>,
     cameras: Arc<CameraRegistry>,
     audios: Arc<AudioRegistry>,
+    audio_backend: SharedAudioBackend,
     inputs: Arc<InputRegistry>,
     dbus_conn: Arc<zbus::Connection>,
     device_name: String,
@@ -1102,7 +1112,8 @@ async fn handle_connection(
                 let pid = peer_id.clone();
                 let perms = permissions.clone();
                 let dbus = dbus_conn.clone();
-                tokio::spawn(audio_inbound_loop(stream, entry, pid, perms, dbus));
+                let backend = audio_backend.clone();
+                tokio::spawn(audio_inbound_loop(stream, entry, pid, perms, dbus, backend));
             }
             StreamKind::Clipboard => {
                 let pid = peer_id.clone();
@@ -1930,6 +1941,7 @@ async fn audio_inbound_loop(
     peer_id: DeviceId,
     permissions: Arc<dyn ansync_permissions::PermissionsStore>,
     dbus_conn: Arc<zbus::Connection>,
+    audio_backend: SharedAudioBackend,
 ) {
     // Emit `StreamStateChanged(<tile>, false)` if the companion drops
     // the inbound stream while the host still believed the route was
@@ -1990,9 +2002,57 @@ async fn audio_inbound_loop(
         }
     };
     info!(%peer_id, codec = ?header.codec, "audio inbound stream wired");
+    // Lazy-provision the sink if no `StartAudioRoute(DeviceToHost)`
+    // came in over D-Bus first. The QSTile-driven mic share flow on
+    // the companion brings up `StreamKind::Audio` directly, so the
+    // host has to materialize the virtual mic node on the fly here.
+    // Permission gate still applies; revoked `AudioIn` aborts render.
+    if !permissions
+        .check(&peer_id, Permission::AudioIn)
+        .await
+        .unwrap_or(false)
+    {
+        warn!(%peer_id, "audio_in permission off; refusing inbound audio");
+        return;
+    }
+    {
+        let mut sink_guard = entry.sink.lock().await;
+        if sink_guard.is_none() {
+            let label = format!("ansync-in-{}", entry.peer_name);
+            let format = AudioFormat {
+                sample_rate: header.sample_rate,
+                channels: header.channels,
+                format: SampleFormat::S16Le,
+            };
+            match audio_backend.create_sink(&label, format).await {
+                Ok(s) => {
+                    *sink_guard = Some(Arc::new(tokio::sync::Mutex::new(s)));
+                    info!(%peer_id, label, "audio sink lazy-provisioned for inbound route");
+                }
+                Err(e) => {
+                    warn!(%peer_id, error = %e, "lazy create_sink failed");
+                    return;
+                }
+            }
+            *entry
+                .inbound_tile_kind
+                .lock()
+                .expect("audio inbound tile slot poisoned") = Some("mic");
+            let mut slot = entry
+                .stats_handle
+                .lock()
+                .expect("audio stats slot poisoned");
+            if slot.as_ref().map(|h| h.is_finished()).unwrap_or(true) {
+                let h = tokio::spawn(audio_stats_loop(peer_id.clone(), entry.clone()));
+                if let Some(prev) = slot.replace(h) {
+                    prev.abort();
+                }
+            }
+        }
+    }
     // Provision the render task now that we know the codec. The
-    // `inbound_tx` slot was set up by `handle_start_audio`; we drain
-    // through it into `audio_render_loop`.
+    // `inbound_tx` slot was set up by `handle_start_audio` (or the
+    // lazy path above); we drain through it into `audio_render_loop`.
     {
         let (tx, rx) = unbounded_channel::<bytes::Bytes>();
         *entry.inbound_tx.lock().expect("audio inbound tx poisoned") = Some(tx);

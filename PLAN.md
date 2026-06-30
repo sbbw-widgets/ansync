@@ -363,6 +363,21 @@ Surfaceado mientras se probaba el pair WiFi + mirror lifecycle real con DMS. Cad
   - Nuevo `SetupStep.BatteryWhitelist`: lanza `ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS` con `Uri.fromParts("package", …)`. Fallback a `ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS`. `KeepAlive.isBatteryWhitelisted(ctx)` para `isDone`.
   - Manifest: nueva perm `REQUEST_IGNORE_BATTERY_OPTIMIZATIONS`.
 
+- [x] **S12 — PipeWire mic share end-to-end (sesión 2026-06-30)**
+  - Síntoma reportado: el mic de Android se escuchaba por los audífonos del host (mal routing) y el virtual mic registrado no producía sonido / sonaba fatal con ruido constante.
+  - Diagnóstico vía `pw-link -l` + diag PCM stats (mean_abs / peak_abs por ventana de 50 packets en `audio_render_loop`):
+    1. `audio_inbound_loop` exitía con "sink missing" porque el QSTile-driven mic share del companion abre `StreamKind::Audio` directo sin `StartAudioRoute` previo por D-Bus → no había sink provisioned.
+    2. Plan A inicial publicaba el nodo como `Audio/Source/Virtual` → adapter solo exponía `capture_FL/FR` outputs, sin `playback_FL/FR` inputs → feeder caía al default sink (easyeffects → speakers).
+    3. PCM decodificado era correcto (mean variando con voz) pero ruido brutal — `VecDeque<Bytes>` ring scrambleaba orden temporal al re-encolar leftover chunk con `push_back`.
+    4. Aún tras `push_front` fix seguía buzzy — quantum PipeWire (1024) ≠ Opus frame (960) → straddling de packets en cada callback + silence-pad mid-buffer cada underrun.
+  - Fixes:
+    - `daemon-core::audio_inbound_loop`: lazy-provisiona sink desde el `AudioStreamInit` header si `entry.sink` está vacío (perm gate `AudioIn` re-checkeado). Plumbing `audio_backend: SharedAudioBackend` por `AcceptCtx → accept_loop → handle_connection`.
+    - `pipewire_backend::run_virtual_sink`: Plan A — `core.create_object::<Node>("adapter", { factory.name=support.null-audio-sink, media.class=Audio/Sink, audio.position=FL,FR, ... })` con roundtrip `core.sync(0)` antes de conectar feeder. `Audio/Sink` (no `Audio/Source/Virtual`) garantiza input ports + auto monitor source.
+    - `pipewire_backend::ByteRing`: reemplazo del `PcmRing` chunk-based por buffer byte-level continuo (`VecDeque<u8>`, cap 512 KiB). Process callback drena `slot.len()` exacto, cero straddling. Prebuffer 40 ms (2 frames Opus) gate la primera salida y se re-arma en underrun → emite `chunk.size=0` (silencio limpio, no click).
+    - Feeder stream gana `node.latency = "960/48000"` → PipeWire negocia quantum 960, alineado a packet Opus.
+    - Diag stats removidas tras validar fix.
+  - Resultado: mic share funciona excelente, sin ruido, sin glitches. PipeWire surface `<peer_name> (Ansync)` aparece en Discord / Firefox / etc.
+
 - [x] **S11 — Camera UX + sink fixes**
   - **Short writes**: `V4l2LoopbackSink::write_frame` ahora loop hasta drenar `frame.len()`. POSIX write(2) puede devolver < total (v4l2loopback cappea por buffer slot del ringbuffer). Retry en `EINTR`/`EAGAIN`; surface `WriteZero` si kernel devuelve 0 bytes (sin consumer).
   - **StopCamera no propagaba al device**: `handle_stop_camera` ahora dispara `ControlMessage::StopCamera` por `StreamKind::Control` ANTES del teardown local. Sin esto, `CameraSession` Camera2 + MediaCodec quedaban corriendo (no hay backpressure por Surface input) → LED + drain de batería persistentes. Mantenemos teardown local aunque el send falle (peer puede haber colgado).
