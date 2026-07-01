@@ -15,6 +15,18 @@ const val PREF_HOST_ADDR = "host_addr"
 const val PREF_MIRROR_ACTIVE = "tile_mirror_active"
 const val PREF_TOUCHPAD_ACTIVE = "tile_touchpad_active"
 const val PREF_MIC_ACTIVE = "tile_mic_active"
+const val PREF_CAMERA_ACTIVE = "tile_camera_active"
+
+/** [CameraLocalConfig] persistence — long-press on the camera tile
+ *  edits these via the settings popup; short taps load them. */
+const val PREF_CAMERA_ID = "camera_id"
+const val PREF_CAMERA_WIDTH = "camera_width"
+const val PREF_CAMERA_HEIGHT = "camera_height"
+const val PREF_CAMERA_FPS = "camera_fps"
+const val PREF_CAMERA_BITRATE = "camera_bitrate_kbps"
+const val PREF_CAMERA_CODEC = "camera_codec"
+const val PREF_CAMERA_ASPECT = "camera_aspect"
+const val PREF_CAMERA_STAB = "camera_stabilization"
 
 /**
  * Opt-in: hold a `PARTIAL_WAKE_LOCK` while at least one stream

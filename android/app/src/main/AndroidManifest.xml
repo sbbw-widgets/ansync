@@ -120,6 +120,24 @@
             android:noHistory="true" />
 
         <!--
+            Camera capture settings popup. Long-press on the CameraTile
+            routes here via QS_TILE_PREFERENCES. Also launched on the
+            first short-tap of the tile when no CameraLocalConfig has
+            been persisted yet — the extra `start_after_save` tells the
+            activity to fire ACTION_START_CAMERA on Save.
+        -->
+        <activity
+            android:name=".CameraSettingsActivity"
+            android:exported="true"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar"
+            android:excludeFromRecents="true"
+            android:noHistory="true">
+            <intent-filter>
+                <action android:name="android.service.quicksettings.action.QS_TILE_PREFERENCES" />
+            </intent-filter>
+        </activity>
+
+        <!--
             Cable-pair driver. Launched by PairingReceiver after the
             host's am broadcast lands; runs the native bootstrap on a
             background thread so the receiver can return inside the
@@ -265,6 +283,20 @@
             <intent-filter>
                 <action android:name="android.service.quicksettings.action.QS_TILE" />
             </intent-filter>
+        </service>
+
+        <service
+            android:name=".tile.CameraTile"
+            android:label="@string/tile_camera_label"
+            android:icon="@android:drawable/ic_menu_camera"
+            android:exported="true"
+            android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
+            <intent-filter>
+                <action android:name="android.service.quicksettings.action.QS_TILE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.service.quicksettings.TOGGLEABLE_TILE"
+                android:value="true" />
         </service>
 
         <service

@@ -86,10 +86,26 @@ object NativeBridge {
     external fun nativeSendInputMessage(blob: ByteArray): Boolean
 
     /**
+     * Announce the camera wire format to the host + open the
+     * outbound Camera stream. Sends the `CameraStreamInit` postcard
+     * as the first stream frame. MUST be called before the first
+     * [nativeSendCameraChunk]. Codec tags: 0 = H.264, 1 = H.265.
+     * Aspect tags: 0 = Crop, 1 = Letterbox, 2 = Stretch.
+     */
+    external fun nativeSendCameraStreamInit(
+        width: Int,
+        height: Int,
+        fps: Int,
+        codec: Int,
+        aspect: Int,
+    ): Boolean
+
+    /**
      * Push one encoded camera frame (H.264 / H.265 access unit) over
-     * the outbound Camera stream. Lazy-opens the stream on first
-     * call. Returns `false` if the stream is unhealthy — caller
-     * should tear the encoder down.
+     * the already-open outbound Camera stream. The stream MUST have
+     * been opened via [nativeSendCameraStreamInit]. Returns `false`
+     * if the stream is unhealthy — caller should tear the encoder
+     * down.
      */
     external fun nativeSendCameraChunk(chunk: ByteArray, ptsUs: Long): Boolean
 

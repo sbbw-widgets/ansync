@@ -32,8 +32,9 @@ use ansync_input::{InputDeviceFactory, InputSession, UinputFactory};
 use ansync_pairing::PeerStore;
 use perms_backend::PeerStorePermissions;
 use ansync_proto::{
-    AudioCodec, AudioDirection, AudioStreamInit, ClipboardMessage, ControlMessage,
-    Envelope, Hello, InputMessage, Message, NotificationMessage, PROTOCOL_VERSION, UrlMessage,
+    AudioCodec, AudioDirection, AudioStreamInit, CameraStreamInit, ClipboardMessage,
+    ControlMessage, Envelope, Hello, InputMessage, Message, NotificationMessage,
+    PROTOCOL_VERSION, UrlMessage, VideoCodec as ProtoVideoCodec,
 };
 use ansync_transport::pinning::TrustedPeers;
 use ansync_transport::{
@@ -1047,8 +1048,9 @@ async fn handle_connection(
             StreamKind::Camera => {
                 let entry = camera_entry.clone();
                 let pid = peer_id.clone();
+                let perms = permissions.clone();
                 let dbus = dbus_conn.clone();
-                tokio::spawn(camera_stream_loop(stream, entry, pid, dbus));
+                tokio::spawn(camera_stream_loop(stream, entry, pid, perms, dbus));
             }
             StreamKind::Audio => {
                 let entry = audio_entry.clone();
@@ -1220,18 +1222,29 @@ async fn stats_telemetry_loop(
     }
 }
 
+/// Reactive camera provisioning: read the `CameraStreamInit` header
+/// off the first frame, build + register the v4l2loopback sink,
+/// spawn the decoder loop, then fan subsequent frames through it.
+///
+/// Permission gate is enforced up front — if `CameraVideo` is off
+/// for this peer we drop the stream without a sink registration.
 async fn camera_stream_loop(
     mut stream: QuicStream,
     entry: Arc<CameraEntry>,
     peer_id: DeviceId,
+    permissions: Arc<dyn ansync_permissions::PermissionsStore>,
     dbus_conn: Arc<zbus::Connection>,
 ) {
     info!(%peer_id, "camera stream wired");
-    // Fire `StreamStateChanged("camera", false)` if the stream dies
-    // while the daemon still thought the route was up (companion-side
-    // tile flip, MediaCodec crash, projection revoked). Daemon-initiated
-    // StopCamera already cleared `frame_tx` AND emitted, so the guard
-    // becomes a no-op there.
+    if !permissions
+        .check(&peer_id, Permission::CameraVideo)
+        .await
+        .unwrap_or(false)
+    {
+        warn!(%peer_id, "camera_video permission off; dropping stream");
+        return;
+    }
+    // Fire `StreamStateChanged("camera", false)` on stream drop.
     struct CameraExitGuard {
         entry: Arc<CameraEntry>,
         peer_id: DeviceId,
@@ -1248,6 +1261,27 @@ async fn camera_stream_loop(
                     false
                 }
             };
+            if let Some(handle) = self
+                .entry
+                .handle
+                .lock()
+                .expect("camera handle slot poisoned")
+                .take()
+            {
+                handle.abort();
+            }
+            let entry = self.entry.clone();
+            tokio::spawn(async move {
+                let mut sink_guard = entry.sink.lock().await;
+                if let Some(sink) = sink_guard.take() {
+                    if let Err(e) = sink.unregister().await {
+                        warn!(error = %e, "camera sink unregister failed");
+                    }
+                }
+                entry
+                    .sink_registered
+                    .store(false, std::sync::atomic::Ordering::Release);
+            });
             if !still_active {
                 return;
             }
@@ -1261,32 +1295,69 @@ async fn camera_stream_loop(
     let _guard = CameraExitGuard {
         entry: entry.clone(),
         peer_id: peer_id.clone(),
-        dbus_conn,
+        dbus_conn: dbus_conn.clone(),
     };
+
+    // Header first: sizes + codec announced by the phone.
+    let header_bytes = match stream.recv().await {
+        Ok(b) => b,
+        Err(e) => {
+            warn!(%peer_id, error = %e, "camera header recv failed");
+            return;
+        }
+    };
+    let header: CameraStreamInit = match postcard::from_bytes(&header_bytes) {
+        Ok(h) => h,
+        Err(e) => {
+            warn!(%peer_id, error = %e, "camera header decode failed");
+            return;
+        }
+    };
+    info!(
+        %peer_id,
+        w = header.width,
+        h = header.height,
+        fps = header.fps,
+        codec = ?header.codec,
+        aspect = ?header.aspect,
+        "camera stream init received"
+    );
+
+    // Provision sink + decoder now that we know the wire format.
+    let sink: Arc<dyn VirtualCameraSink> = match build_camera_sink() {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(%peer_id, error = %e, "build camera sink failed; dropping stream");
+            return;
+        }
+    };
+    *entry.sink.lock().await = Some(sink);
+    let codec = match header.codec {
+        ProtoVideoCodec::H264 => VideoCodec::H264,
+        ProtoVideoCodec::H265 => VideoCodec::H265,
+    };
+    let (frame_tx, frame_rx) = unbounded_channel::<bytes::Bytes>();
+    *entry.frame_tx.lock().expect("frame tx slot poisoned") = Some(frame_tx);
+    let decoder_handle = tokio::spawn(camera_decode_loop(
+        entry.clone(),
+        codec,
+        header.width,
+        header.height,
+        frame_rx,
+    ));
+    *entry.handle.lock().expect("camera handle slot poisoned") = Some(decoder_handle);
+    emit_stream(&dbus_conn, &peer_id, "camera", true).await;
+
     loop {
         let bytes = match stream.recv().await {
             Ok(b) => b,
             Err(ansync_transport::TransportError::Closed)
             | Err(ansync_transport::TransportError::TimedOut) => {
-                info!(%peer_id, "camera stream closed");
+                info!(%peer_id, "camera stream closed by peer");
                 return;
             }
             Err(e) => {
-                // StopCamera path: companion drops its end of the stream
-                // and quinn surfaces that as `early eof` on the next
-                // recv. The local side already cleared `frame_tx` so we
-                // know this is a graceful teardown — keep the log at
-                // info to avoid scaring the user.
-                let graceful = entry
-                    .frame_tx
-                    .lock()
-                    .expect("frame tx slot poisoned")
-                    .is_none();
-                if graceful {
-                    info!(%peer_id, "camera stream closed by peer");
-                } else {
-                    warn!(%peer_id, error = %e, "camera stream recv error");
-                }
+                warn!(%peer_id, error = %e, "camera stream recv error");
                 return;
             }
         };
@@ -1297,14 +1368,7 @@ async fn camera_stream_loop(
             .clone()
         {
             Some(tx) => tx,
-            None => {
-                // StartCamera hasn't fired yet (companion opened its
-                // stream first) or StopCamera already cleared the
-                // sender. Drop frames silently — when StartCamera
-                // arrives it spawns a fresh decoder loop that picks
-                // up subsequent frames.
-                continue;
-            }
+            None => continue,
         };
         if tx.send(bytes).is_err() {
             info!(%peer_id, "camera frame receiver dropped; exiting");

@@ -97,21 +97,22 @@ pub enum VideoCodec {
     H265,
 }
 
-/// Per-call camera capture parameters negotiated host → companion.
-/// `camera_id` is an Android `cameraId` string ("0" = primary back,
-/// "1" = primary front on most devices). Width/height are the
-/// *encoder output* dimensions; the companion may letterbox or
-/// downscale the sensor frame to fit, honouring `aspect`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CameraConfig {
-    pub camera_id: String,
+/// Header declared on the first frame of every `StreamKind::Camera`
+/// stream (phone → PC, phone-initiated). Subsequent frames are
+/// encoded video access units for the announced codec.
+///
+/// Post sender-initiates refactor (2026-07-01): the phone picks its
+/// own encoding parameters (from the [`CameraSettingsActivity`]
+/// popup) and tells the daemon via this header. The daemon uses
+/// `width`/`height` to size the v4l2loopback sink and `codec` to
+/// pick the right hardware decoder.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct CameraStreamInit {
     pub width: u32,
     pub height: u32,
     pub fps: u8,
-    pub bitrate_kbps: u32,
     pub codec: VideoCodec,
     pub aspect: CameraAspect,
-    pub stabilization: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]

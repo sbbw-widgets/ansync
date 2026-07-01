@@ -1494,6 +1494,82 @@ pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativeSendInputMessa
     }
 }
 
+/// Open the outbound `StreamKind::Camera` + send the
+/// `CameraStreamInit` header as the first frame. Must be called
+/// BEFORE the first `nativeSendCameraChunk`. `codec` and `aspect`
+/// use the same tag values as the Kotlin `CameraLocalConfig` enum
+/// (0=H264 / 1=H265, 0=Crop / 1=Letterbox / 2=Stretch).
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativeSendCameraStreamInit<'local>(
+    _env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    width: jni::sys::jint,
+    height: jni::sys::jint,
+    fps: jni::sys::jint,
+    codec: jni::sys::jint,
+    aspect: jni::sys::jint,
+) -> jboolean {
+    let codec = match codec {
+        0 => ansync_proto::VideoCodec::H264,
+        1 => ansync_proto::VideoCodec::H265,
+        other => {
+            warn!("nativeSendCameraStreamInit: unknown codec tag {other}");
+            return jni::sys::JNI_FALSE;
+        }
+    };
+    let aspect = match aspect {
+        0 => ansync_proto::CameraAspect::Crop,
+        1 => ansync_proto::CameraAspect::Letterbox,
+        2 => ansync_proto::CameraAspect::Stretch,
+        other => {
+            warn!("nativeSendCameraStreamInit: unknown aspect tag {other}");
+            return jni::sys::JNI_FALSE;
+        }
+    };
+    let init = ansync_proto::CameraStreamInit {
+        width: width as u32,
+        height: height as u32,
+        fps: fps as u8,
+        codec,
+        aspect,
+    };
+    let bytes = match postcard::to_allocvec(&init) {
+        Ok(b) => b,
+        Err(e) => {
+            error!("nativeSendCameraStreamInit: encode: {e}");
+            return jni::sys::JNI_FALSE;
+        }
+    };
+    let (conn, outbound_camera) = {
+        let slot = state_slot().lock().expect("state mutex poisoned");
+        match slot.as_ref().and_then(|s| s.session.as_ref()) {
+            Some(sess) => (sess.conn.clone(), sess.outbound_camera.clone()),
+            None => {
+                warn!("nativeSendCameraStreamInit: no active session");
+                return jni::sys::JNI_FALSE;
+            }
+        }
+    };
+    let result = runtime().block_on(async move {
+        let mut guard = outbound_camera.lock().await;
+        if guard.is_some() {
+            warn!("nativeSendCameraStreamInit: stream already open; refusing to re-init");
+            return Err(ansync_transport::TransportError::Closed);
+        }
+        let mut stream = conn.open(StreamKind::Camera).await?;
+        stream.send(Bytes::from(bytes)).await?;
+        *guard = Some(stream);
+        Ok::<(), ansync_transport::TransportError>(())
+    });
+    match result {
+        Ok(()) => jni::sys::JNI_TRUE,
+        Err(e) => {
+            warn!("nativeSendCameraStreamInit: stream open failed: {e}");
+            jni::sys::JNI_FALSE
+        }
+    }
+}
+
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativeSendCameraChunk<'local>(
     env: JNIEnv<'local>,
@@ -1508,10 +1584,10 @@ pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativeSendCameraChun
             return jni::sys::JNI_FALSE;
         }
     };
-    let (conn, outbound_camera) = {
+    let outbound_camera = {
         let slot = state_slot().lock().expect("state mutex poisoned");
         match slot.as_ref().and_then(|s| s.session.as_ref()) {
-            Some(sess) => (sess.conn.clone(), sess.outbound_camera.clone()),
+            Some(sess) => sess.outbound_camera.clone(),
             None => {
                 warn!("nativeSendCameraChunk: no active session");
                 return jni::sys::JNI_FALSE;
@@ -1520,15 +1596,13 @@ pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativeSendCameraChun
     };
     let result = runtime().block_on(async move {
         let mut guard = outbound_camera.lock().await;
-        if guard.is_none() {
-            let stream = conn.open(StreamKind::Camera).await?;
-            *guard = Some(stream);
+        match guard.as_mut() {
+            Some(stream) => stream.send(Bytes::from(bytes)).await,
+            None => {
+                warn!("nativeSendCameraChunk: stream not opened; call nativeSendCameraStreamInit first");
+                Err(ansync_transport::TransportError::Closed)
+            }
         }
-        guard
-            .as_mut()
-            .expect("just inserted")
-            .send(Bytes::from(bytes))
-            .await
     });
     match result {
         Ok(()) => jni::sys::JNI_TRUE,

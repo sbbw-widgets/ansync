@@ -581,7 +581,26 @@ class AnsyncCompanionService : Service() {
         NativeBridge.nativeSendStopAudioSink()
     }
 
-    // Camera lifecycle (start + stop) wires in task #5 via CameraTile.
+    /** Fired by [tile.CameraTile] short-tap. Loads the persisted
+     *  [CameraLocalConfig] (or defaults on first run) and spawns a
+     *  [CameraSession]. Config is picked BY the phone — the host
+     *  never dictates. */
+    private fun handleStartCamera() {
+        if (camera != null) {
+            Log.i(TAG, "camera already running; ignoring start")
+            return
+        }
+        promoteForegroundType(
+            ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+                or ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA
+        )
+        val cfg = CameraLocalConfig.load(this)
+        camera = CameraSession(this, cfg).also { it.start() }
+        markStream("camera", true)
+        Log.i(TAG, "camera session started ${cfg.cameraId} ${cfg.width}x${cfg.height}@${cfg.fps}")
+        refreshNotification()
+    }
+
     private fun handleStopCamera() {
         camera?.stop()
         camera = null
@@ -646,6 +665,7 @@ class AnsyncCompanionService : Service() {
             // the notif tears the local AudioTrack down AND tells the
             // PC to stop pumping (receiver-can-stop).
             ACTION_STOP_AUDIO_SINK -> stopAudioSinkFromNotif()
+            ACTION_START_CAMERA -> handleStartCamera()
             ACTION_STOP_CAMERA -> handleStopCamera()
             ACTION_START_CAPTURE -> {
                 val resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, 0)
@@ -945,7 +965,9 @@ class AnsyncCompanionService : Service() {
         const val ACTION_STOP_MIC_SHARE = "org.gameros.ansync.action.STOP_MIC_SHARE"
         const val ACTION_STOP_AUDIO_SINK = "org.gameros.ansync.action.STOP_AUDIO_SINK"
 
-        /** Camera lifecycle stop (notification action button). */
+        /** Camera lifecycle (QSTile short-tap start, notification /
+         *  QSTile toggle-off stop). */
+        const val ACTION_START_CAMERA = "org.gameros.ansync.action.START_CAMERA"
         const val ACTION_STOP_CAMERA = "org.gameros.ansync.action.STOP_CAMERA"
 
         /** Flip [PREF_CPU_WAKE_LOCK] at runtime.

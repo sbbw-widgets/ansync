@@ -27,14 +27,18 @@ import kotlin.concurrent.thread
  *   CameraDevice ─▶ CaptureSession ─▶ MediaCodec input Surface ─▶
  *     MediaCodec encoder (H.264 / H.265) ─▶ NativeBridge.nativeSendCameraChunk
  *
- * Lifecycle is driven by the host through the Control stream
- * (StartCamera / StopCamera). The companion never opens a camera on
- * its own — the host's explicit request is what triggers the user-
- * facing permission grant + the foreground service notification.
+ * Lifecycle is phone-driven (post sender-initiates refactor). The
+ * QSTile short-tap fires `ACTION_START_CAMERA` with a
+ * [CameraLocalConfig] loaded from SharedPreferences; long-press
+ * opens [CameraSettingsActivity] to edit the config first.
+ *
+ * The host never asks — it just accepts the incoming Camera stream
+ * and reads the [CameraStreamInit] header off the first frame to
+ * provision its v4l2loopback sink.
  */
 class CameraSession(
     private val context: Context,
-    private val config: WireCameraControl.StartCamera,
+    private val config: CameraLocalConfig,
 ) {
     private val cameraManager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
     private var encoder: MediaCodec? = null
@@ -49,8 +53,8 @@ class CameraSession(
     fun start() {
         if (running) return
         val mime = when (config.codec) {
-            WireCameraControl.Codec.H264 -> MediaFormat.MIMETYPE_VIDEO_AVC
-            WireCameraControl.Codec.H265 -> MediaFormat.MIMETYPE_VIDEO_HEVC
+            CameraLocalConfig.Codec.H264 -> MediaFormat.MIMETYPE_VIDEO_AVC
+            CameraLocalConfig.Codec.H265 -> MediaFormat.MIMETYPE_VIDEO_HEVC
         }
 
         // Pick a sensor-supported output size at least as large as
@@ -59,17 +63,32 @@ class CameraSession(
         val pickedSize = pickOutputSize(config.cameraId, config.width, config.height)
         Log.i(TAG, "camera $cameraId picked size $pickedSize for target ${config.width}x${config.height}")
 
+        // Announce the wire format to the host BEFORE the first
+        // encoded frame. If this fails we abort — the daemon can't
+        // decode without the CameraStreamInit header.
+        val initOk = NativeBridge.nativeSendCameraStreamInit(
+            pickedSize.width,
+            pickedSize.height,
+            config.fps,
+            config.codec.tag,
+            config.aspect.tag,
+        )
+        if (!initOk) {
+            Log.e(TAG, "nativeSendCameraStreamInit failed; aborting")
+            return
+        }
+
         val format = MediaFormat.createVideoFormat(mime, pickedSize.width, pickedSize.height).apply {
             setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
             setInteger(MediaFormat.KEY_BIT_RATE, config.bitrateKbps * 1000)
             setInteger(MediaFormat.KEY_FRAME_RATE, config.fps)
             setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, I_FRAME_INTERVAL_SEC)
             when (config.codec) {
-                WireCameraControl.Codec.H264 -> setInteger(
+                CameraLocalConfig.Codec.H264 -> setInteger(
                     MediaFormat.KEY_PROFILE,
                     MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline,
                 )
-                WireCameraControl.Codec.H265 -> setInteger(
+                CameraLocalConfig.Codec.H265 -> setInteger(
                     MediaFormat.KEY_PROFILE,
                     MediaCodecInfo.CodecProfileLevel.HEVCProfileMain,
                 )
