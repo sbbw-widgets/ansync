@@ -985,7 +985,6 @@ async fn control_recv_loop(
                 let dir_byte = match direction {
                     ansync_proto::AudioDirection::HostToDevice => 0u8,
                     ansync_proto::AudioDirection::DeviceToHost => 1,
-                    ansync_proto::AudioDirection::Both => 2,
                 };
                 if audio_tx.send(vec![0u8, dir_byte]).is_err() {
                     return;

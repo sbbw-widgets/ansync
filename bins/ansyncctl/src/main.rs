@@ -120,7 +120,7 @@ enum Command {
     /// (`Device.StartAudioRoute`).
     AudioStart {
         id: String,
-        #[arg(value_parser = ["host-to-device", "device-to-host", "both"])]
+        #[arg(value_parser = ["host-to-device", "device-to-host"])]
         direction: String,
     },
     /// Stop the active audio route (`Device.StopAudioRoute`).

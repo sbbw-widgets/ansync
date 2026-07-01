@@ -21,9 +21,8 @@ import kotlin.concurrent.thread
  * `nativePollAudioChunk` and writes the returned PCM to an
  * `AudioTrack` configured for music playback.
  *
- * `Both` runs both threads. Stopping unblocks each worker by closing
- * the native session — the JNI poll returns `null` and the loop
- * exits.
+ * Stopping unblocks each worker by closing the native session — the
+ * JNI poll returns `null` and the loop exits.
  *
  * Sample format is hardcoded to 48 kHz / stereo / S16LE because
  * that's what the host-side `daemon-core::handle_start_audio`
@@ -40,15 +39,9 @@ class AudioRouter(val direction: WireAudioControl.Direction) {
     fun start() {
         if (running) return
         running = true
-        if (direction == WireAudioControl.Direction.DeviceToHost
-            || direction == WireAudioControl.Direction.Both
-        ) {
-            startCapture()
-        }
-        if (direction == WireAudioControl.Direction.HostToDevice
-            || direction == WireAudioControl.Direction.Both
-        ) {
-            startPlayback()
+        when (direction) {
+            WireAudioControl.Direction.DeviceToHost -> startCapture()
+            WireAudioControl.Direction.HostToDevice -> startPlayback()
         }
     }
 
@@ -154,7 +147,7 @@ sealed class WireAudioControl {
     data class StartAudioRoute(val direction: Direction) : WireAudioControl()
     object StopAudioRoute : WireAudioControl()
 
-    enum class Direction { HostToDevice, DeviceToHost, Both }
+    enum class Direction { HostToDevice, DeviceToHost }
 
     companion object {
         fun decode(bytes: ByteArray): WireAudioControl? {
@@ -165,7 +158,6 @@ sealed class WireAudioControl {
                     val dir = when (bytes[1].toInt() and 0xFF) {
                         0 -> Direction.HostToDevice
                         1 -> Direction.DeviceToHost
-                        2 -> Direction.Both
                         else -> return null
                     }
                     StartAudioRoute(dir)

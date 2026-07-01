@@ -838,27 +838,22 @@ class AnsyncCompanionService : Service() {
     /** QSTile-driven audio start. Re-uses [AudioRouter] but skips the
      *  control-message handshake — the user already opted in by
      *  tapping the tile. The host sees the new stream open the same
-     *  way it does for a `Device.StartAudioRoute` D-Bus call. */
+     *  way it does for a `Device.StartAudioRoute` D-Bus call.
+     *
+     *  Only one direction may be active at a time on the tile-driven
+     *  path; a second call with a different direction is a no-op
+     *  (existing router wins). Simultaneous mic+sink is driven by the
+     *  D-Bus surface — see task #4. */
     private fun startAudioFromTile(direction: WireAudioControl.Direction) {
         val existing = audio
-        val effective: WireAudioControl.Direction
         if (existing != null) {
-            // Merge directions: if the current router is `DeviceToHost`
-            // and the user enables sink → upgrade to `Both`; vice
-            // versa. Otherwise no-op.
-            val merged = mergeDirections(existing.direction, direction)
-            effective = merged
-            if (merged != existing.direction) {
-                existing.stop()
-                audio = AudioRouter(merged).also { it.start() }
-            }
-        } else {
-            audio = AudioRouter(direction).also { it.start() }
-            effective = direction
+            if (existing.direction == direction) return
+            existing.stop()
         }
+        audio = AudioRouter(direction).also { it.start() }
         markStream("audio", true)
         val ms = mediaSession ?: AudioMediaSession(this).also { mediaSession = it }
-        ms.start(effective)
+        ms.start(direction)
         refreshNotification()
         when (direction) {
             WireAudioControl.Direction.DeviceToHost -> {
@@ -871,61 +866,23 @@ class AnsyncCompanionService : Service() {
             WireAudioControl.Direction.HostToDevice -> {
                 setTileState(PREF_AUDIO_OUT_ACTIVE, true)
             }
-            WireAudioControl.Direction.Both -> {
-                setTileState(PREF_MIC_ACTIVE, true)
-                setTileState(PREF_AUDIO_OUT_ACTIVE, true)
-                promoteForegroundType(
-                    ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
-                        or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
-                )
-            }
         }
     }
 
-    /** Inverse: peel one direction off the active router. */
+    /** Inverse: tear the router down if the direction matches. */
     private fun stopAudioFromTile(direction: WireAudioControl.Direction) {
         val existing = audio ?: return
-        val remaining = removeDirection(existing.direction, direction)
+        if (existing.direction != direction) return
         existing.stop()
-        audio = remaining?.let { AudioRouter(it).also { r -> r.start() } }
-        if (audio == null) markStream("audio", false)
-        if (remaining == null) {
-            mediaSession?.release()
-            mediaSession = null
-        } else {
-            mediaSession?.start(remaining)
-        }
+        audio = null
+        markStream("audio", false)
+        mediaSession?.release()
+        mediaSession = null
         refreshNotification()
         when (direction) {
             WireAudioControl.Direction.DeviceToHost -> setTileState(PREF_MIC_ACTIVE, false)
             WireAudioControl.Direction.HostToDevice -> setTileState(PREF_AUDIO_OUT_ACTIVE, false)
-            WireAudioControl.Direction.Both -> {
-                setTileState(PREF_MIC_ACTIVE, false)
-                setTileState(PREF_AUDIO_OUT_ACTIVE, false)
-            }
         }
-    }
-
-    private fun mergeDirections(
-        current: WireAudioControl.Direction,
-        add: WireAudioControl.Direction,
-    ): WireAudioControl.Direction = when {
-        current == add -> current
-        current == WireAudioControl.Direction.Both || add == WireAudioControl.Direction.Both ->
-            WireAudioControl.Direction.Both
-        else -> WireAudioControl.Direction.Both
-    }
-
-    private fun removeDirection(
-        current: WireAudioControl.Direction,
-        remove: WireAudioControl.Direction,
-    ): WireAudioControl.Direction? = when {
-        current == remove -> null
-        current == WireAudioControl.Direction.Both && remove == WireAudioControl.Direction.DeviceToHost ->
-            WireAudioControl.Direction.HostToDevice
-        current == WireAudioControl.Direction.Both && remove == WireAudioControl.Direction.HostToDevice ->
-            WireAudioControl.Direction.DeviceToHost
-        else -> current
     }
 
     private fun setTileState(key: String, active: Boolean) {
@@ -1139,24 +1096,21 @@ class AnsyncCompanionService : Service() {
             }
             val audioRouter = svc.audio
             if (audioRouter != null) {
-                val dir = audioRouter.direction
-                if (dir == WireAudioControl.Direction.DeviceToHost
-                    || dir == WireAudioControl.Direction.Both
-                ) {
-                    active.add("mic")
-                    val stop = Intent(ctx, AnsyncCompanionService::class.java)
-                        .setAction(ACTION_STOP_MIC_SHARE)
-                    val pi = PendingIntent.getService(ctx, 11, stop, flags)
-                    builder.addAction(android.R.drawable.ic_media_pause, "Stop mic share", pi)
-                }
-                if (dir == WireAudioControl.Direction.HostToDevice
-                    || dir == WireAudioControl.Direction.Both
-                ) {
-                    active.add("PC audio")
-                    val stop = Intent(ctx, AnsyncCompanionService::class.java)
-                        .setAction(ACTION_STOP_AUDIO_SINK)
-                    val pi = PendingIntent.getService(ctx, 12, stop, flags)
-                    builder.addAction(android.R.drawable.ic_media_pause, "Stop PC audio", pi)
+                when (audioRouter.direction) {
+                    WireAudioControl.Direction.DeviceToHost -> {
+                        active.add("mic")
+                        val stop = Intent(ctx, AnsyncCompanionService::class.java)
+                            .setAction(ACTION_STOP_MIC_SHARE)
+                        val pi = PendingIntent.getService(ctx, 11, stop, flags)
+                        builder.addAction(android.R.drawable.ic_media_pause, "Stop mic share", pi)
+                    }
+                    WireAudioControl.Direction.HostToDevice -> {
+                        active.add("PC audio")
+                        val stop = Intent(ctx, AnsyncCompanionService::class.java)
+                            .setAction(ACTION_STOP_AUDIO_SINK)
+                        val pi = PendingIntent.getService(ctx, 12, stop, flags)
+                        builder.addAction(android.R.drawable.ic_media_pause, "Stop PC audio", pi)
+                    }
                 }
             }
             if (svc.camera != null) {

@@ -41,7 +41,7 @@ class AudioMediaSession(private val svc: AnsyncCompanionService) {
 
     private var session: MediaSession? = null
     private var focusRequest: AudioFocusRequest? = null
-    private var direction: WireAudioControl.Direction = WireAudioControl.Direction.Both
+    private var direction: WireAudioControl.Direction = WireAudioControl.Direction.DeviceToHost
     private var pausedByFocus: Boolean = false
 
     private val focusListener = AudioManager.OnAudioFocusChangeListener { change ->
@@ -71,23 +71,15 @@ class AudioMediaSession(private val svc: AnsyncCompanionService) {
      *  dispatch handles the actual teardown (avoids duplicating
      *  AudioRouter shutdown logic here). */
     private fun stopRouteViaService() {
-        val intents = when (direction) {
-            WireAudioControl.Direction.DeviceToHost ->
-                listOf(AnsyncCompanionService.ACTION_STOP_MIC_SHARE)
-            WireAudioControl.Direction.HostToDevice ->
-                listOf(AnsyncCompanionService.ACTION_STOP_AUDIO_SINK)
-            WireAudioControl.Direction.Both -> listOf(
-                AnsyncCompanionService.ACTION_STOP_MIC_SHARE,
-                AnsyncCompanionService.ACTION_STOP_AUDIO_SINK,
-            )
+        val action = when (direction) {
+            WireAudioControl.Direction.DeviceToHost -> AnsyncCompanionService.ACTION_STOP_MIC_SHARE
+            WireAudioControl.Direction.HostToDevice -> AnsyncCompanionService.ACTION_STOP_AUDIO_SINK
         }
-        for (action in intents) {
-            val i = Intent(svc, AnsyncCompanionService::class.java).setAction(action)
-            try {
-                svc.startService(i)
-            } catch (e: Exception) {
-                Log.w(TAG, "startService($action) threw", e)
-            }
+        val i = Intent(svc, AnsyncCompanionService::class.java).setAction(action)
+        try {
+            svc.startService(i)
+        } catch (e: Exception) {
+            Log.w(TAG, "startService($action) threw", e)
         }
     }
 
@@ -147,7 +139,6 @@ class AudioMediaSession(private val svc: AnsyncCompanionService) {
         val title = when (direction) {
             WireAudioControl.Direction.DeviceToHost -> "Sharing mic with PC"
             WireAudioControl.Direction.HostToDevice -> "Playing PC audio"
-            WireAudioControl.Direction.Both -> "Two-way audio with PC"
         }
         val md = MediaMetadata.Builder()
             .putString(MediaMetadata.METADATA_KEY_TITLE, title)
@@ -204,7 +195,6 @@ class AudioMediaSession(private val svc: AnsyncCompanionService) {
         val title = when (direction) {
             WireAudioControl.Direction.DeviceToHost -> "Mic → PC"
             WireAudioControl.Direction.HostToDevice -> "PC audio → phone"
-            WireAudioControl.Direction.Both -> "Two-way audio"
         }
         val builder = NotificationCompat.Builder(svc, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.ic_btn_speak_now)
@@ -254,19 +244,6 @@ class AudioMediaSession(private val svc: AnsyncCompanionService) {
                     "Stop PC audio",
                     PendingIntent.getService(svc, 31, stopSinkIntent, flags),
                 )
-            }
-            WireAudioControl.Direction.Both -> {
-                builder.addAction(
-                    android.R.drawable.ic_media_pause,
-                    "Stop mic",
-                    PendingIntent.getService(svc, 30, stopMicIntent, flags),
-                )
-                builder.addAction(
-                    android.R.drawable.ic_media_pause,
-                    "Stop PC audio",
-                    PendingIntent.getService(svc, 31, stopSinkIntent, flags),
-                )
-                mediaStyle.setShowActionsInCompactView(0, 1)
             }
         }
         builder.setStyle(mediaStyle)

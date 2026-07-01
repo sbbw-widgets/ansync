@@ -199,10 +199,9 @@ impl Device {
         let dir = match direction.as_str() {
             "host-to-device" => AudioDirection::HostToDevice,
             "device-to-host" => AudioDirection::DeviceToHost,
-            "both" => AudioDirection::Both,
             other => {
                 return Err(zbus::fdo::Error::InvalidArgs(format!(
-                    "direction must be host-to-device|device-to-host|both, got {other}"
+                    "direction must be host-to-device|device-to-host, got {other}"
                 )));
             }
         };

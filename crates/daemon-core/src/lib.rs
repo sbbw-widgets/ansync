@@ -1681,8 +1681,8 @@ async fn handle_start_audio(
     // Permission gates per direction. AudioIn = peer→host (mic
     // forwarding into host PipeWire), AudioOut = host→peer (host
     // capture going to the peer's speaker).
-    let need_in = matches!(direction, AudioDirection::DeviceToHost | AudioDirection::Both);
-    let need_out = matches!(direction, AudioDirection::HostToDevice | AudioDirection::Both);
+    let need_in = matches!(direction, AudioDirection::DeviceToHost);
+    let need_out = matches!(direction, AudioDirection::HostToDevice);
     if need_in
         && !permissions
             .check(device, Permission::AudioIn)

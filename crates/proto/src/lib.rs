@@ -131,7 +131,6 @@ pub enum CameraAspect {
 pub enum AudioDirection {
     HostToDevice,
     DeviceToHost,
-    Both,
 }
 
 /// Audio compression codec carried on `StreamKind::Audio`. `Raw` keeps

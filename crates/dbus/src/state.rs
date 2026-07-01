@@ -71,7 +71,7 @@ pub enum DaemonAction {
     /// Bring up the audio route in `direction`. `HostToDevice` pumps
     /// the host's default capture into the peer's playback;
     /// `DeviceToHost` pumps the peer's microphone into a virtual
-    /// PipeWire source. `Both` is the obvious union.
+    /// PipeWire source.
     StartAudioRoute { device: DeviceId, direction: AudioDirection },
     /// Tear the audio route down regardless of direction.
     StopAudioRoute { device: DeviceId },
