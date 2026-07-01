@@ -239,7 +239,12 @@ struct ActiveSession {
     /// Held purely for its drop-side teardown — the connection
     /// closes when this is taken.
     conn: Arc<QuicConnection>,
-    video_stream: Arc<AsyncMutex<QuicStream>>,
+    /// Outbound device→host Video stream. Lazy-opened on the first
+    /// [`Java_org_gameros_ansync_NativeBridge_nativeSendVideoChunk`]
+    /// after each QSTile arm. Dropping the guard closes the QUIC
+    /// stream, which is exactly what the daemon uses as the signal to
+    /// tear the mirror window down. Reopens on the next capture.
+    video_stream: Arc<AsyncMutex<Option<QuicStream>>>,
     /// Outbound device→host Input stream. Lazy-opened on first
     /// `nativeSendInputMessage` call so the wire is only used when
     /// the user actually drives the touchpad activity.
@@ -512,13 +517,12 @@ pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativeOpenConnection
         }
     }
 
-    let video_stream = match runtime().block_on(conn.open(StreamKind::Video)) {
-        Ok(s) => s,
-        Err(e) => {
-            error!("nativeOpenConnection: open Video stream: {e}");
-            return jni::sys::JNI_FALSE;
-        }
-    };
+    // Video stream is lazy-opened by the first `nativeSendVideoChunk`
+    // after each QSTile arm, mirroring the camera / audio patterns.
+    // That way `nativeStopVideoStream` (called by `CaptureSession.stop`)
+    // can drop the send half so the daemon's `video_stream_loop` sees
+    // the read half close and tears the mirror window down.
+    //
     // Convention: the OPENER of a stream uses it for send. The
     // host→device input stream is opened by the daemon on
     // ShowScreen; we accept it in `streams_accept_loop`. Device→host
@@ -584,7 +588,7 @@ pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativeOpenConnection
 
     let session = ActiveSession {
         conn: conn_arc,
-        video_stream: Arc::new(AsyncMutex::new(video_stream)),
+        video_stream: Arc::new(AsyncMutex::new(None)),
         outbound_input: Arc::new(AsyncMutex::new(None)),
         input_rx: Arc::new(AsyncMutex::new(input_rx)),
         outbound_camera: Arc::new(AsyncMutex::new(None)),
@@ -1233,27 +1237,74 @@ pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativeSendVideoChunk
             return jni::sys::JNI_FALSE;
         }
     };
-    let video_stream = {
+    let (video_stream, conn) = {
         let slot = state_slot().lock().expect("state mutex poisoned");
         match slot.as_ref().and_then(|s| s.session.as_ref()) {
-            Some(sess) => sess.video_stream.clone(),
+            Some(sess) => (sess.video_stream.clone(), sess.conn.clone()),
             None => {
                 warn!("nativeSendVideoChunk: no active session");
                 return jni::sys::JNI_FALSE;
             }
         }
     };
-    let result = runtime().block_on(async move {
+    let result: std::result::Result<(), String> = runtime().block_on(async move {
         let mut guard = video_stream.lock().await;
-        guard.send(Bytes::from(bytes)).await
+        if guard.is_none() {
+            match conn.open(StreamKind::Video).await {
+                Ok(s) => *guard = Some(s),
+                Err(e) => return Err(format!("open Video stream: {e}")),
+            }
+        }
+        let stream = guard.as_mut().expect("video stream just installed");
+        stream
+            .send(Bytes::from(bytes))
+            .await
+            .map_err(|e| format!("stream send: {e}"))
     });
     match result {
         Ok(()) => jni::sys::JNI_TRUE,
         Err(e) => {
-            warn!("nativeSendVideoChunk: stream send failed: {e}");
+            warn!("nativeSendVideoChunk: {e}");
+            // Drop the wedged stream so the next chunk reopens.
+            let video_stream = {
+                let slot = state_slot().lock().expect("state mutex poisoned");
+                slot.as_ref()
+                    .and_then(|s| s.session.as_ref())
+                    .map(|sess| sess.video_stream.clone())
+            };
+            if let Some(vs) = video_stream {
+                runtime().block_on(async move {
+                    let mut guard = vs.lock().await;
+                    *guard = None;
+                });
+            }
             jni::sys::JNI_FALSE
         }
     }
+}
+
+/// Tear the outbound Video stream down. `CaptureSession.stop` calls
+/// this after the MediaCodec drain thread joins, so the daemon's
+/// `video_stream_loop` observes the read half close and fires
+/// `MirrorStreamGone` — mirror window on the PC disappears without
+/// waiting for the whole QUIC connection to churn.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativeStopVideoStream<'local>(
+    _env: JNIEnv<'local>,
+    _class: JClass<'local>,
+) -> jboolean {
+    let video_stream = {
+        let slot = state_slot().lock().expect("state mutex poisoned");
+        match slot.as_ref().and_then(|s| s.session.as_ref()) {
+            Some(sess) => sess.video_stream.clone(),
+            None => return jni::sys::JNI_FALSE,
+        }
+    };
+    runtime().block_on(async move {
+        let mut guard = video_stream.lock().await;
+        *guard = None;
+    });
+    jni::sys::JNI_TRUE
 }
 
 #[unsafe(no_mangle)]

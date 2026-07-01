@@ -184,6 +184,16 @@ class CaptureSession(
         } catch (e: Exception) {
             Log.w(TAG, "inputSurface.release threw", e)
         }
+        // Close the outbound QUIC Video stream. The daemon reads this
+        // as the "user hit Stop mirror on the phone" signal and tears
+        // the mirror window down. Missing this call is why the PC
+        // window used to stay stuck showing the last frame until the
+        // whole QUIC session churned.
+        try {
+            NativeBridge.nativeStopVideoStream()
+        } catch (e: Throwable) {
+            Log.w(TAG, "nativeStopVideoStream threw", e)
+        }
         encoder = null
         virtualDisplay = null
         inputSurface = null

@@ -53,13 +53,22 @@ object NativeBridge {
     external fun nativeOpenConnection(host: String, port: Int, daemonPubkeyHex: String): Boolean
 
     /**
-     * Push one encoded H.264 access unit over the host's `Video`
+     * Push one encoded H.264 access unit over the outbound `Video`
      * stream. `chunk` is one MediaCodec output buffer; `ptsUs` is the
-     * presentation timestamp in microseconds. Returns `false` if the
-     * stream is no longer healthy — caller should tear the session
-     * down.
+     * presentation timestamp in microseconds. Lazy-opens the stream on
+     * the first call after each [nativeStopVideoStream] / QSTile arm.
+     * Returns `false` if the stream cannot be opened or the send
+     * failed — caller should tear the session down.
      */
     external fun nativeSendVideoChunk(chunk: ByteArray, ptsUs: Long): Boolean
+
+    /**
+     * Close the outbound `Video` stream. Called by
+     * `CaptureSession.stop` after the MediaCodec drain thread joins,
+     * so the daemon's `video_stream_loop` observes the read half close
+     * and tears the mirror window down. Idempotent.
+     */
+    external fun nativeStopVideoStream(): Boolean
 
     /**
      * Block (in native) until the next reverse-input `InputMessage`
