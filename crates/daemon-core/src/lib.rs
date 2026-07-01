@@ -436,6 +436,15 @@ pub struct MirrorSubprocess {
     pub host_tx: Option<UnboundedSender<ansync_video::ipc::HostMsg>>,
     /// Best-effort PID for tracing diagnostics.
     pub pid: u32,
+    /// Flipped to `false` by the wait task the moment the child exits
+    /// (clean shutdown, crash, hard kill). `handle_mirror_stream_appeared`
+    /// consults this before short-circuiting on a stale entry — a dead
+    /// PID must never masquerade as a live window.
+    pub alive: Arc<std::sync::atomic::AtomicBool>,
+    /// Hard-kill hatch. `handle_mirror_stream_gone` fires this if the
+    /// renderer hasn't observed the `Shutdown` message within a small
+    /// grace window; the wait task then invokes `child.kill()`.
+    pub kill_tx: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 /// Per-peer audio pipeline state. Like `CameraRegistry`, but with
@@ -732,11 +741,27 @@ async fn handle_mirror_stream_appeared(
         warn!(%device, "MirrorStreamAppeared: no mirror entry");
         return;
     };
-    let already_up = entry
-        .subprocess
-        .lock()
-        .expect("subprocess slot poisoned")
-        .is_some();
+    // Purge a stale entry that still holds a MirrorSubprocess whose
+    // wait task has already flipped `alive` off. Without this, a
+    // dead-PID slot would masquerade as a live window and every future
+    // ShowScreen would silently short-circuit.
+    let already_up = {
+        let mut slot = entry.subprocess.lock().expect("subprocess slot poisoned");
+        if let Some(sp) = slot.as_ref() {
+            if !sp.alive.load(std::sync::atomic::Ordering::Relaxed) {
+                let dead = slot.take();
+                if let Some(sp) = dead {
+                    warn!(%device, pid = sp.pid, "clearing stale mirror subprocess entry");
+                }
+                *entry.video_tx.lock().expect("video_tx slot poisoned") = None;
+                false
+            } else {
+                true
+            }
+        } else {
+            false
+        }
+    };
     if already_up {
         info!(%device, "MirrorStreamAppeared: subprocess already up");
         return;
@@ -815,6 +840,22 @@ async fn handle_mirror_stream_gone(
     if let Some(mut sp) = taken {
         if let Some(tx) = sp.host_tx.take() {
             let _ = tx.send(ansync_video::ipc::HostMsg::Shutdown);
+        }
+        // Graceful Shutdown may hang if the renderer wedged on a wgpu
+        // teardown race or the IPC pipe stalled. Arm a hard-kill after
+        // 1.5s; the wait task will invoke `child.kill()` and flip
+        // `alive` off so a follow-up ShowScreen re-bootstraps cleanly.
+        let alive = sp.alive.clone();
+        let pid = sp.pid;
+        let device_id = device.clone();
+        if let Some(kill_tx) = sp.kill_tx.take() {
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                if alive.load(std::sync::atomic::Ordering::Relaxed) {
+                    warn!(%device_id, pid, "mirror renderer ignored Shutdown; escalating to kill");
+                    let _ = kill_tx.send(());
+                }
+            });
         }
     }
     info!(%device, "MirrorStreamGone: subprocess down");

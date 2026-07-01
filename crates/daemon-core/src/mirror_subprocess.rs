@@ -15,11 +15,13 @@
 
 use std::process::Stdio;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use ansync_proto::InputMessage;
 use ansync_video::ipc::{HostMsg, RendererMsg, WireCodec, read_msg, write_msg};
 use tokio::process::Command;
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
+use tokio::sync::oneshot;
 use tracing::{info, warn};
 
 use crate::{MirrorEntry, MirrorSubprocess};
@@ -120,21 +122,40 @@ pub async fn spawn_mirror_subprocess(
         });
     }
 
-    // Wait task: when the child exits (user closed the window, crash,
-    // SIGKILL on HideScreen, etc.) fire the on_exit hook so the
+    let alive = Arc::new(AtomicBool::new(true));
+    let (kill_tx, kill_rx) = oneshot::channel::<()>();
+
+    // Wait task: races `child.wait()` against a hard-kill request.
+    // Either way, flips `alive` off + fires the on_exit hook so the
     // action loop runs the rest of the teardown (companion stop +
-    // state cleanup).
+    // state cleanup) and any future ShowScreen re-bootstraps cleanly.
+    let alive_wait = alive.clone();
     tokio::spawn(async move {
-        match child.wait().await {
-            Ok(status) => info!(pid, ?status, "mirror renderer exited"),
-            Err(e) => warn!(error = %e, "wait on mirror renderer failed"),
+        tokio::select! {
+            res = child.wait() => match res {
+                Ok(status) => info!(pid, ?status, "mirror renderer exited"),
+                Err(e) => warn!(error = %e, "wait on mirror renderer failed"),
+            },
+            _ = kill_rx => {
+                warn!(pid, "mirror renderer: hard kill requested");
+                if let Err(e) = child.kill().await {
+                    warn!(error = %e, pid, "child.kill() failed");
+                }
+                match child.wait().await {
+                    Ok(status) => info!(pid, ?status, "mirror renderer killed"),
+                    Err(e) => warn!(error = %e, "post-kill wait failed"),
+                }
+            }
         }
+        alive_wait.store(false, Ordering::Relaxed);
         on_exit();
     });
 
     *entry.subprocess.lock().expect("subprocess slot poisoned") = Some(MirrorSubprocess {
         host_tx: Some(host_tx),
         pid,
+        alive,
+        kill_tx: Some(kill_tx),
     });
 
     Ok(())

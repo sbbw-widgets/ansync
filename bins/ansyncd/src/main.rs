@@ -51,7 +51,13 @@ enum SubCmd {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    install_logging()?;
+    // Detect the mirror-renderer subcommand before touching clap so we
+    // can route tracing to stderr — the subprocess's stdout is the
+    // postcard IPC pipe shared with the daemon, and any fmt::layer
+    // write to stdout corrupts the wire (daemon reads timestamp bytes
+    // as the length prefix and dies with "frame too large").
+    let is_renderer = std::env::args().nth(1).as_deref() == Some("mirror-renderer");
+    install_logging(is_renderer)?;
     let args = Args::parse();
 
     if let Some(SubCmd::MirrorRenderer) = &args.cmd {
@@ -97,14 +103,25 @@ async fn run_daemon(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn install_logging() -> Result<(), Box<dyn std::error::Error>> {
+fn install_logging(to_stderr: bool) -> Result<(), Box<dyn std::error::Error>> {
     let env_filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    tracing_subscriber::registry()
+    let registry = tracing_subscriber::registry()
         .with(env_filter)
-        .with(tracing_subscriber::fmt::layer().with_target(true))
-        .with(tracing_journald::layer().ok())
-        .try_init()?;
+        .with(tracing_journald::layer().ok());
+    if to_stderr {
+        registry
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_target(true)
+                    .with_writer(std::io::stderr),
+            )
+            .try_init()?;
+    } else {
+        registry
+            .with(tracing_subscriber::fmt::layer().with_target(true))
+            .try_init()?;
+    }
     // wgpu / naga / winit emit through `log::*`; bridge so the same
     // EnvFilter applies. Without this any wgpu validation error is
     // silently discarded — exactly the kind of thing that shows up
