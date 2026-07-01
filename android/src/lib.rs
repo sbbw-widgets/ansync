@@ -249,21 +249,11 @@ struct ActiveSession {
     /// reading-while-spawning races against the recv task.
     input_rx: Arc<AsyncMutex<UnboundedReceiver<Vec<u8>>>>,
     /// Outbound device→host Camera stream. Lazy-opened on first
-    /// `nativeSendCameraChunk` call (typically right after Kotlin
-    /// processes a StartCamera control message).
+    /// `nativeSendCameraChunk` call after the QSTile arms capture.
     outbound_camera: Arc<AsyncMutex<Option<QuicStream>>>,
-    /// Inbound `ControlMessage::StartCamera` / `StopCamera` decoded
-    /// from the host's Control stream. Encoded as tag-binary blobs
-    /// for the Kotlin polling loop. Mirrors the FS request channel
-    /// pattern.
-    camera_ctrl_rx: Arc<AsyncMutex<UnboundedReceiver<Vec<u8>>>>,
-    /// Inbound `ControlMessage::StartAudioRoute` / `StopAudioRoute`.
-    /// Same tag-binary fanout pattern as camera_ctrl_rx.
+    /// Inbound `ControlMessage::StartAudioSink` / `StopAudioSink`.
+    /// Encoded as tag-binary blobs for the Kotlin polling loop.
     audio_ctrl_rx: Arc<AsyncMutex<UnboundedReceiver<Vec<u8>>>>,
-    /// Inbound `ControlMessage::RequestScreenCapture` /
-    /// `StopScreenCapture`. Two single-byte tags so Kotlin can poll
-    /// without postcard.
-    capture_ctrl_rx: Arc<AsyncMutex<UnboundedReceiver<Vec<u8>>>>,
     /// Outbound device→host Audio stream for mic forwarding.
     /// Lazy-opened on the first `nativeSendAudioChunk` (device-side).
     outbound_audio: Arc<AsyncMutex<Option<QuicStream>>>,
@@ -537,14 +527,8 @@ pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativeOpenConnection
     let (input_tx, input_rx) = unbounded_channel::<Vec<u8>>();
     let input_tx_arc = Arc::new(input_tx);
 
-    let (camera_ctrl_tx, camera_ctrl_rx) = unbounded_channel::<Vec<u8>>();
-    let camera_ctrl_tx = Arc::new(camera_ctrl_tx);
-
     let (audio_ctrl_tx, audio_ctrl_rx) = unbounded_channel::<Vec<u8>>();
     let audio_ctrl_tx = Arc::new(audio_ctrl_tx);
-
-    let (capture_ctrl_tx, capture_ctrl_rx) = unbounded_channel::<Vec<u8>>();
-    let capture_ctrl_tx = Arc::new(capture_ctrl_tx);
 
     let (audio_in_tx, audio_in_rx) = unbounded_channel::<Vec<u8>>();
     let audio_in_tx = Arc::new(audio_in_tx);
@@ -584,13 +568,11 @@ pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativeOpenConnection
         host_device_id.clone(),
         download_dir,
         input_tx_arc.clone(),
-        camera_ctrl_tx.clone(),
         audio_ctrl_tx.clone(),
         audio_in_tx.clone(),
         clip_in_tx.clone(),
         clip_blob_tx.clone(),
         host_name_slot,
-        capture_ctrl_tx.clone(),
         url_in_tx.clone(),
         received_file_tx.clone(),
         progress_tx.clone(),
@@ -606,14 +588,12 @@ pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativeOpenConnection
         outbound_input: Arc::new(AsyncMutex::new(None)),
         input_rx: Arc::new(AsyncMutex::new(input_rx)),
         outbound_camera: Arc::new(AsyncMutex::new(None)),
-        camera_ctrl_rx: Arc::new(AsyncMutex::new(camera_ctrl_rx)),
         audio_ctrl_rx: Arc::new(AsyncMutex::new(audio_ctrl_rx)),
         outbound_audio: Arc::new(AsyncMutex::new(None)),
         outbound_audio_encoder: Arc::new(AsyncMutex::new(None)),
         audio_in_rx: Arc::new(AsyncMutex::new(audio_in_rx)),
         clipboard_in_rx: Arc::new(AsyncMutex::new(clip_in_rx)),
         clipboard_in_blob_rx: Arc::new(AsyncMutex::new(clip_blob_rx)),
-        capture_ctrl_rx: Arc::new(AsyncMutex::new(capture_ctrl_rx)),
         url_in_rx: Arc::new(AsyncMutex::new(url_in_rx)),
         received_files_rx: Arc::new(AsyncMutex::new(received_file_rx)),
         host_id: host_device_id,
@@ -721,13 +701,11 @@ async fn streams_accept_loop(
     host_id: DeviceId,
     download_dir: PathBuf,
     input_inbound_tx: Arc<UnboundedSender<Vec<u8>>>,
-    camera_ctrl_tx: Arc<UnboundedSender<Vec<u8>>>,
     audio_ctrl_tx: Arc<UnboundedSender<Vec<u8>>>,
     audio_in_tx: Arc<UnboundedSender<Vec<u8>>>,
     clip_in_tx: Arc<UnboundedSender<String>>,
     clip_blob_tx: Arc<UnboundedSender<(String, Vec<u8>)>>,
     host_name_slot: Arc<Mutex<Option<String>>>,
-    capture_ctrl_tx: Arc<UnboundedSender<Vec<u8>>>,
     url_in_tx: Arc<UnboundedSender<String>>,
     received_file_tx: Arc<UnboundedSender<String>>,
     progress_tx: Arc<UnboundedSender<Vec<u8>>>,
@@ -819,15 +797,8 @@ async fn streams_accept_loop(
                 });
             }
             StreamKind::Control => {
-                let cam_tx = camera_ctrl_tx.clone();
                 let aud_tx = audio_ctrl_tx.clone();
-                let cap_tx = capture_ctrl_tx.clone();
-                tokio::spawn(control_recv_loop(
-                    stream,
-                    (*cam_tx).clone(),
-                    (*aud_tx).clone(),
-                    (*cap_tx).clone(),
-                ));
+                tokio::spawn(control_recv_loop(stream, (*aud_tx).clone()));
             }
             StreamKind::Audio => {
                 let tx = audio_in_tx.clone();
@@ -915,21 +886,17 @@ impl<'a> Cursor<'a> {
 }
 
 /// Decode `Envelope`s off the Control stream and surface the
-/// `ControlMessage::StartCamera` / `StopCamera` ones to Kotlin via
-/// a tag-binary blob.
+/// audio-sink control messages to Kotlin via a tag-binary blob.
 ///
-/// Layout (mirrored in `WireCameraControl.kt`):
-///   tag 0  StartCamera : str camera_id | u32 w | u32 h | u8 fps |
-///                        u32 bitrate_kbps | u8 codec(0=H264,1=H265) |
-///                        u8 aspect(0=Crop,1=Letterbox,2=Stretch) |
-///                        u8 stabilization
-///   tag 1  StopCamera  : (no payload)
-async fn control_recv_loop(
-    mut stream: QuicStream,
-    camera_tx: UnboundedSender<Vec<u8>>,
-    audio_tx: UnboundedSender<Vec<u8>>,
-    capture_tx: UnboundedSender<Vec<u8>>,
-) {
+/// Layout (mirrored in `WireAudioControl.kt`):
+///   tag 0  StartAudioSink : (no payload)
+///   tag 1  StopAudioSink  : (no payload)
+///
+/// Post sender-initiates refactor (2026-07-01) the only control
+/// surface is audio-sink: PC → phone declaring "I am about to send
+/// audio". Every other stream is phone-initiated and needs no
+/// preamble.
+async fn control_recv_loop(mut stream: QuicStream, audio_tx: UnboundedSender<Vec<u8>>) {
     loop {
         let bytes = match stream.recv().await {
             Ok(b) => b,
@@ -951,64 +918,18 @@ async fn control_recv_loop(
             }
         };
         match env.message {
-            Message::Control(ControlMessage::StartCamera(cfg)) => {
-                let mut out = Vec::with_capacity(32);
-                out.push(0u8);
-                let id = cfg.camera_id.as_bytes();
-                out.extend_from_slice(&(id.len() as u32).to_le_bytes());
-                out.extend_from_slice(id);
-                out.extend_from_slice(&cfg.width.to_le_bytes());
-                out.extend_from_slice(&cfg.height.to_le_bytes());
-                out.push(cfg.fps);
-                out.extend_from_slice(&cfg.bitrate_kbps.to_le_bytes());
-                out.push(match cfg.codec {
-                    ansync_proto::VideoCodec::H264 => 0,
-                    ansync_proto::VideoCodec::H265 => 1,
-                });
-                out.push(match cfg.aspect {
-                    ansync_proto::CameraAspect::Crop => 0,
-                    ansync_proto::CameraAspect::Letterbox => 1,
-                    ansync_proto::CameraAspect::Stretch => 2,
-                });
-                out.push(if cfg.stabilization { 1 } else { 0 });
-                if camera_tx.send(out).is_err() {
-                    info!("control_recv_loop: camera receiver dropped; exiting");
+            Message::Control(ControlMessage::StartAudioSink) => {
+                if audio_tx.send(vec![0u8]).is_err() {
                     return;
                 }
             }
-            Message::Control(ControlMessage::StopCamera) => {
-                if camera_tx.send(vec![1u8]).is_err() {
-                    return;
-                }
-            }
-            Message::Control(ControlMessage::StartAudioRoute { direction }) => {
-                let dir_byte = match direction {
-                    ansync_proto::AudioDirection::HostToDevice => 0u8,
-                    ansync_proto::AudioDirection::DeviceToHost => 1,
-                };
-                if audio_tx.send(vec![0u8, dir_byte]).is_err() {
-                    return;
-                }
-            }
-            Message::Control(ControlMessage::StopAudioRoute) => {
+            Message::Control(ControlMessage::StopAudioSink) => {
                 if audio_tx.send(vec![1u8]).is_err() {
                     return;
                 }
             }
-            Message::Control(ControlMessage::RequestScreenCapture) => {
-                // Single-byte signal — Kotlin matches on tag 0 = start
-                // request, tag 1 = stop. No payload either way.
-                if capture_tx.send(vec![0u8]).is_err() {
-                    return;
-                }
-            }
-            Message::Control(ControlMessage::StopScreenCapture) => {
-                if capture_tx.send(vec![1u8]).is_err() {
-                    return;
-                }
-            }
             other => {
-                warn!("control_recv_loop: ignoring Control message {other:?}");
+                warn!("control_recv_loop: ignoring non-Control message {other:?}");
             }
         }
     }
@@ -1574,34 +1495,6 @@ pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativeSendInputMessa
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativePollCameraControl<'local>(
-    env: JNIEnv<'local>,
-    _class: JClass<'local>,
-) -> jni::sys::jbyteArray {
-    let camera_ctrl_rx = {
-        let slot = state_slot().lock().expect("state mutex poisoned");
-        match slot.as_ref().and_then(|s| s.session.as_ref()) {
-            Some(sess) => sess.camera_ctrl_rx.clone(),
-            None => return std::ptr::null_mut(),
-        }
-    };
-    let bytes = runtime().block_on(async move {
-        let mut guard = camera_ctrl_rx.lock().await;
-        guard.recv().await
-    });
-    match bytes {
-        Some(b) => match env.byte_array_from_slice(&b) {
-            Ok(arr) => arr.into_raw(),
-            Err(e) => {
-                error!("nativePollCameraControl: byte_array_from_slice: {e}");
-                std::ptr::null_mut()
-            }
-        },
-        None => std::ptr::null_mut(),
-    }
-}
-
-#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativeSendCameraChunk<'local>(
     env: JNIEnv<'local>,
     _class: JClass<'local>,
@@ -1665,38 +1558,6 @@ pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativeStopCameraStre
         *guard = None;
     });
     jni::sys::JNI_TRUE
-}
-
-/// Block (in native) until the host sends a
-/// `ControlMessage::RequestScreenCapture` / `StopScreenCapture` and
-/// return a single-byte tag (0 = start, 1 = stop). Returns `null`
-/// on session teardown.
-#[unsafe(no_mangle)]
-pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativePollCaptureControl<'local>(
-    env: JNIEnv<'local>,
-    _class: JClass<'local>,
-) -> jni::sys::jbyteArray {
-    let rx = {
-        let slot = state_slot().lock().expect("state mutex poisoned");
-        match slot.as_ref().and_then(|s| s.session.as_ref()) {
-            Some(sess) => sess.capture_ctrl_rx.clone(),
-            None => return std::ptr::null_mut(),
-        }
-    };
-    let bytes = runtime().block_on(async move {
-        let mut guard = rx.lock().await;
-        guard.recv().await
-    });
-    match bytes {
-        Some(b) => match env.byte_array_from_slice(&b) {
-            Ok(arr) => arr.into_raw(),
-            Err(e) => {
-                error!("nativePollCaptureControl: byte_array_from_slice: {e}");
-                std::ptr::null_mut()
-            }
-        },
-        None => std::ptr::null_mut(),
-    }
 }
 
 #[unsafe(no_mangle)]

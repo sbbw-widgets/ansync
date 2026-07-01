@@ -32,9 +32,8 @@ use ansync_input::{InputDeviceFactory, InputSession, UinputFactory};
 use ansync_pairing::PeerStore;
 use perms_backend::PeerStorePermissions;
 use ansync_proto::{
-    AudioCodec, AudioDirection, AudioStreamInit, CameraConfig, ClipboardMessage, ControlMessage,
+    AudioCodec, AudioDirection, AudioStreamInit, ClipboardMessage, ControlMessage,
     Envelope, Hello, InputMessage, Message, NotificationMessage, PROTOCOL_VERSION, UrlMessage,
-    VideoCodec as ProtoVideoCodec,
 };
 use ansync_transport::pinning::TrustedPeers;
 use ansync_transport::{
@@ -222,9 +221,7 @@ impl Daemon {
         info!(backend = %audio_backend.kind(), "audio backend selected");
         let action_handle = tokio::spawn(action_loop(
             action_rx,
-            action_tx.clone(),
             mirrors.clone(),
-            cameras.clone(),
             audios.clone(),
             audio_backend.clone(),
             permissions.clone(),
@@ -663,9 +660,7 @@ impl MirrorRegistry {
 
 async fn action_loop(
     mut rx: UnboundedReceiver<DaemonAction>,
-    self_tx: tokio::sync::mpsc::UnboundedSender<DaemonAction>,
     mirrors: Arc<MirrorRegistry>,
-    cameras: Arc<CameraRegistry>,
     audios: Arc<AudioRegistry>,
     audio_backend: SharedAudioBackend,
     permissions: Arc<dyn ansync_permissions::PermissionsStore>,
@@ -674,45 +669,23 @@ async fn action_loop(
 ) {
     while let Some(action) = rx.recv().await {
         match action {
-            DaemonAction::StartAudioRoute { device, direction } => {
-                match handle_start_audio(
+            DaemonAction::StartAudioSink { device } => {
+                match handle_start_audio_sink(
                     &mirrors,
                     &audios,
                     audio_backend.as_ref(),
                     &permissions,
                     &device,
-                    direction,
-                    "audio",
                 )
                 .await
                 {
                     Ok(()) => emit_stream(&dbus_conn, &device, "audio", true).await,
-                    Err(e) => warn!(%device, error = %e, "StartAudioRoute failed"),
+                    Err(e) => warn!(%device, error = %e, "StartAudioSink failed"),
                 }
             }
-            DaemonAction::StopAudioRoute { device } => {
-                handle_stop_audio(&audios, &device).await;
+            DaemonAction::StopAudioSink { device } => {
+                handle_stop_audio_sink(&mirrors, &audios, &device).await;
                 emit_stream(&dbus_conn, &device, "audio", false).await;
-            }
-            DaemonAction::StartMicrophone { device } => {
-                match handle_start_audio(
-                    &mirrors,
-                    &audios,
-                    audio_backend.as_ref(),
-                    &permissions,
-                    &device,
-                    AudioDirection::DeviceToHost,
-                    "mic",
-                )
-                .await
-                {
-                    Ok(()) => emit_stream(&dbus_conn, &device, "mic", true).await,
-                    Err(e) => warn!(%device, error = %e, "StartMicrophone failed"),
-                }
-            }
-            DaemonAction::StopMicrophone { device } => {
-                handle_stop_audio(&audios, &device).await;
-                emit_stream(&dbus_conn, &device, "mic", false).await;
             }
             DaemonAction::SyncClipboard { device } => {
                 if let Err(e) =
@@ -726,152 +699,6 @@ async fn action_loop(
             }
             DaemonAction::SendUrl { device, url } => {
                 handle_send_url(&mirrors, &device, url).await;
-            }
-            DaemonAction::StartCamera { device, config } => {
-                match handle_start_camera(&mirrors, &cameras, &permissions, &device, config).await
-                {
-                    Ok(()) => emit_stream(&dbus_conn, &device, "camera", true).await,
-                    Err(e) => warn!(%device, error = %e, "StartCamera failed"),
-                }
-            }
-            DaemonAction::StopCamera { device } => {
-                match handle_stop_camera(&mirrors, &cameras, &device).await {
-                    Ok(()) => emit_stream(&dbus_conn, &device, "camera", false).await,
-                    Err(e) => warn!(%device, error = %e, "StopCamera failed"),
-                }
-            }
-            DaemonAction::ShowScreen { device } => {
-                let Some(entry) = mirrors.get(&device) else {
-                    warn!(%device, "ShowScreen: no mirror entry (peer not connected?)");
-                    continue;
-                };
-                // Idempotent: if a renderer is already up for this
-                // peer, only refresh the input pipe + (maybe) re-ask
-                // the companion to start capture.
-                let already_up = entry
-                    .subprocess
-                    .lock()
-                    .expect("subprocess slot poisoned")
-                    .is_some();
-
-                // Open the outbound Input stream so renderer-side
-                // pointer/keyboard/gamepad events reach the peer.
-                let conn = entry.conn.lock().expect("conn slot poisoned").clone();
-                let input_tx = if let Some(conn) = conn.clone() {
-                    match conn.open(StreamKind::Input).await {
-                        Ok(stream) => {
-                            let (tx, rx) = unbounded_channel::<InputMessage>();
-                            tokio::spawn(input_writer_loop(stream, rx, device.clone()));
-                            Some(tx)
-                        }
-                        Err(e) => {
-                            warn!(%device, error = %e, "open outbound Input stream failed; window will be view-only");
-                            None
-                        }
-                    }
-                } else {
-                    warn!(%device, "ShowScreen: no live connection; window will be view-only");
-                    None
-                };
-
-                // Only ask the companion to start capture when the
-                // tile-driven path hasn't already opened the Video
-                // stream — otherwise we re-pop the MediaProjection
-                // picker on the device.
-                if !entry.video_inbound.load(std::sync::atomic::Ordering::Relaxed) {
-                    if let Some(conn) = conn {
-                        if let Err(e) = send_request_capture(&conn).await {
-                            warn!(%device, error = %e, "RequestScreenCapture send failed");
-                        }
-                    }
-                }
-
-                if already_up {
-                    info!(%device, "ShowScreen: subprocess already up");
-                    // The existing subprocess keeps consuming chunks
-                    // from `entry.video_tx`. Input pipe was per-conn
-                    // and we already swapped a fresh one above (it'll
-                    // simply replace whatever the previous Input
-                    // writer was using on next user input).
-                    let _ = input_tx;
-                    continue;
-                }
-
-                let title = format!("ansync — {}", entry.peer_name);
-                let exit_tx = self_tx.clone();
-                let exit_device = device.clone();
-                let entry_for_spawn = entry.clone();
-                let entry_for_exit = entry.clone();
-                match spawn_mirror_subprocess(
-                    title,
-                    entry_for_spawn,
-                    input_tx,
-                    move || {
-                        // Renderer exited (user closed the window or
-                        // process crashed). Clear the slots
-                        // synchronously BEFORE enqueueing HideScreen
-                        // so a fast-following ShowScreen sees a clean
-                        // subprocess slot — otherwise the
-                        // `already_up` check races against the
-                        // queued HideScreen and silently swallows the
-                        // user's reopen.
-                        *entry_for_exit
-                            .subprocess
-                            .lock()
-                            .expect("subprocess slot poisoned") = None;
-                        *entry_for_exit
-                            .video_tx
-                            .lock()
-                            .expect("video_tx slot poisoned") = None;
-                        let _ = exit_tx.send(DaemonAction::HideScreen {
-                            device: exit_device.clone(),
-                        });
-                    },
-                )
-                .await
-                {
-                    Ok(()) => {
-                        info!(%device, "ShowScreen: subprocess spawned");
-                        emit_stream(&dbus_conn, &device, "screen", true).await;
-                    }
-                    Err(e) => warn!(%device, error = %e, "ShowScreen subprocess failed"),
-                }
-            }
-            DaemonAction::HideScreen { device } => {
-                let Some(entry) = mirrors.get(&device) else {
-                    continue;
-                };
-                // Pull the subprocess handle out and ask it to exit.
-                // Drop the video fan-out sender so any in-flight
-                // chunks stop reaching the (about-to-die) child.
-                {
-                    let mut tx_slot = entry.video_tx.lock().expect("video_tx slot poisoned");
-                    *tx_slot = None;
-                }
-                let taken = entry
-                    .subprocess
-                    .lock()
-                    .expect("subprocess slot poisoned")
-                    .take();
-                if let Some(mut sp) = taken {
-                    if let Some(tx) = sp.host_tx.take() {
-                        let _ = tx.send(ansync_video::ipc::HostMsg::Shutdown);
-                    }
-                    // Closing host_tx → writer task drops child_stdin
-                    // → renderer sees EOF → exits. `kill_on_drop` on
-                    // the child handle in `spawn_mirror_subprocess`
-                    // is the safety net if the renderer hangs.
-                }
-                // Tell the companion to drop the encoder + projection
-                // too so the device's foreground notification clears.
-                let conn = entry.conn.lock().expect("conn slot poisoned").clone();
-                if let Some(conn) = conn {
-                    if let Err(e) = send_stop_capture(&conn).await {
-                        warn!(%device, error = %e, "StopScreenCapture send failed");
-                    }
-                }
-                info!(%device, "HideScreen: subprocess down, companion notified");
-                emit_stream(&dbus_conn, &device, "screen", false).await;
             }
         }
     }
@@ -1401,19 +1228,6 @@ async fn send_hello(
     Ok(())
 }
 
-/// Push `ControlMessage::RequestScreenCapture` to the companion.
-/// One-shot — the stream is dropped after the frame so each call
-/// stands on its own (matches how the companion's `control_recv_loop`
-/// treats Control: stream-per-message, no per-stream state).
-async fn send_request_capture(conn: &QuicConnection) -> Result<(), DaemonError> {
-    send_control(conn, ControlMessage::RequestScreenCapture).await
-}
-
-/// Inverse of [`send_request_capture`].
-async fn send_stop_capture(conn: &QuicConnection) -> Result<(), DaemonError> {
-    send_control(conn, ControlMessage::StopScreenCapture).await
-}
-
 /// One-shot Control envelope sender. Used by anything in the
 /// `action_loop` that needs to ask the companion to do something
 /// without opening a long-lived stream.
@@ -1669,36 +1483,25 @@ async fn push_clipboard_to_peer(
     Ok(())
 }
 
-async fn handle_start_audio(
+/// PC-initiated audio-sink route: open `StreamKind::Audio` outbound,
+/// encode host PipeWire capture with Opus, push to the peer's
+/// `AudioTrack`.
+///
+/// The mic-share direction (phone → PC) is entirely phone-driven and
+/// arrives via `audio_inbound_loop` — no host trigger needed.
+async fn handle_start_audio_sink(
     mirrors: &MirrorRegistry,
     audios: &AudioRegistry,
     audio_backend: &dyn AudioBackend,
     permissions: &Arc<dyn ansync_permissions::PermissionsStore>,
     device: &DeviceId,
-    direction: AudioDirection,
-    inbound_tile_kind: &'static str,
 ) -> Result<(), DaemonError> {
-    // Permission gates per direction. AudioIn = peer→host (mic
-    // forwarding into host PipeWire), AudioOut = host→peer (host
-    // capture going to the peer's speaker).
-    let need_in = matches!(direction, AudioDirection::DeviceToHost);
-    let need_out = matches!(direction, AudioDirection::HostToDevice);
-    if need_in
-        && !permissions
-            .check(device, Permission::AudioIn)
-            .await
-            .unwrap_or(false)
+    if !permissions
+        .check(device, Permission::AudioOut)
+        .await
+        .unwrap_or(false)
     {
-        warn!(%device, "audio_in permission off; refusing StartAudioRoute(DeviceToHost)");
-        return Ok(());
-    }
-    if need_out
-        && !permissions
-            .check(device, Permission::AudioOut)
-            .await
-            .unwrap_or(false)
-    {
-        warn!(%device, "audio_out permission off; refusing StartAudioRoute(HostToDevice)");
+        warn!(%device, "audio_out permission off; refusing StartAudioSink");
         return Ok(());
     }
     let mirror = mirrors
@@ -1727,97 +1530,65 @@ async fn handle_start_audio(
         }
     }
 
-    // Send the control message so the companion knows which
-    // direction to bring up on its side.
+    // Tell the companion to arm its playback AudioTrack.
     let mut ctrl = conn.open(StreamKind::Control).await?;
     let env = Envelope {
         version: PROTOCOL_VERSION,
-        message: Message::Control(ControlMessage::StartAudioRoute { direction }),
+        message: Message::Control(ControlMessage::StartAudioSink),
     };
     let bytes = postcard::to_allocvec(&env)
-        .map_err(|e| DaemonError::Startup(format!("encode StartAudioRoute: {e}")))?;
+        .map_err(|e| DaemonError::Startup(format!("encode StartAudioSink: {e}")))?;
     ctrl.send(bytes::Bytes::from(bytes)).await?;
-    info!(%device, ?direction, "StartAudioRoute control sent");
+    info!(%device, "StartAudioSink control sent");
 
-    // Inbound: provision sink + tile slot now; the render task is
-    // spawned by `audio_inbound_loop` once the wire `AudioStreamInit`
-    // header arrives — that's when we know the codec the companion
-    // picked (OpusVoip vs Raw fallback).
-    if need_in {
-        *entry
-            .inbound_tile_kind
-            .lock()
-            .expect("audio inbound tile slot poisoned") = Some(inbound_tile_kind);
-        // Reuse the existing CpalSink across reconnects / re-Starts
-        // so PipeWire / PulseAudio clients (Discord, browsers, OBS)
-        // keep their "ansync-in-..." selection. Building a new sink
-        // every time creates a fresh device node and apps fall back
-        // to whatever default was active before.
-        let mut sink_guard = entry.sink.lock().await;
-        if sink_guard.is_none() {
-            let label = format!("ansync-in-{}", entry.peer_name);
-            let format = AudioFormat {
-                sample_rate: 48_000,
-                channels: 2,
-                format: SampleFormat::S16Le,
-            };
-            let built = match audio_backend.create_sink(&label, format).await {
-                Ok(s) => Arc::new(tokio::sync::Mutex::new(s)),
-                Err(e) => {
-                    warn!(%device, error = %e, "open audio sink failed");
-                    return Ok(());
-                }
-            };
-            *sink_guard = Some(built);
+    let mut stream = conn.open(StreamKind::Audio).await?;
+    // Host → device renders general audio (music, game sound, VOIP
+    // mixed in PipeWire). OpusAudio profile @ 128 kbps gives clean
+    // music; bandwidth still fits LAN comfortably.
+    let codec = AudioCodec::OpusAudio;
+    let init = AudioStreamInit {
+        sample_rate: 48_000,
+        channels: 2,
+        direction: AudioDirection::HostToDevice,
+        codec,
+        frame_samples: OPUS_FRAME_SAMPLES as u16,
+    };
+    let header = postcard::to_allocvec(&init)
+        .map_err(|e| DaemonError::Startup(format!("encode AudioStreamInit: {e}")))?;
+    stream.send(bytes::Bytes::from(header)).await?;
+    let label = format!("ansync-out-{}", entry.peer_name);
+    let format = AudioFormat {
+        sample_rate: 48_000,
+        channels: 2,
+        format: SampleFormat::S16Le,
+    };
+    let source = match audio_backend.create_source(&label, format).await {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(%device, error = %e, "open audio source failed");
+            return Ok(());
         }
-    }
-
-    if need_out {
-        let mut stream = conn.open(StreamKind::Audio).await?;
-        // Host → device renders general audio (music, game sound, VOIP
-        // mixed in PipeWire). OpusAudio profile @ 128 kbps gives clean
-        // music; bandwidth still fits LAN comfortably.
-        let codec = AudioCodec::OpusAudio;
-        let init = AudioStreamInit {
-            sample_rate: 48_000,
-            channels: 2,
-            direction: AudioDirection::HostToDevice,
-            codec,
-            frame_samples: OPUS_FRAME_SAMPLES as u16,
-        };
-        let header = postcard::to_allocvec(&init)
-            .map_err(|e| DaemonError::Startup(format!("encode AudioStreamInit: {e}")))?;
-        stream.send(bytes::Bytes::from(header)).await?;
-        let label = format!("ansync-out-{}", entry.peer_name);
-        let format = AudioFormat {
-            sample_rate: 48_000,
-            channels: 2,
-            format: SampleFormat::S16Le,
-        };
-        let source = match audio_backend.create_source(&label, format).await {
-            Ok(s) => s,
-            Err(e) => {
-                warn!(%device, error = %e, "open audio source failed");
-                return Ok(());
-            }
-        };
-        let encoder = OpusEncoderWrap::new(codec)
-            .map_err(|e| DaemonError::Startup(format!("opus encoder: {e}")))?;
-        let perms_pump = permissions.clone();
-        let peer_pump = device.clone();
-        let stats_pump = entry.stats.clone();
-        let handle = tokio::spawn(audio_pump_loop(
-            stream, source, encoder, peer_pump, perms_pump, stats_pump,
-        ));
-        *entry
-            .pump_handle
-            .lock()
-            .expect("audio pump slot poisoned") = Some(handle);
-    }
+    };
+    let encoder = OpusEncoderWrap::new(codec)
+        .map_err(|e| DaemonError::Startup(format!("opus encoder: {e}")))?;
+    let perms_pump = permissions.clone();
+    let peer_pump = device.clone();
+    let stats_pump = entry.stats.clone();
+    let handle = tokio::spawn(audio_pump_loop(
+        stream, source, encoder, peer_pump, perms_pump, stats_pump,
+    ));
+    *entry
+        .pump_handle
+        .lock()
+        .expect("audio pump slot poisoned") = Some(handle);
     Ok(())
 }
 
-async fn handle_stop_audio(audios: &AudioRegistry, device: &DeviceId) {
+async fn handle_stop_audio_sink(
+    mirrors: &MirrorRegistry,
+    audios: &AudioRegistry,
+    device: &DeviceId,
+) {
     let entry = match audios.get(device) {
         Some(e) => e,
         None => return,
@@ -1831,20 +1602,6 @@ async fn handle_stop_audio(audios: &AudioRegistry, device: &DeviceId) {
         h.abort();
     }
     if let Some(h) = entry
-        .inbound_handle
-        .lock()
-        .expect("audio inbound slot poisoned")
-        .take()
-    {
-        h.abort();
-    }
-    *entry.inbound_tx.lock().expect("audio inbound tx poisoned") = None;
-    *entry
-        .inbound_tile_kind
-        .lock()
-        .expect("audio inbound tile slot poisoned") = None;
-    *entry.sink.lock().await = None;
-    if let Some(h) = entry
         .stats_handle
         .lock()
         .expect("audio stats slot poisoned")
@@ -1852,7 +1609,18 @@ async fn handle_stop_audio(audios: &AudioRegistry, device: &DeviceId) {
     {
         h.abort();
     }
-    info!(%device, "StopAudioRoute done");
+    // Tell the companion the pump is done so it tears down the
+    // AudioTrack + Stop notif. Best-effort — if the conn is gone the
+    // companion already saw the stream close.
+    let conn_opt = mirrors
+        .get(device)
+        .and_then(|mirror| mirror.conn.lock().expect("conn slot poisoned").clone());
+    if let Some(conn) = conn_opt {
+        if let Err(e) = send_control(&conn, ControlMessage::StopAudioSink).await {
+            warn!(%device, error = %e, "StopAudioSink control push failed");
+        }
+    }
+    info!(%device, "StopAudioSink done");
 }
 
 async fn audio_render_loop(
@@ -2155,132 +1923,6 @@ async fn audio_stats_loop(device: DeviceId, entry: Arc<AudioEntry>) {
     }
 }
 
-async fn handle_start_camera(
-    mirrors: &MirrorRegistry,
-    cameras: &CameraRegistry,
-    permissions: &Arc<dyn ansync_permissions::PermissionsStore>,
-    device: &DeviceId,
-    config: CameraConfig,
-) -> Result<(), DaemonError> {
-    if !permissions
-        .check(device, Permission::CameraVideo)
-        .await
-        .unwrap_or(false)
-    {
-        warn!(%device, "camera_video permission off; refusing StartCamera");
-        return Ok(());
-    }
-    let mirror = mirrors
-        .get(device)
-        .ok_or_else(|| DaemonError::Startup(format!("no mirror entry for {device}")))?;
-    let conn = mirror
-        .conn
-        .lock()
-        .expect("conn slot poisoned")
-        .clone()
-        .ok_or_else(|| DaemonError::Startup(format!("peer {device} not connected")))?;
-    let entry = cameras.ensure(device, &mirror.peer_name);
-
-    // Tear down any previous pipeline before re-bootstrapping so a
-    // second StartCamera with a different config doesn't leak a task.
-    if let Some(handle) = entry.handle.lock().expect("handle slot poisoned").take() {
-        handle.abort();
-    }
-    {
-        let mut sink_guard = entry.sink.lock().await;
-        if sink_guard.is_none() {
-            let sink: Arc<dyn VirtualCameraSink> = build_camera_sink()?;
-            *sink_guard = Some(sink);
-        }
-    }
-
-    // Push the StartCamera control message to the companion. The
-    // Control stream is opener-writes, so the host opens it for this
-    // outbound message.
-    let mut ctrl = conn.open(StreamKind::Control).await?;
-    let env = Envelope {
-        version: PROTOCOL_VERSION,
-        message: Message::Control(ControlMessage::StartCamera(config.clone())),
-    };
-    let bytes = postcard::to_allocvec(&env)
-        .map_err(|e| DaemonError::Startup(format!("encode StartCamera: {e}")))?;
-    ctrl.send(bytes::Bytes::from(bytes)).await?;
-    info!(%device, camera = %config.camera_id, "StartCamera control sent");
-
-    // Spawn the decode → sink loop. The companion will open
-    // `StreamKind::Camera` in response; we wait for it on the
-    // per-peer accept loop and dispatch into a temporary channel.
-    let entry_clone = entry.clone();
-    let codec = match config.codec {
-        ProtoVideoCodec::H264 => VideoCodec::H264,
-        ProtoVideoCodec::H265 => VideoCodec::H265,
-    };
-    let width = config.width;
-    let height = config.height;
-    let (frame_tx, frame_rx) = unbounded_channel::<bytes::Bytes>();
-    *entry.frame_tx.lock().expect("frame tx slot poisoned") = Some(frame_tx);
-    let handle = tokio::spawn(camera_decode_loop(
-        entry_clone,
-        codec,
-        width,
-        height,
-        frame_rx,
-    ));
-    *entry.handle.lock().expect("handle slot poisoned") = Some(handle);
-    Ok(())
-}
-
-async fn handle_stop_camera(
-    mirrors: &MirrorRegistry,
-    cameras: &CameraRegistry,
-    device: &DeviceId,
-) -> Result<(), DaemonError> {
-    // Push the StopCamera control to the companion FIRST so the
-    // Android-side `CameraSession` tears down its sensor + encoder
-    // before we drop the local sink. If we yanked the local
-    // pipeline before notifying the device, Camera2 + MediaCodec
-    // would keep running for ~60 s of idle frames (no consumer
-    // backpressure on the Surface input path) and the LED + battery
-    // drain would stay on. Best-effort: if the conn is gone we
-    // proceed with the local teardown anyway.
-    let conn_opt = mirrors.get(device).and_then(|mirror| {
-        mirror
-            .conn
-            .lock()
-            .expect("conn slot poisoned")
-            .clone()
-    });
-    if let Some(conn) = conn_opt {
-        if let Err(e) = send_control(&conn, ControlMessage::StopCamera).await {
-            warn!(%device, error = %e, "StopCamera control push failed");
-        }
-    } else {
-        warn!(%device, "StopCamera: peer not connected; skipping wire push");
-    }
-    let entry = match cameras.get(device) {
-        Some(e) => e,
-        None => return Ok(()),
-    };
-    if let Some(handle) = entry.handle.lock().expect("handle slot poisoned").take() {
-        handle.abort();
-    }
-    *entry.frame_tx.lock().expect("frame tx slot poisoned") = None;
-    let mut sink_guard = entry.sink.lock().await;
-    if let Some(sink) = sink_guard.take() {
-        if let Err(e) = sink.unregister().await {
-            warn!(%device, error = %e, "camera sink unregister failed");
-        }
-    }
-    // Reset the persisted registration flag so a follow-up StartCamera
-    // (possibly with a different format) re-runs `register()` on the
-    // freshly-built sink instead of skipping it.
-    entry
-        .sink_registered
-        .store(false, std::sync::atomic::Ordering::Release);
-    info!(%device, "StopCamera done");
-    Ok(())
-}
-
 fn build_camera_sink() -> Result<Arc<dyn VirtualCameraSink>, DaemonError> {
     Ok(Arc::new(ansync_camera::V4l2LoopbackSink::new()))
 }
@@ -2464,27 +2106,23 @@ async fn video_stream_loop(
     // window down too — there's no point keeping a renderer
     // subprocess alive showing the last frozen frame, and the user
     // explicitly does NOT want a window that outlives the stream.
+    // Auto tear-down of the mirror window on stream close is wired in
+    // task #3 (auto mirror window on inbound). For now the guard only
+    // clears the `video_inbound` flag so re-connect logic sees a
+    // clean slate.
+    let _ = action_tx;
     struct InboundGuard {
         entry: Arc<MirrorEntry>,
-        peer_id: DeviceId,
-        action_tx: Option<UnboundedSender<DaemonAction>>,
     }
     impl Drop for InboundGuard {
         fn drop(&mut self) {
             self.entry
                 .video_inbound
                 .store(false, std::sync::atomic::Ordering::Relaxed);
-            if let Some(tx) = self.action_tx.as_ref() {
-                let _ = tx.send(DaemonAction::HideScreen {
-                    device: self.peer_id.clone(),
-                });
-            }
         }
     }
     let _guard = InboundGuard {
         entry: entry.clone(),
-        peer_id: peer_id.clone(),
-        action_tx,
     };
     let mut first_chunk_logged = false;
     let mut chunks_since_log: u64 = 0;

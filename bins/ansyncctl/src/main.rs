@@ -83,48 +83,13 @@ enum Command {
     },
     /// Forget a previously paired device (`Manager.ForgetDevice`).
     Forget { id: String },
-    /// Open the mirror window for a device (`Device.ShowScreen`).
-    Show { id: String },
-    /// Close an open mirror window (`Device.HideScreen`).
-    Hide { id: String },
-    /// Start a camera capture session on the peer's lens
-    /// (`Device.StartCamera`).
-    CameraStart {
-        id: String,
-        /// Android `cameraId` string (`0` = back, `1` = front).
-        #[arg(long, default_value = "0")]
-        camera_id: String,
-        #[arg(long, default_value_t = 1920)]
-        width: u32,
-        #[arg(long, default_value_t = 1080)]
-        height: u32,
-        #[arg(long, default_value_t = 60)]
-        fps: u8,
-        #[arg(long, default_value_t = 8000)]
-        bitrate_kbps: u32,
-        #[arg(long, default_value = "h264", value_parser = ["h264", "h265"])]
-        codec: String,
-        #[arg(long, default_value = "crop", value_parser = ["crop", "letterbox", "stretch"])]
-        aspect: String,
-        #[arg(long)]
-        stabilization: bool,
-    },
-    /// Stop a running camera capture (`Device.StopCamera`).
-    CameraStop { id: String },
-    /// Share the peer's microphone to host audio
-    /// (`Device.StartMicrophone`).
-    MicStart { id: String },
-    /// Stop microphone sharing (`Device.StopMicrophone`).
-    MicStop { id: String },
-    /// Start an audio route in either direction
-    /// (`Device.StartAudioRoute`).
-    AudioStart {
-        id: String,
-        #[arg(value_parser = ["host-to-device", "device-to-host"])]
-        direction: String,
-    },
-    /// Stop the active audio route (`Device.StopAudioRoute`).
-    AudioStop { id: String },
+    /// Start the host → device audio sink (`Device.StartAudioSink`).
+    /// PC PipeWire capture is Opus-encoded and pushed to the peer's
+    /// speaker. Mirror, camera and mic share have no host trigger —
+    /// they are QSTile-initiated on the phone.
+    AudioSinkStart { id: String },
+    /// Stop the audio sink (`Device.StopAudioSink`).
+    AudioSinkStop { id: String },
     /// One-shot clipboard push host → peer (`Device.SyncClipboard`).
     ClipboardSync { id: String },
     /// Push one or more files to a paired device. Routes through the
@@ -200,37 +165,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             discover_seconds,
         } => pair_dispatch(serial, remote_addr, apk, discover_seconds).await?,
         Command::Forget { id } => forget(id).await?,
-        Command::Show { id } => show_screen(id).await?,
-        Command::Hide { id } => hide_screen(id).await?,
-        Command::CameraStart {
-            id,
-            camera_id,
-            width,
-            height,
-            fps,
-            bitrate_kbps,
-            codec,
-            aspect,
-            stabilization,
-        } => {
-            camera_start(
-                id,
-                camera_id,
-                width,
-                height,
-                fps,
-                bitrate_kbps,
-                codec,
-                aspect,
-                stabilization,
-            )
-            .await?
-        }
-        Command::CameraStop { id } => camera_stop(id).await?,
-        Command::MicStart { id } => mic_start(id).await?,
-        Command::MicStop { id } => mic_stop(id).await?,
-        Command::AudioStart { id, direction } => audio_start(id, direction).await?,
-        Command::AudioStop { id } => audio_stop(id).await?,
+        Command::AudioSinkStart { id } => audio_sink_start(id).await?,
+        Command::AudioSinkStop { id } => audio_sink_stop(id).await?,
         Command::ClipboardSync { id } => clipboard_sync(id).await?,
         Command::Push { id, paths } => push(id, paths).await?,
         Command::Url { id, url } => send_url(id, url).await?,
@@ -384,20 +320,6 @@ async fn forget(id: String) -> Result<(), Box<dyn std::error::Error>> {
     let mgr = manager_proxy(&conn).await?;
     mgr.call::<_, _, ()>("ForgetDevice", &id).await?;
     println!("forgot {id}");
-    Ok(())
-}
-
-async fn show_screen(id: String) -> Result<(), Box<dyn std::error::Error>> {
-    let proxy = device_proxy(&id).await?;
-    proxy.call::<_, _, ()>("ShowScreen", &()).await?;
-    println!("daemon opened mirror for {id}");
-    Ok(())
-}
-
-async fn hide_screen(id: String) -> Result<(), Box<dyn std::error::Error>> {
-    let proxy = device_proxy(&id).await?;
-    proxy.call::<_, _, ()>("HideScreen", &()).await?;
-    println!("daemon closed mirror for {id}");
     Ok(())
 }
 
@@ -708,75 +630,17 @@ async fn send_url(id_hex: String, url: String) -> Result<(), Box<dyn std::error:
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn camera_start(
-    id: String,
-    camera_id: String,
-    width: u32,
-    height: u32,
-    fps: u8,
-    bitrate_kbps: u32,
-    codec: String,
-    aspect: String,
-    stabilization: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn audio_sink_start(id: String) -> Result<(), Box<dyn std::error::Error>> {
     let proxy = device_proxy(&id).await?;
-    proxy
-        .call::<_, _, ()>(
-            "StartCamera",
-            &(
-                camera_id,
-                width,
-                height,
-                fps,
-                bitrate_kbps,
-                codec,
-                aspect,
-                stabilization,
-            ),
-        )
-        .await?;
-    println!("camera start queued for {id}");
+    proxy.call::<_, _, ()>("StartAudioSink", &()).await?;
+    println!("audio sink started for {id}");
     Ok(())
 }
 
-async fn camera_stop(id: String) -> Result<(), Box<dyn std::error::Error>> {
+async fn audio_sink_stop(id: String) -> Result<(), Box<dyn std::error::Error>> {
     let proxy = device_proxy(&id).await?;
-    proxy.call::<_, _, ()>("StopCamera", &()).await?;
-    println!("camera stop queued for {id}");
-    Ok(())
-}
-
-async fn mic_start(id: String) -> Result<(), Box<dyn std::error::Error>> {
-    let proxy = device_proxy(&id).await?;
-    proxy.call::<_, _, ()>("StartMicrophone", &()).await?;
-    println!("microphone share started for {id}");
-    Ok(())
-}
-
-async fn mic_stop(id: String) -> Result<(), Box<dyn std::error::Error>> {
-    let proxy = device_proxy(&id).await?;
-    proxy.call::<_, _, ()>("StopMicrophone", &()).await?;
-    println!("microphone share stopped for {id}");
-    Ok(())
-}
-
-async fn audio_start(
-    id: String,
-    direction: String,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let proxy = device_proxy(&id).await?;
-    proxy
-        .call::<_, _, ()>("StartAudioRoute", &direction)
-        .await?;
-    println!("audio route ({direction}) started for {id}");
-    Ok(())
-}
-
-async fn audio_stop(id: String) -> Result<(), Box<dyn std::error::Error>> {
-    let proxy = device_proxy(&id).await?;
-    proxy.call::<_, _, ()>("StopAudioRoute", &()).await?;
-    println!("audio route stopped for {id}");
+    proxy.call::<_, _, ()>("StopAudioSink", &()).await?;
+    println!("audio sink stopped for {id}");
     Ok(())
 }
 

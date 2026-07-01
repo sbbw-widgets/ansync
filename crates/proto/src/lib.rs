@@ -69,28 +69,26 @@ pub enum PermissionMessage {
     Denied(Permission),
 }
 
+/// Wire control messages that flow over `StreamKind::Control`.
+///
+/// Post sender-initiates refactor (2026-07-01) the only surface here
+/// is the audio sink route: PC is always the sender of the
+/// `HostToDevice` audio stream, so it must announce start / stop to
+/// the companion so the companion can arm its `AudioTrack`.
+///
+/// Every other stream (mic share, screen mirror, camera) is
+/// phone-initiated — the sender opens the stream directly with the
+/// appropriate `StreamKind` + `*StreamInit` header, no control
+/// message needed.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum ControlMessage {
-    StartScreen { codec: VideoCodec, max_bitrate_kbps: u32, max_fps: u8 },
-    StopScreen,
-    StartCamera(CameraConfig),
-    StopCamera,
-    StartMic,
-    StopMic,
-    StartAudioRoute { direction: AudioDirection },
-    StopAudioRoute,
-    /// Host → companion: "I would like to mirror your screen now."
-    /// The companion's service decides how to handle the request — if
-    /// the user already granted MediaProjection for this session, it
-    /// starts capture immediately; otherwise it posts a high-priority
-    /// notification asking the user to grant. Either way the host
-    /// can't force capture without on-device consent (Android limit).
-    RequestScreenCapture,
-    /// Host → companion: "Stop mirroring." Stops capture on the
-    /// device side without waiting for the host to drop the QUIC
-    /// connection. Symmetric to `StopScreen` but on the
-    /// control-stream surface.
-    StopScreenCapture,
+    /// PC → phone: "I am about to start pumping audio into you."
+    /// Companion arms `AudioRouter(HostToDevice)` and waits for the
+    /// first `StreamKind::Audio` frame.
+    StartAudioSink,
+    /// PC → phone: "I am done pumping audio." Companion tears the
+    /// `AudioTrack` and notification down.
+    StopAudioSink,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]

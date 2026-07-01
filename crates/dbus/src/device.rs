@@ -3,7 +3,6 @@
 use std::sync::Arc;
 
 use ansync_core::{Capabilities, DeviceId};
-use ansync_proto::{AudioDirection, CameraAspect, CameraConfig, VideoCodec};
 use zbus::interface;
 
 use crate::state::{ConnState, DaemonAction, DaemonState};
@@ -85,131 +84,28 @@ impl Device {
         String::new()
     }
 
-    async fn show_screen(&self) -> zbus::fdo::Result<()> {
-        let tx = self.state.actions.as_ref().ok_or_else(|| {
-            zbus::fdo::Error::Failed("daemon action channel not wired".into())
-        })?;
-        tx.send(DaemonAction::ShowScreen { device: self.id.clone() })
-            .map_err(|e| zbus::fdo::Error::Failed(format!("send action: {e}")))?;
-        Ok(())
-    }
-
-    async fn hide_screen(&self) -> zbus::fdo::Result<()> {
-        let tx = self.state.actions.as_ref().ok_or_else(|| {
-            zbus::fdo::Error::Failed("daemon action channel not wired".into())
-        })?;
-        tx.send(DaemonAction::HideScreen { device: self.id.clone() })
-            .map_err(|e| zbus::fdo::Error::Failed(format!("send action: {e}")))?;
-        Ok(())
-    }
-
-    /// Start a camera capture session on the paired peer.
+    /// Bring up host → device audio sink. The daemon opens a
+    /// `StreamKind::Audio` outbound, encodes host PipeWire capture
+    /// with Opus, and pushes it to the peer's speaker.
     ///
-    /// * `camera_id` is the Android `cameraId` string (typically
-    ///   `"0"` = primary back, `"1"` = primary front).
-    /// * `codec` accepts `"h264"` / `"h265"`.
-    /// * `aspect` accepts `"crop"` / `"letterbox"` / `"stretch"`.
-    /// * `stabilization` toggles `CONTROL_VIDEO_STABILIZATION_MODE_ON`
-    ///   on the companion side when the device supports it.
-    #[allow(clippy::too_many_arguments)]
-    async fn start_camera(
-        &self,
-        camera_id: String,
-        width: u32,
-        height: u32,
-        fps: u8,
-        bitrate_kbps: u32,
-        codec: String,
-        aspect: String,
-        stabilization: bool,
-    ) -> zbus::fdo::Result<()> {
+    /// This is the only host-initiated media stream. Mirror, camera
+    /// and mic share are triggered from the phone (QSTile) — the host
+    /// only consumes them.
+    async fn start_audio_sink(&self) -> zbus::fdo::Result<()> {
         let tx = self.state.actions.as_ref().ok_or_else(|| {
             zbus::fdo::Error::Failed("daemon action channel not wired".into())
         })?;
-        let codec = match codec.as_str() {
-            "h264" | "H264" => VideoCodec::H264,
-            "h265" | "H265" | "hevc" | "HEVC" => VideoCodec::H265,
-            other => {
-                return Err(zbus::fdo::Error::InvalidArgs(format!(
-                    "codec must be h264|h265, got {other}"
-                )));
-            }
-        };
-        let aspect = match aspect.as_str() {
-            "crop" => CameraAspect::Crop,
-            "letterbox" => CameraAspect::Letterbox,
-            "stretch" => CameraAspect::Stretch,
-            other => {
-                return Err(zbus::fdo::Error::InvalidArgs(format!(
-                    "aspect must be crop|letterbox|stretch, got {other}"
-                )));
-            }
-        };
-        let config = CameraConfig {
-            camera_id,
-            width,
-            height,
-            fps,
-            bitrate_kbps,
-            codec,
-            aspect,
-            stabilization,
-        };
-        tx.send(DaemonAction::StartCamera {
-            device: self.id.clone(),
-            config,
-        })
-        .map_err(|e| zbus::fdo::Error::Failed(format!("send action: {e}")))?;
-        Ok(())
-    }
-
-    async fn stop_camera(&self) -> zbus::fdo::Result<()> {
-        let tx = self.state.actions.as_ref().ok_or_else(|| {
-            zbus::fdo::Error::Failed("daemon action channel not wired".into())
-        })?;
-        tx.send(DaemonAction::StopCamera {
-            device: self.id.clone(),
-        })
-        .map_err(|e| zbus::fdo::Error::Failed(format!("send action: {e}")))?;
-        Ok(())
-    }
-
-    async fn start_microphone(&self) -> zbus::fdo::Result<()> {
-        let tx = self.state.actions.as_ref().ok_or_else(|| {
-            zbus::fdo::Error::Failed("daemon action channel not wired".into())
-        })?;
-        tx.send(DaemonAction::StartMicrophone { device: self.id.clone() })
+        tx.send(DaemonAction::StartAudioSink { device: self.id.clone() })
             .map_err(|e| zbus::fdo::Error::Failed(format!("send action: {e}")))?;
         Ok(())
     }
 
-    async fn stop_microphone(&self) -> zbus::fdo::Result<()> {
+    async fn stop_audio_sink(&self) -> zbus::fdo::Result<()> {
         let tx = self.state.actions.as_ref().ok_or_else(|| {
             zbus::fdo::Error::Failed("daemon action channel not wired".into())
         })?;
-        tx.send(DaemonAction::StopMicrophone { device: self.id.clone() })
+        tx.send(DaemonAction::StopAudioSink { device: self.id.clone() })
             .map_err(|e| zbus::fdo::Error::Failed(format!("send action: {e}")))?;
-        Ok(())
-    }
-
-    async fn start_audio_route(&self, direction: String) -> zbus::fdo::Result<()> {
-        let tx = self.state.actions.as_ref().ok_or_else(|| {
-            zbus::fdo::Error::Failed("daemon action channel not wired".into())
-        })?;
-        let dir = match direction.as_str() {
-            "host-to-device" => AudioDirection::HostToDevice,
-            "device-to-host" => AudioDirection::DeviceToHost,
-            other => {
-                return Err(zbus::fdo::Error::InvalidArgs(format!(
-                    "direction must be host-to-device|device-to-host, got {other}"
-                )));
-            }
-        };
-        tx.send(DaemonAction::StartAudioRoute {
-            device: self.id.clone(),
-            direction: dir,
-        })
-        .map_err(|e| zbus::fdo::Error::Failed(format!("send action: {e}")))?;
         Ok(())
     }
 
@@ -221,15 +117,6 @@ impl Device {
             device: self.id.clone(),
         })
         .map_err(|e| zbus::fdo::Error::Failed(format!("send action: {e}")))?;
-        Ok(())
-    }
-
-    async fn stop_audio_route(&self) -> zbus::fdo::Result<()> {
-        let tx = self.state.actions.as_ref().ok_or_else(|| {
-            zbus::fdo::Error::Failed("daemon action channel not wired".into())
-        })?;
-        tx.send(DaemonAction::StopAudioRoute { device: self.id.clone() })
-            .map_err(|e| zbus::fdo::Error::Failed(format!("send action: {e}")))?;
         Ok(())
     }
 

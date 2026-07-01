@@ -10,7 +10,6 @@ use ansync_core::DeviceId;
 use ansync_crypto::IdentityKeypair;
 use ansync_pairing::PeerStore;
 use ansync_permissions::PermissionsStore;
-use ansync_proto::{AudioDirection, CameraConfig};
 use tokio::sync::mpsc::UnboundedSender;
 
 /// Lifecycle of a per-peer connection as surfaced over D-Bus.
@@ -48,36 +47,24 @@ impl ConnState {
 
 /// Actions D-Bus interfaces dispatch back into `daemon-core`. Sent on
 /// [`DaemonState::actions`]; the daemon spawns an action loop that
-/// consumes the receiver and runs the appropriate task (open mirror
-/// window, start camera session, etc.).
+/// consumes the receiver and runs the appropriate task.
+///
+/// Post sender-initiates refactor (2026-07-01) the surface is
+/// intentionally minimal: the daemon owns two outbound streams (audio
+/// sink + clipboard + share) and everything else — mirror, camera,
+/// mic — flows the other way and is triggered by the phone.
 ///
 /// The enum sits in the `dbus` crate to avoid a cycle: D-Bus
 /// interfaces own the sender; `daemon-core` owns the receiver.
 #[derive(Debug, Clone)]
 pub enum DaemonAction {
-    /// Show the mirror window for `device`. Idempotent — if a window
-    /// is already up, the action is a no-op.
-    ShowScreen { device: DeviceId },
-    /// Close the mirror window for `device`.
-    HideScreen { device: DeviceId },
-    /// Push a `ControlMessage::StartCamera` to `device` and bring up
-    /// the v4l2loopback sink + decoder pipeline for it. Idempotent —
-    /// a second StartCamera with a different config tears the old
-    /// pipeline down and re-bootstraps.
-    StartCamera { device: DeviceId, config: CameraConfig },
-    /// Stop the camera pipeline for `device` (sink unregistered,
-    /// stream closed).
-    StopCamera { device: DeviceId },
-    /// Bring up the audio route in `direction`. `HostToDevice` pumps
-    /// the host's default capture into the peer's playback;
-    /// `DeviceToHost` pumps the peer's microphone into a virtual
-    /// PipeWire source.
-    StartAudioRoute { device: DeviceId, direction: AudioDirection },
-    /// Tear the audio route down regardless of direction.
-    StopAudioRoute { device: DeviceId },
-    /// Sugar for `StartAudioRoute { direction: DeviceToHost }`.
-    StartMicrophone { device: DeviceId },
-    StopMicrophone { device: DeviceId },
+    /// Bring up the host → device audio sink route. The daemon opens
+    /// a `StreamKind::Audio` outbound, encodes host PipeWire capture
+    /// with Opus, and pushes it to the peer's speaker. Gated by
+    /// `Permission::AudioOut`.
+    StartAudioSink { device: DeviceId },
+    /// Tear the audio sink route down.
+    StopAudioSink { device: DeviceId },
     /// Read the host's Wayland clipboard and push it to `device`
     /// over a fresh `StreamKind::Clipboard`. Gated by
     /// `Permission::ClipboardOut`.
