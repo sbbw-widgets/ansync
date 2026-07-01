@@ -268,17 +268,6 @@
         </service>
 
         <service
-            android:name=".tile.AudioSinkTile"
-            android:label="@string/tile_audio_label"
-            android:icon="@android:drawable/ic_lock_silent_mode_off"
-            android:exported="true"
-            android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
-            <intent-filter>
-                <action android:name="android.service.quicksettings.action.QS_TILE" />
-            </intent-filter>
-        </service>
-
-        <service
             android:name=".tile.GamepadTile"
             android:label="@string/tile_gamepad_label"
             android:icon="@android:drawable/ic_menu_send"

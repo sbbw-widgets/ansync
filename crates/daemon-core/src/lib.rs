@@ -1081,9 +1081,10 @@ async fn handle_connection(
                 let perms = permissions.clone();
                 tokio::spawn(url_inbound_loop(stream, pid, pname, perms));
             }
-            other => {
-                warn!(kind = ?other, "stream kind accepted but not wired yet — dropping");
-                drop(stream);
+            StreamKind::Control => {
+                let pid = peer_id.clone();
+                let action_tx = dbus_state.actions.clone();
+                tokio::spawn(control_inbound_loop(stream, pid, action_tx));
             }
         }
     }
@@ -2460,6 +2461,58 @@ impl InboundCoalescer {
                 &format!("Received {count} files"),
                 &sample,
             );
+        }
+    }
+}
+
+/// Read `ControlMessage` envelopes off a companion-opened Control
+/// stream and dispatch them into the action loop. Only the
+/// receiver-can-stop path currently flows this way: the phone taps
+/// "Stop PC audio" on the notif → companion opens Control → sends
+/// `StopAudioSink` → daemon tears the pump down.
+///
+/// `StartAudioSink` is never sent phone → PC (senders initiate on
+/// their own side), so we log-and-drop if it shows up.
+async fn control_inbound_loop(
+    mut stream: QuicStream,
+    peer_id: DeviceId,
+    action_tx: Option<UnboundedSender<DaemonAction>>,
+) {
+    loop {
+        let bytes = match stream.recv().await {
+            Ok(b) => b,
+            Err(ansync_transport::TransportError::Closed)
+            | Err(ansync_transport::TransportError::TimedOut) => {
+                info!(%peer_id, "control stream closed");
+                return;
+            }
+            Err(e) => {
+                warn!(%peer_id, error = %e, "control recv error");
+                return;
+            }
+        };
+        let env: Envelope = match postcard::from_bytes(&bytes) {
+            Ok(e) => e,
+            Err(e) => {
+                warn!(%peer_id, error = %e, "control postcard decode failed");
+                continue;
+            }
+        };
+        match env.message {
+            Message::Control(ControlMessage::StopAudioSink) => {
+                info!(%peer_id, "peer requested StopAudioSink");
+                if let Some(tx) = action_tx.as_ref() {
+                    let _ = tx.send(DaemonAction::StopAudioSink {
+                        device: peer_id.clone(),
+                    });
+                }
+            }
+            Message::Control(ControlMessage::StartAudioSink) => {
+                warn!(%peer_id, "unexpected StartAudioSink from peer; ignoring");
+            }
+            other => {
+                warn!(%peer_id, ?other, "control stream carried unexpected message; ignoring");
+            }
         }
     }
 }

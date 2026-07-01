@@ -43,9 +43,6 @@ class AnsyncCompanionService : Service() {
     private var projection: MediaProjection? = null
     private var capture: CaptureSession? = null
     private var camera: CameraSession? = null
-    private var cameraPollThread: HandlerThread? = null
-    private var cameraPollHandler: Handler? = null
-    @Volatile private var cameraPollRunning = false
     private var audio: AudioRouter? = null
     private var audioPollThread: HandlerThread? = null
     private var audioPollHandler: Handler? = null
@@ -59,9 +56,6 @@ class AnsyncCompanionService : Service() {
     private var hostNameHandler: Handler? = null
     @Volatile private var hostNamePollRunning = false
     @Volatile private var hostStatus: HostStatus = HostStatus.NotPaired
-    private var capturePollThread: HandlerThread? = null
-    private var capturePollHandler: Handler? = null
-    @Volatile private var capturePollRunning = false
     private var urlPollThread: HandlerThread? = null
     @Volatile private var urlPollRunning = false
     private var receivedFilePollThread: HandlerThread? = null
@@ -101,7 +95,6 @@ class AnsyncCompanionService : Service() {
         // shade — no full-screen wizard. SetupStepActivity calls
         // back via ACTION_REFRESH_SETUP after each grant resolves.
         SetupNotif.refresh(this)
-        startCameraControlPoller()
         startAudioControlPoller()
         clipboard = ClipboardBridge(this).also { it.start() }
         dialer = HostDialer(this).also {
@@ -112,7 +105,6 @@ class AnsyncCompanionService : Service() {
             it.start()
         }
         wifiPair = WifiPairManager(this).also { it.start() }
-        startCaptureControlPoller()
         startHostNamePoller()
         startUrlPoller()
         startReceivedFilePoller()
@@ -529,44 +521,6 @@ class AnsyncCompanionService : Service() {
             ?.notify(URL_NOTIF_ID_BASE + (url.hashCode() and 0x7fff), n)
     }
 
-    private fun startCaptureControlPoller() {
-        if (capturePollThread != null) return
-        val ht = HandlerThread("ansync-cap-ctrl").also { it.start() }
-        capturePollThread = ht
-        capturePollHandler = Handler(ht.looper)
-        capturePollRunning = true
-        capturePollHandler?.post(object : Runnable {
-            override fun run() {
-                while (capturePollRunning) {
-                    val blob = NativeBridge.nativePollCaptureControl()
-                    if (blob == null) {
-                        try { Thread.sleep(500) } catch (_: InterruptedException) {}
-                        continue
-                    }
-                    if (blob.isEmpty()) continue
-                    when (blob[0].toInt()) {
-                        0 -> Handler(mainLooper).post {
-                            // If a session already exists the host
-                            // probably just wants a fresh IDR (e.g.
-                            // viewer reattached, decoder reset).
-                            // Skipping the projection re-prompt avoids
-                            // a surprise dialog mid-session.
-                            val active = capture
-                            if (active != null) {
-                                Log.i(TAG, "RequestScreenCapture w/ active session — key frame instead")
-                                active.requestKeyFrame()
-                            } else {
-                                requestCaptureFromUser()
-                            }
-                        }
-                        1 -> Handler(mainLooper).post { stopCapture() }
-                        else -> Log.w(TAG, "unknown capture-ctrl tag ${blob[0]}")
-                    }
-                }
-            }
-        })
-    }
-
     private fun startAudioControlPoller() {
         if (audioPollThread != null) return
         val ht = HandlerThread("ansync-aud-ctrl").also { it.start() }
@@ -581,9 +535,9 @@ class AnsyncCompanionService : Service() {
                         try { Thread.sleep(500) } catch (_: InterruptedException) {}
                         continue
                     }
-                    when (val msg = WireAudioControl.decode(blob)) {
-                        is WireAudioControl.StartAudioRoute -> handleStartAudio(msg)
-                        WireAudioControl.StopAudioRoute -> handleStopAudio()
+                    when (WireAudioControl.decode(blob)) {
+                        WireAudioControl.StartAudioSink -> handleStartAudioSink()
+                        WireAudioControl.StopAudioSink -> handleStopAudioSink()
                         null -> Log.w(TAG, "bad audio control blob")
                     }
                 }
@@ -591,74 +545,43 @@ class AnsyncCompanionService : Service() {
         })
     }
 
-    private fun handleStartAudio(msg: WireAudioControl.StartAudioRoute) {
+    /** Host announced `ControlMessage::StartAudioSink` — arm the
+     *  playback AudioTrack + notif with Stop action. Direction is
+     *  always [WireAudioControl.Direction.HostToDevice]. */
+    private fun handleStartAudioSink() {
         audio?.stop()
-        // Microphone foreground type required when capturing from the
-        // device; speaker-only direction stays under dataSync.
-        if (msg.direction != WireAudioControl.Direction.HostToDevice) {
-            promoteForegroundType(
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
-                    or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
-            )
-        }
-        audio = AudioRouter(msg.direction).also { it.start() }
+        audio = AudioRouter(WireAudioControl.Direction.HostToDevice).also { it.start() }
         markStream("audio", true)
         val ms = mediaSession ?: AudioMediaSession(this).also { mediaSession = it }
-        ms.start(msg.direction)
-        Log.i(TAG, "audio route started ${msg.direction}")
+        ms.start(WireAudioControl.Direction.HostToDevice)
+        Log.i(TAG, "audio sink armed")
         refreshNotification()
     }
 
-    private fun handleStopAudio() {
+    /** Host announced `ControlMessage::StopAudioSink` — tear the
+     *  AudioTrack + notif down. No upstream signal needed: the host
+     *  already stopped pumping before sending this. */
+    private fun handleStopAudioSink() {
         audio?.stop()
         audio = null
         markStream("audio", false)
         mediaSession?.release()
         mediaSession = null
-        Log.i(TAG, "audio route stopped")
+        Log.i(TAG, "audio sink stopped by host")
         refreshNotification()
     }
 
-    private fun startCameraControlPoller() {
-        if (cameraPollThread != null) return
-        val ht = HandlerThread("ansync-cam-ctrl").also { it.start() }
-        cameraPollThread = ht
-        cameraPollHandler = Handler(ht.looper)
-        cameraPollRunning = true
-        cameraPollHandler?.post(object : Runnable {
-            override fun run() {
-                while (cameraPollRunning) {
-                    val blob = NativeBridge.nativePollCameraControl()
-                    if (blob == null) {
-                        try { Thread.sleep(500) } catch (_: InterruptedException) {}
-                        continue
-                    }
-                    when (val msg = WireCameraControl.decode(blob)) {
-                        is WireCameraControl.StartCamera -> handleStartCamera(msg)
-                        WireCameraControl.StopCamera -> handleStopCamera()
-                        null -> Log.w(TAG, "bad camera control blob")
-                    }
-                }
-            }
-        })
+    /** User tapped the "Stop PC audio" notif action. Tear the local
+     *  AudioTrack down AND tell the host to stop pumping so the
+     *  encoder + capture-source shut off on that side too. */
+    private fun stopAudioSinkFromNotif() {
+        handleStopAudioSink()
+        // Best-effort: if the QUIC session is gone the call returns
+        // false — that's fine, the host already lost the stream.
+        NativeBridge.nativeSendStopAudioSink()
     }
 
-    private fun handleStartCamera(cfg: WireCameraControl.StartCamera) {
-        if (camera != null) {
-            Log.i(TAG, "camera already running; tearing down before re-bootstrap")
-            camera?.stop()
-            camera = null
-        }
-        promoteForegroundType(
-            ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
-                or ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA
-        )
-        camera = CameraSession(this, cfg).also { it.start() }
-        markStream("camera", true)
-        Log.i(TAG, "camera session started for ${cfg.cameraId} (${cfg.width}x${cfg.height}@${cfg.fps})")
-        refreshNotification()
-    }
-
+    // Camera lifecycle (start + stop) wires in task #5 via CameraTile.
     private fun handleStopCamera() {
         camera?.stop()
         camera = null
@@ -719,8 +642,10 @@ class AnsyncCompanionService : Service() {
             ACTION_REFRESH_SETUP -> SetupNotif.refresh(this)
             ACTION_START_MIC_SHARE -> startAudioFromTile(WireAudioControl.Direction.DeviceToHost)
             ACTION_STOP_MIC_SHARE -> stopAudioFromTile(WireAudioControl.Direction.DeviceToHost)
-            ACTION_START_AUDIO_SINK -> startAudioFromTile(WireAudioControl.Direction.HostToDevice)
-            ACTION_STOP_AUDIO_SINK -> stopAudioFromTile(WireAudioControl.Direction.HostToDevice)
+            // Audio sink is host-initiated (D-Bus). The Stop action on
+            // the notif tears the local AudioTrack down AND tells the
+            // PC to stop pumping (receiver-can-stop).
+            ACTION_STOP_AUDIO_SINK -> stopAudioSinkFromNotif()
             ACTION_STOP_CAMERA -> handleStopCamera()
             ACTION_START_CAPTURE -> {
                 val resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, 0)
@@ -835,15 +760,14 @@ class AnsyncCompanionService : Service() {
         mirrorMediaSession = MirrorMediaSession(this, host).also { it.start() }
     }
 
-    /** QSTile-driven audio start. Re-uses [AudioRouter] but skips the
-     *  control-message handshake — the user already opted in by
-     *  tapping the tile. The host sees the new stream open the same
-     *  way it does for a `Device.StartAudioRoute` D-Bus call.
+    /** QSTile-driven mic share start. The user tapped [MicShareTile];
+     *  the host has no say — it will see the stream open when the
+     *  first Opus packet arrives.
      *
-     *  Only one direction may be active at a time on the tile-driven
-     *  path; a second call with a different direction is a no-op
-     *  (existing router wins). Simultaneous mic+sink is driven by the
-     *  D-Bus surface — see task #4. */
+     *  Direction is passed for symmetry with [stopAudioFromTile] but
+     *  callers pass [WireAudioControl.Direction.DeviceToHost] only.
+     *  Simultaneous host-initiated audio sink runs on a separate
+     *  [AudioRouter] wired by `handleStartAudioSink`. */
     private fun startAudioFromTile(direction: WireAudioControl.Direction) {
         val existing = audio
         if (existing != null) {
@@ -864,7 +788,7 @@ class AnsyncCompanionService : Service() {
                 )
             }
             WireAudioControl.Direction.HostToDevice -> {
-                setTileState(PREF_AUDIO_OUT_ACTIVE, true)
+                Log.w(TAG, "startAudioFromTile(HostToDevice) — audio sink is host-initiated, ignoring")
             }
         }
     }
@@ -881,7 +805,10 @@ class AnsyncCompanionService : Service() {
         refreshNotification()
         when (direction) {
             WireAudioControl.Direction.DeviceToHost -> setTileState(PREF_MIC_ACTIVE, false)
-            WireAudioControl.Direction.HostToDevice -> setTileState(PREF_AUDIO_OUT_ACTIVE, false)
+            WireAudioControl.Direction.HostToDevice -> {
+                // no-op: audio sink Stop comes through
+                // stopAudioSinkFromNotif, not the tile-driven path.
+            }
         }
     }
 
@@ -924,12 +851,8 @@ class AnsyncCompanionService : Service() {
     }
 
     override fun onDestroy() {
-        cameraPollRunning = false
         camera?.stop()
         camera = null
-        cameraPollThread?.quitSafely()
-        cameraPollThread = null
-        cameraPollHandler = null
         audioPollRunning = false
         audio?.stop()
         audio = null
@@ -946,10 +869,6 @@ class AnsyncCompanionService : Service() {
         dialer = null
         wifiPair?.stop()
         wifiPair = null
-        capturePollRunning = false
-        capturePollThread?.quitSafely()
-        capturePollThread = null
-        capturePollHandler = null
         urlPollRunning = false
         urlPollThread?.quitSafely()
         urlPollThread = null
@@ -1018,11 +937,12 @@ class AnsyncCompanionService : Service() {
          *  service can re-evaluate which step (if any) is still pending. */
         const val ACTION_REFRESH_SETUP = "org.gameros.ansync.action.REFRESH_SETUP"
 
-        /** QSTile triggers — start/stop audio routes directly without
-         *  waiting for the host's control-stream handshake. */
+        /** QSTile triggers — mic share (phone → PC) starts/stops
+         *  directly from [MicShareTile]. Audio sink (PC → phone) has
+         *  no start tile (host-initiated via D-Bus); only STOP exists,
+         *  fired from the notification action. */
         const val ACTION_START_MIC_SHARE = "org.gameros.ansync.action.START_MIC_SHARE"
         const val ACTION_STOP_MIC_SHARE = "org.gameros.ansync.action.STOP_MIC_SHARE"
-        const val ACTION_START_AUDIO_SINK = "org.gameros.ansync.action.START_AUDIO_SINK"
         const val ACTION_STOP_AUDIO_SINK = "org.gameros.ansync.action.STOP_AUDIO_SINK"
 
         /** Camera lifecycle stop (notification action button). */

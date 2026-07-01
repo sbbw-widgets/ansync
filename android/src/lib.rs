@@ -1539,6 +1539,54 @@ pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativeSendCameraChun
     }
 }
 
+/// Companion → host: notify the daemon to stop pumping audio sink.
+/// Fired when the user taps "Stop PC audio" on the ansync notif — the
+/// local `AudioTrack` is already torn down; this tells the host to
+/// stop its encoder + PipeWire capture too.
+///
+/// Opens a one-shot `StreamKind::Control` outbound, writes a
+/// `Message::Control(StopAudioSink)` envelope, drops the stream.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativeSendStopAudioSink<'local>(
+    _env: JNIEnv<'local>,
+    _class: JClass<'local>,
+) -> jboolean {
+    let conn = {
+        let slot = state_slot().lock().expect("state mutex poisoned");
+        match slot.as_ref().and_then(|s| s.session.as_ref()) {
+            Some(sess) => sess.conn.clone(),
+            None => {
+                warn!("nativeSendStopAudioSink: no active session");
+                return jni::sys::JNI_FALSE;
+            }
+        }
+    };
+    let env_msg = Envelope {
+        version: PROTOCOL_VERSION,
+        message: Message::Control(ControlMessage::StopAudioSink),
+    };
+    let bytes = match postcard::to_allocvec(&env_msg) {
+        Ok(b) => b,
+        Err(e) => {
+            error!("nativeSendStopAudioSink: encode: {e}");
+            return jni::sys::JNI_FALSE;
+        }
+    };
+    let result = runtime().block_on(async move {
+        let mut stream = conn.open(StreamKind::Control).await?;
+        stream.send(Bytes::from(bytes)).await?;
+        let _ = stream.finish().await;
+        Ok::<(), ansync_transport::TransportError>(())
+    });
+    match result {
+        Ok(()) => jni::sys::JNI_TRUE,
+        Err(e) => {
+            warn!("nativeSendStopAudioSink: send failed: {e}");
+            jni::sys::JNI_FALSE
+        }
+    }
+}
+
 /// Tear down the outbound camera stream — typically called by Kotlin
 /// after the encoder drains in response to a StopCamera control.
 #[unsafe(no_mangle)]

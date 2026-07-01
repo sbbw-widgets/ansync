@@ -86,22 +86,6 @@ object NativeBridge {
     external fun nativeSendInputMessage(blob: ByteArray): Boolean
 
     /**
-     * Block (in native) until the next camera control message arrives
-     * from the host (StartCamera / StopCamera), then return the
-     * tag-binary encoding (see `WireCameraControl`). Returns `null`
-     * on session teardown.
-     */
-    external fun nativePollCameraControl(): ByteArray?
-
-    /**
-     * Block (in native) until the host sends a screen-capture
-     * control: `RequestScreenCapture` (single byte 0x00) or
-     * `StopScreenCapture` (single byte 0x01). Returns `null` on
-     * session teardown.
-     */
-    external fun nativePollCaptureControl(): ByteArray?
-
-    /**
      * Push one encoded camera frame (H.264 / H.265 access unit) over
      * the outbound Camera stream. Lazy-opens the stream on first
      * call. Returns `false` if the stream is unhealthy — caller
@@ -114,11 +98,19 @@ object NativeBridge {
 
     /**
      * Block (in native) until the next audio control message arrives
-     * (StartAudioRoute / StopAudioRoute). Wire layout:
-     *   tag 0 StartAudioRoute : u8 direction(0=HostToDevice,1=DeviceToHost,2=Both)
-     *   tag 1 StopAudioRoute  : (no payload)
+     * (StartAudioSink / StopAudioSink). Wire layout:
+     *   tag 0 StartAudioSink : (no payload)
+     *   tag 1 StopAudioSink  : (no payload)
      */
     external fun nativePollAudioControl(): ByteArray?
+
+    /**
+     * Companion → host one-shot: open a Control stream and send
+     * `Message::Control(StopAudioSink)`. Used by the "Stop PC audio"
+     * notif action to tell the host to stop pumping (receiver-can-
+     * stop). Returns `false` if the session is gone.
+     */
+    external fun nativeSendStopAudioSink(): Boolean
 
     /**
      * Block until the next host→device PCM chunk arrives over the

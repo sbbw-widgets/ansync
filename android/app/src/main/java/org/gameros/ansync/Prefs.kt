@@ -11,11 +11,10 @@ const val PREFS = "ansync_prefs"
 const val PREF_HOST_ADDR = "host_addr"
 
 
-/** Sticky state for the four QSTiles. Service writes + Tile reads. */
+/** Sticky state for the QSTiles. Service writes + Tile reads. */
 const val PREF_MIRROR_ACTIVE = "tile_mirror_active"
 const val PREF_TOUCHPAD_ACTIVE = "tile_touchpad_active"
 const val PREF_MIC_ACTIVE = "tile_mic_active"
-const val PREF_AUDIO_OUT_ACTIVE = "tile_audio_out_active"
 
 /**
  * Opt-in: hold a `PARTIAL_WAKE_LOCK` while at least one stream

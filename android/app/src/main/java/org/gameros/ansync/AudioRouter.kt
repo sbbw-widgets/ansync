@@ -135,17 +135,21 @@ class AudioRouter(val direction: WireAudioControl.Direction) {
 
 /**
  * Tag-binary audio-control wire mirrored from
- * `control_recv_loop::Message::Control(StartAudioRoute|StopAudioRoute)`
+ * `control_recv_loop::Message::Control(StartAudioSink|StopAudioSink)`
  * in `android/src/lib.rs`. Any change requires a matching diff in
  * that file in the same commit.
  *
  * Wire:
- *   tag 0 StartAudioRoute : u8 direction (0=HostToDevice, 1=DeviceToHost, 2=Both)
- *   tag 1 StopAudioRoute  : (no payload)
+ *   tag 0 StartAudioSink : (no payload)
+ *   tag 1 StopAudioSink  : (no payload)
+ *
+ * The audio sink is always host → device. Direction is a Kotlin-only
+ * detail carried on [AudioRouter] to distinguish the phone-initiated
+ * mic share path.
  */
 sealed class WireAudioControl {
-    data class StartAudioRoute(val direction: Direction) : WireAudioControl()
-    object StopAudioRoute : WireAudioControl()
+    object StartAudioSink : WireAudioControl()
+    object StopAudioSink : WireAudioControl()
 
     enum class Direction { HostToDevice, DeviceToHost }
 
@@ -153,16 +157,8 @@ sealed class WireAudioControl {
         fun decode(bytes: ByteArray): WireAudioControl? {
             if (bytes.isEmpty()) return null
             return when (bytes[0].toInt() and 0xFF) {
-                0 -> {
-                    if (bytes.size < 2) return null
-                    val dir = when (bytes[1].toInt() and 0xFF) {
-                        0 -> Direction.HostToDevice
-                        1 -> Direction.DeviceToHost
-                        else -> return null
-                    }
-                    StartAudioRoute(dir)
-                }
-                1 -> StopAudioRoute
+                0 -> StartAudioSink
+                1 -> StopAudioSink
                 else -> null
             }
         }
