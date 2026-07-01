@@ -221,6 +221,7 @@ impl Daemon {
         info!(backend = %audio_backend.kind(), "audio backend selected");
         let action_handle = tokio::spawn(action_loop(
             action_rx,
+            action_tx.clone(),
             mirrors.clone(),
             audios.clone(),
             audio_backend.clone(),
@@ -660,6 +661,7 @@ impl MirrorRegistry {
 
 async fn action_loop(
     mut rx: UnboundedReceiver<DaemonAction>,
+    self_tx: UnboundedSender<DaemonAction>,
     mirrors: Arc<MirrorRegistry>,
     audios: Arc<AudioRegistry>,
     audio_backend: SharedAudioBackend,
@@ -700,8 +702,122 @@ async fn action_loop(
             DaemonAction::SendUrl { device, url } => {
                 handle_send_url(&mirrors, &device, url).await;
             }
+            DaemonAction::MirrorStreamAppeared { device } => {
+                handle_mirror_stream_appeared(&mirrors, &self_tx, &dbus_conn, &device).await;
+            }
+            DaemonAction::MirrorStreamGone { device } => {
+                handle_mirror_stream_gone(&mirrors, &dbus_conn, &device).await;
+            }
         }
     }
+}
+
+/// Bring up the mirror renderer subprocess for `device`. Called by
+/// `action_loop` on `MirrorStreamAppeared` — that is, the phone has
+/// just opened a Video stream and pushed its first chunk. Idempotent:
+/// a second appearance while the subprocess is already up is a no-op
+/// (companion reconnected without the daemon noticing).
+///
+/// Also opens the outbound Input stream so pointer / keyboard events
+/// dispatched from the renderer window reach the peer. If the Input
+/// stream fails to open the window still runs, view-only.
+async fn handle_mirror_stream_appeared(
+    mirrors: &MirrorRegistry,
+    self_tx: &UnboundedSender<DaemonAction>,
+    dbus_conn: &Arc<zbus::Connection>,
+    device: &DeviceId,
+) {
+    let Some(entry) = mirrors.get(device) else {
+        warn!(%device, "MirrorStreamAppeared: no mirror entry");
+        return;
+    };
+    let already_up = entry
+        .subprocess
+        .lock()
+        .expect("subprocess slot poisoned")
+        .is_some();
+    if already_up {
+        info!(%device, "MirrorStreamAppeared: subprocess already up");
+        return;
+    }
+    let conn = entry.conn.lock().expect("conn slot poisoned").clone();
+    let input_tx = if let Some(conn) = conn {
+        match conn.open(StreamKind::Input).await {
+            Ok(stream) => {
+                let (tx, rx) = unbounded_channel::<InputMessage>();
+                tokio::spawn(input_writer_loop(stream, rx, device.clone()));
+                Some(tx)
+            }
+            Err(e) => {
+                warn!(%device, error = %e, "open outbound Input stream failed; window view-only");
+                None
+            }
+        }
+    } else {
+        warn!(%device, "MirrorStreamAppeared: no live connection; window view-only");
+        None
+    };
+    let title = format!("ansync — {}", entry.peer_name);
+    let exit_tx = self_tx.clone();
+    let exit_device = device.clone();
+    let entry_for_exit = entry.clone();
+    match spawn_mirror_subprocess(
+        title,
+        entry.clone(),
+        input_tx,
+        move || {
+            *entry_for_exit
+                .subprocess
+                .lock()
+                .expect("subprocess slot poisoned") = None;
+            *entry_for_exit
+                .video_tx
+                .lock()
+                .expect("video_tx slot poisoned") = None;
+            let _ = exit_tx.send(DaemonAction::MirrorStreamGone {
+                device: exit_device,
+            });
+        },
+    )
+    .await
+    {
+        Ok(()) => {
+            info!(%device, "MirrorStreamAppeared: subprocess spawned");
+            emit_stream(dbus_conn, device, "screen", true).await;
+        }
+        Err(e) => warn!(%device, error = %e, "MirrorStreamAppeared spawn failed"),
+    }
+}
+
+/// Tear the mirror renderer subprocess down. Called by `action_loop`
+/// on `MirrorStreamGone` — the phone closed the Video stream (QSTile
+/// flipped off, MediaProjection revoked, connection dropped). Also
+/// called by the subprocess `on_exit` hook when the user closes the
+/// window manually.
+async fn handle_mirror_stream_gone(
+    mirrors: &MirrorRegistry,
+    dbus_conn: &Arc<zbus::Connection>,
+    device: &DeviceId,
+) {
+    let Some(entry) = mirrors.get(device) else {
+        return;
+    };
+    {
+        let mut tx_slot = entry.video_tx.lock().expect("video_tx slot poisoned");
+        *tx_slot = None;
+    }
+    let taken = entry
+        .subprocess
+        .lock()
+        .expect("subprocess slot poisoned")
+        .take();
+    if let Some(mut sp) = taken {
+        if let Some(tx) = sp.host_tx.take() {
+            let _ = tx.send(ansync_video::ipc::HostMsg::Shutdown);
+        }
+    }
+    info!(%device, "MirrorStreamGone: subprocess down");
+    emit_stream(dbus_conn, device, "screen", false).await;
 }
 
 /// Fire-and-forget wrapper around `Device::emit_stream_state` so the
@@ -919,14 +1035,14 @@ async fn handle_connection(
                     .video_inbound
                     .store(true, std::sync::atomic::Ordering::Relaxed);
                 let action_tx = dbus_state.actions.clone();
-                // No auto-ShowScreen here on purpose. The user owns
-                // the decision to open the mirror window — D-Bus
-                // ShowScreen from DMS (or the CLI). Inbound Video
-                // without an active subprocess gets fanned to
-                // `entry.video_tx == None` and dropped, which is what
-                // we want: the daemon shouldn't pop a window on its
-                // own just because the phone started capturing.
-                tokio::spawn(video_stream_loop(stream, entry, pid, action_tx));
+                let mirrors_v = mirrors.clone();
+                let dbus_v = dbus_conn.clone();
+                // Auto-window on inbound: first chunk fires the
+                // subprocess spawn synchronously (so the first NAL
+                // isn't dropped), subsequent chunks fan through
+                // `entry.video_tx`. Stream close fires
+                // `MirrorStreamGone` via the guard drop.
+                tokio::spawn(video_stream_loop(stream, entry, pid, mirrors_v, dbus_v, action_tx));
             }
             StreamKind::Camera => {
                 let entry = camera_entry.clone();
@@ -2091,40 +2207,38 @@ async fn video_stream_loop(
     mut stream: QuicStream,
     entry: Arc<MirrorEntry>,
     peer_id: DeviceId,
+    mirrors: Arc<MirrorRegistry>,
+    dbus_conn: Arc<zbus::Connection>,
     action_tx: Option<UnboundedSender<DaemonAction>>,
 ) {
     info!(%peer_id, "video stream wired");
-    // The decoder lives in the per-window mirror subprocess now.
-    // This loop's only job is to fan encoded NAL chunks off the QUIC
-    // stream into whichever subprocess (if any) currently owns the
-    // window for this peer. No window open → no subscriber → chunks
-    // are dropped silently, which is fine: the companion keeps
-    // capturing only because the device-side decision (QSTile / D-Bus)
-    // told it to.
-    // When the QUIC video stream ends (Android stopped capturing,
-    // tile flipped off, peer disconnected, etc.) tear the mirror
-    // window down too — there's no point keeping a renderer
-    // subprocess alive showing the last frozen frame, and the user
-    // explicitly does NOT want a window that outlives the stream.
-    // Auto tear-down of the mirror window on stream close is wired in
-    // task #3 (auto mirror window on inbound). For now the guard only
-    // clears the `video_inbound` flag so re-connect logic sees a
-    // clean slate.
-    let _ = action_tx;
+    // Auto-window: first chunk arrives → spawn the mirror subprocess
+    // synchronously so `entry.video_tx` is set before we try to fan
+    // this chunk to it. Stream close → InboundGuard fires
+    // `MirrorStreamGone` through the action loop for teardown.
     struct InboundGuard {
         entry: Arc<MirrorEntry>,
+        peer_id: DeviceId,
+        action_tx: Option<UnboundedSender<DaemonAction>>,
     }
     impl Drop for InboundGuard {
         fn drop(&mut self) {
             self.entry
                 .video_inbound
                 .store(false, std::sync::atomic::Ordering::Relaxed);
+            if let Some(tx) = self.action_tx.as_ref() {
+                let _ = tx.send(DaemonAction::MirrorStreamGone {
+                    device: self.peer_id.clone(),
+                });
+            }
         }
     }
     let _guard = InboundGuard {
         entry: entry.clone(),
+        peer_id: peer_id.clone(),
+        action_tx: action_tx.clone(),
     };
-    let mut first_chunk_logged = false;
+    let mut first_chunk_seen = false;
     let mut chunks_since_log: u64 = 0;
     let mut last_stat = std::time::Instant::now();
     loop {
@@ -2140,9 +2254,16 @@ async fn video_stream_loop(
                 return;
             }
         };
-        if !first_chunk_logged {
+        if !first_chunk_seen {
             info!(%peer_id, bytes = bytes.len(), "first video chunk from peer");
-            first_chunk_logged = true;
+            first_chunk_seen = true;
+            // Bootstrap the renderer inline so the very first NAL
+            // (typically the keyframe SPS/PPS/IDR) is not dropped —
+            // an event round-trip through the action loop would race
+            // the next chunk arriving.
+            if let Some(tx) = action_tx.as_ref() {
+                handle_mirror_stream_appeared(&mirrors, tx, &dbus_conn, &peer_id).await;
+            }
         }
         chunks_since_log += 1;
         let sender = entry
@@ -2153,8 +2274,8 @@ async fn video_stream_loop(
         if let Some(tx) = sender {
             if tx.send(bytes).is_err() {
                 // Renderer subprocess died or was closed by the user.
-                // Drop the sender so future ShowScreen actions
-                // re-bootstrap from scratch.
+                // Drop the sender so a future MirrorStreamAppeared
+                // re-bootstraps from scratch.
                 *entry.video_tx.lock().expect("video_tx slot poisoned") = None;
             }
         }

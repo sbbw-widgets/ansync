@@ -80,6 +80,14 @@ pub enum DaemonAction {
     /// behaviour is per-platform (Linux opens directly, Android
     /// prompts) — see `ansync_proto::UrlMessage`.
     SendUrl { device: DeviceId, url: String },
+    /// Internal: first Video chunk arrived from the peer — spawn the
+    /// mirror renderer subprocess if not already up. Fired by
+    /// `video_stream_loop` on first chunk, never by D-Bus.
+    MirrorStreamAppeared { device: DeviceId },
+    /// Internal: the Video stream closed — tear the mirror renderer
+    /// subprocess down. Fired by the `InboundGuard` drop in
+    /// `video_stream_loop`.
+    MirrorStreamGone { device: DeviceId },
 }
 
 pub struct DaemonState {
