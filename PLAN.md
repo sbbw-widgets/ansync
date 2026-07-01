@@ -705,3 +705,83 @@ Diagnóstico real con telemetría: **loss=0% RTT 7ms** sostenido. Loss descartad
 ### "Cursor chill se endura" (slow-finger sticky) — cerrado
 
 Síntoma residual reportado en mid-session: cursor fluido pero se "endurece" en moves lentísimos. Hipótesis principal: libinput `accel-profile=adaptive` aplica multiplier <1.0 a velocidades bajas (precision mode by design). Fix compositor-side: `gsettings set org.gnome.desktop.peripherals.touchpad accel-profile 'flat'` (GNOME), `accel_profile flat` en sway/wayfire/hyprland config, KDE Settings → Mouse → Pointer acceleration = None. No requiere cambios en ansync.
+
+## Sender-initiates refactor + Mirror lifecycle (sesión 2026-07-01)
+
+Reorganización grande de la surface de acciones + arreglo del ciclo de vida de la ventana de mirror.
+
+### Regla sender-initiates
+
+El trigger de cada stream vive en la punta que emite el dato.
+
+- **Screen mirror / camera / mic share** → QSTiles del companion (privacidad: la PC no puede pedirlo).
+- **Audio sink (PC → phone)** → único trigger D-Bus (`Device.StartAudioSink` / `StopAudioSink`).
+- **Files / URLs** → bidi por evento share (D-Bus del host o `ACTION_SEND` del companion).
+- **Clipboard** → always-sync (sin cambios).
+- **Receiver conserva Stop**. Ejemplo: notif del companion "Stop PC audio" dispara `nativeSendStopAudioSink()` → daemon `control_inbound_loop` decoda `ControlMessage::StopAudioSink` → `handle_stop_audio_sink`.
+
+### Cambios en el wire / crates
+
+- **`proto`**:
+  - `ControlMessage` reducido a `StartAudioSink` / `StopAudioSink`. Removidos `StartScreen`, `StopScreen`, `StartCamera`, `StopCamera`, `StartMic`, `StopMic`, `StartAudioRoute`, `StopAudioRoute`, `RequestScreenCapture`, `StopScreenCapture`.
+  - `AudioDirection` reducido a `HostToDevice | DeviceToHost` (drop `Both`).
+  - Nuevo `CameraStreamInit { width, height, fps, codec, aspect }` — header postcard first-frame en `StreamKind::Camera`. Companion elige encoding; host proviciona sink reactivo.
+- **`dbus`**: `Device.StartAudioSink` / `StopAudioSink` reemplazan los 8 métodos removidos. `DaemonAction` reducido a `StartAudioSink`, `StopAudioSink`, `SyncClipboard`, `SendFiles`, `SendUrl`, `MirrorStreamAppeared`, `MirrorStreamGone`.
+- **`ansyncctl`**: `audio-sink-start <id>` / `audio-sink-stop <id>`. Removidos `show`, `hide`, `camera-start/stop`, `mic-start/stop`, `audio-start/stop`.
+- **`daemon-core`**:
+  - `MirrorStreamAppeared` / `MirrorStreamGone` internos (no D-Bus). `video_stream_loop` fires `MirrorStreamAppeared` INLINE en primer chunk para no perder SPS/PPS/IDR (evita race del action_loop round-trip).
+  - `control_inbound_loop` acepta phone→PC ControlMessage (Stop sink desde notif).
+  - `camera_stream_loop` reactivo: lee `CameraStreamInit` header primero, luego provisiona sink + spawn `camera_decode_loop`.
+- **Android companion Kotlin**:
+  - `CameraTile` nueva. Short-tap = start con últimos valores/defaults; long-press = `QS_TILE_PREFERENCES` intent → `CameraSettingsActivity`.
+  - `CameraSettingsActivity` (translucent) con `AnsyncDialog` composable — responsive: bottom-sheet phone portrait / centered card tablet-landscape. Pickers para camera, resolution, FPS, codec, aspect + Switch stabilization + Slider bitrate.
+  - `CameraLocalConfig` en SharedPreferences. Prefs comparte tag values con `nativeSendCameraStreamInit`.
+  - `AudioSinkTile` retirada — sink es host-initiated only, notif conserva "Stop" via `nativeSendStopAudioSink`.
+  - `WireCameraControl.kt` retirado.
+- **Native JNI companion**:
+  - Nuevo `nativeSendCameraStreamInit(w, h, fps, codec, aspect)` — abre `StreamKind::Camera` outbound + envía header postcard.
+  - Nuevo `nativeSendStopAudioSink()` — one-shot Control stream con `Message::Control(StopAudioSink)`.
+  - Removidos `nativePollCameraControl`, `nativePollCaptureControl` (no más PC-initiated camera / capture).
+
+### Commits
+
+- `9866396` refactor(audio): drop AudioDirection::Both
+- `44c4cdb` refactor(dbus,proto,cli): sender-initiates surface — StartAudioSink, drop mirror/camera/mic host triggers
+- `af56552` feat(daemon): auto mirror window on inbound video stream
+- `47454b6` feat(companion): drop AudioSinkTile — sink is host-initiated, notif Stop only
+- `0fd488d` feat(camera): phone-initiated flow — CameraTile + settings popup + CameraStreamInit header
+
+### Mirror lifecycle fix
+
+Bug reportado: user cierra mirror desde Android → ventana PC no cierra. Retransmite → todo se rompe y no vuelve a aparecer ninguna ventana.
+
+Diagnóstico (log muestra `frame too large: 1832016667 bytes` + subprocess exit SIGSEGV):
+
+1. **Tracing subscriber leak en la pipe IPC (`f384b75`)** — `install_logging()` en `bins/ansyncd/src/main.rs:100` montaba `tracing_subscriber::fmt::layer()` con writer default (stdout) ANTES del dispatch de subcomando. El subprocess `mirror-renderer` heredaba mismo subscriber → cada `tracing::info!` en el renderer clobbeaba el stdout pipe IPC compartido con el daemon → daemon leía bytes de timestamp como u32 length prefix → `frame too large`. Reader IPC muerto → renderer wedged → SIGSEGV eventual → cadena degradada en cada redial.
+   - Fix: `install_logging(to_stderr: bool)`. Detección pre-clap `std::env::args().nth(1) == Some("mirror-renderer")`. Renderer routea fmt layer a `std::io::stderr` (que sigue heredado del daemon → aparece en journal). Stdout queda limpia para postcard IPC.
+2. **PID health check en handle_mirror_stream_appeared (`f384b75`)** — `MirrorSubprocess` gana `alive: Arc<AtomicBool>` + `kill_tx: oneshot::Sender<()>`. Wait task flippea `alive=false` al exit (clean shutdown, crash, kill). `handle_mirror_stream_appeared` verifica antes del short-circuit "already up" — dead-PID slot ya no bloquea la próxima ShowScreen. Purga el slot + clarea `video_tx` si detecta zombie.
+3. **Hard-kill fallback en handle_mirror_stream_gone (`f384b75`)** — post `HostMsg::Shutdown`, arma timer 1.5s. Si `alive` sigue true → `kill_tx.send(())` → wait task ejecuta `child.kill()` + `child.wait()`. Cierre garantizado incluso si el renderer wedgeó en un race de wgpu teardown o la pipe stalleó.
+
+### Companion video stream teardown
+
+Bug remanente post-`f384b75`: user cierra QSTile Mirror → capture stops → PC window sigue mostrando último frame. Log: `mirror reader: clean EOF from renderer` sólo aparecía cuando user cerraba manualmente la ventana PC (X button), no cuando Android detenía capture. Causa: `ActiveSession.video_stream` era pre-abierta en `nativeOpenConnection` como `Arc<AsyncMutex<QuicStream>>` — `CaptureSession.stop` no la cerraba, entonces `stream.recv()` del daemon quedaba bloqueado esperando chunks nuevos que nunca llegaban.
+
+Fix (`00d7f42`):
+
+- `ActiveSession.video_stream` migrada a `Arc<AsyncMutex<Option<QuicStream>>>` (patrón `outbound_camera` / `outbound_audio`). Init `None`.
+- `nativeSendVideoChunk` lazy-opens la stream cuando slot está vacío. Send fail → clarea slot → next chunk reopens (dead-stream recovery, análogo al que tiene `nativeSendInputMessage`).
+- Nuevo JNI `nativeStopVideoStream()` — drop del guard cierra QUIC send half. Idempotente.
+- `CaptureSession.stop()` en Kotlin llama `NativeBridge.nativeStopVideoStream()` post drain-thread join.
+
+Ciclo completo funcional:
+
+1. QSTile Start → `CaptureSession.start` → first frame → lazy-open Video → daemon spawn subprocess.
+2. QSTile Stop → `CaptureSession.stop` → drain-thread join → `nativeStopVideoStream` → QUIC Video close.
+3. Daemon `video_stream_loop::recv` → `Closed` → `InboundGuard::drop` → `MirrorStreamGone`.
+4. `handle_mirror_stream_gone` → `HostMsg::Shutdown` → renderer exit → wait task → `alive=false` (+ kill fallback 1.5s).
+5. QSTile Start otra vez → `nativeSendVideoChunk` reopens Video → daemon accept nueva stream → nuevo subprocess (entry previo purgado por PID alive check).
+
+### Commits
+
+- `f384b75` fix(mirror): route renderer tracing to stderr + PID health + kill fallback
+- `00d7f42` fix(companion): close outbound Video stream on CaptureSession.stop

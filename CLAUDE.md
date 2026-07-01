@@ -175,7 +175,21 @@ El `flake.nix` pinea `nixpkgs` a `549bd84d6279f9852cae6225e372cc67fb91a4c1` para
   - **Quantum align**: feeder gana `node.latency = "960/48000"` → PipeWire negocia quantum 960 (alineado a packet Opus) en vez del default 1024 → no más straddle de 64 samples por callback creando buzz a 46 Hz.
   - Resultado: surface `<peer_name> (Ansync)` aparece en Discord / Firefox / pavucontrol; audio claro sin ruido ni glitches.
 
-Ver `PLAN.md` § Roadmap + § Touchpad Mac-style + § Telemetría para la lista completa.
+- **Sender-initiates refactor + Mirror lifecycle (sesión 2026-07-01)** — reorganización de la surface de acciones + fix de la ventana de mirror que quedaba viva post-stop:
+  - **Regla sender-initiates**: el trigger de cada stream vive en la punta que emite el dato. Screen mirror / camera / mic share → 3 QSTiles del companion (privacidad); audio sink (PC→phone) → único D-Bus trigger; files / URLs → bidi por evento share; clipboard → always-sync. Receiver conserva Stop pero nunca Start.
+  - `ControlMessage` reducido a `StartAudioSink` / `StopAudioSink`. Removidos `StartScreen`/`StopScreen`/`StartCamera`/`StopCamera`/`StartMic`/`StopMic`/`StartAudioRoute`/`StopAudioRoute`/`RequestScreenCapture`/`StopScreenCapture`. `AudioDirection` reducido a `HostToDevice | DeviceToHost` (drop `Both`).
+  - D-Bus `Device` gana `StartAudioSink` + `StopAudioSink`, pierde los 8 métodos mirror/camera/mic/audio-route. CLI `ansyncctl audio-sink-{start,stop} <id>` reemplaza los ex-`show/hide/camera-*/mic-*/audio-*`.
+  - Nuevo proto `CameraStreamInit {width, height, fps, codec, aspect}` (header first-frame de `StreamKind::Camera`) — companion elige encoding + host proviciona sink reactivo, sin RPC previo.
+  - `daemon-core`: nuevo `MirrorStreamAppeared/Gone` interno; `video_stream_loop` spawnea subprocess inline en primer chunk para no perder SPS/PPS/IDR. `control_inbound_loop` acepta phone→PC ControlMessage (Stop sink desde notif del companion).
+  - Companion Kotlin: `CameraTile` nueva (QSTile short-tap = start con últimos valores; long-press = `QS_TILE_PREFERENCES` → `CameraSettingsActivity`). `CameraLocalConfig` persiste en SharedPreferences. `AudioSinkTile` retirada (PC-initiated only). `AnsyncDialog` responsive (bottom sheet phone portrait / centered card tablet-landscape) usada por `CameraSettingsActivity`.
+  - **Mirror lifecycle fix (`f384b75`)** — bug: renderer subprocess corrompía la pipe IPC porque `install_logging()` montaba `tracing::fmt::layer()` con writer stdout ANTES del dispatch de subcomando. `mirror-renderer` heredaba misma subscriber → cada `info!` clobbeaba postcard reader del daemon → `frame too large: 1832016667 bytes`. Fix triple:
+    - `install_logging(to_stderr: bool)` — routea fmt layer a stderr cuando `argv[1] == "mirror-renderer"`. Stdout queda limpia para IPC. Stderr sigue heredado del daemon → aparece en journal.
+    - `MirrorSubprocess` gana `alive: Arc<AtomicBool>` + `kill_tx: oneshot::Sender<()>`. Wait task flippea `alive` en exit; `handle_mirror_stream_appeared` verifica antes del short-circuit "already up" (dead-PID slots ya no bloquean nuevas ShowScreen).
+    - `handle_mirror_stream_gone`: post `HostMsg::Shutdown` arma timer 1.5s; si `alive` sigue true → `kill_tx.send(())` → wait task ejecuta `child.kill()` + `child.wait()`. Cierre garantizado.
+  - **Companion video stream teardown (`00d7f42`)** — `ActiveSession.video_stream` migrada a `Arc<AsyncMutex<Option<QuicStream>>>` (patrón outbound_camera/outbound_audio). No pre-open en `nativeOpenConnection`. `nativeSendVideoChunk` lazy-open; send fail → clarea slot para reopen. Nuevo `nativeStopVideoStream` — drop del guard cierra QUIC send half. `CaptureSession.stop()` (post drain-thread join) llama JNI → daemon `video_stream_loop::recv` retorna `Closed` → `InboundGuard::drop` → `MirrorStreamGone` → ventana PC cierra.
+  - Ciclo completo: QSTile Start → first frame lazy-open Video → daemon spawn subprocess. QSTile Stop → `nativeStopVideoStream` → Video close → `MirrorStreamGone` → `HostMsg::Shutdown` (+ kill fallback 1.5s). QSTile Start otra vez → `nativeSendVideoChunk` reopens → daemon accept nueva stream → nuevo subprocess (entry previo purgado por PID alive check).
+
+Ver `PLAN.md` § Roadmap + § Touchpad Mac-style + § Telemetría + § Sender-initiates para la lista completa.
 
 ## Convenciones de continuidad
 
