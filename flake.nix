@@ -102,13 +102,82 @@
             homepage = "https://github.com/SergioRibera/ansync";
             bundleId = "com.sergioribera.ansync";
 
-            # `autoDepends` scans the staged ELFs and resolves SONAMEs
-            # against the curated lib-map. Manual lists below cover what
-            # the scanner misses (kernel modules, runtime tools).
+            # Thin bundle: bundler ships the binary naked and lets the
+            # target distro's package manager resolve runtime libs.
+            # `autoDepends = true` still runs — it scans NEEDED SONAMEs
+            # against the built-in lib-map (glibc / xkbcommon / wayland-
+            # client / dbus / udev / systemd / Qt/GTK/glib) and merges
+            # those in on top of the manual lists below.
+            #
+            # Manual entries cover everything the lib-map does not know
+            # about: pipewire, alsa, opus, GL/EGL, VA-API, Vulkan, v4l,
+            # openh264 (ferricast software fallback), plus the kernel
+            # module (`v4l2loopback`) which is never a shared library.
+            #
+            # Package-name deltas per distro (Debian/Ubuntu vs. Fedora
+            # vs. Arch) are the reason each entry is spelled explicitly.
+            bundleLibs = false;
+            autoDepends = true;
+
             depends = {
-              deb = [ "v4l2loopback-dkms" ];
-              rpm = [ "v4l2loopback" ];
-              archlinux = [ "v4l2loopback-dkms" ];
+              deb = [
+                # Kernel module
+                "v4l2loopback-dkms"
+                # Audio
+                "libpipewire-0.3-0"
+                "libspa-0.2-modules"
+                "libasound2"
+                "libopus0"
+                # GPU / rendering
+                "libgl1"
+                "libegl1"
+                "libglvnd0"
+                "libvulkan1"
+                "libwayland-egl1"
+                # Video accel
+                "libva2"
+                "libva-drm2"
+                # Camera helpers
+                "v4l-utils"
+                # H.264 software fallback (ferricast); openh264 ships in
+                # Debian non-free / Ubuntu multiverse — leave as a
+                # Recommends so `dpkg -i` succeeds even when the repo is
+                # not enabled and only the NVENC/VAAPI paths are used.
+                "libopenh264-7 | libopenh264-6"
+              ];
+
+              debRecommends = [
+                # NVENC / NVDEC. The driver package name churns per
+                # release; leave it a Recommends so a headless-CPU
+                # install still works.
+                "nvidia-cuda-toolkit"
+              ];
+
+              rpm = [
+                "v4l2loopback"
+                "pipewire-libs"
+                "alsa-lib"
+                "opus"
+                "mesa-libGL"
+                "mesa-libEGL"
+                "libglvnd"
+                "vulkan-loader"
+                "libva"
+                "v4l-utils"
+                "openh264"
+              ];
+
+              archlinux = [
+                "v4l2loopback-dkms"
+                "libpipewire"
+                "alsa-lib"
+                "opus"
+                "libglvnd"
+                "vulkan-icd-loader"
+                "libva"
+                "v4l-utils"
+                "openh264"
+              ];
             };
 
             # Daemon-only: no desktop entries.
