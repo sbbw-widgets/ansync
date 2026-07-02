@@ -30,6 +30,10 @@ enum class GamepadButton(val bit: Int?, val label: String) {
     ThumbR(10, "R3"),
     L2(null, "L2"),
     R2(null, "R2"),
+    DpadUp(11, "▲"),
+    DpadDown(12, "▼"),
+    DpadLeft(13, "◀"),
+    DpadRight(14, "▶"),
 }
 
 enum class GamepadStick { L, R }
@@ -120,6 +124,7 @@ data class GamepadLayout(
             val meta = { cx: Float, cy: Float -> ButtonPlacement(cx, cy, 26f, 0.7f) }
             val shoulder = { cx: Float, cy: Float -> ButtonPlacement(cx, cy, 34f, 0.85f) }
             val stickClick = { cx: Float, cy: Float -> ButtonPlacement(cx, cy, 22f, 0.7f) }
+            val dpad = { cx: Float, cy: Float -> ButtonPlacement(cx, cy, 30f, 0.85f) }
             val stick = { cx: Float, cy: Float ->
                 StickPlacement(cx, cy, outerRadius = 90f, thumbRadius = 42f, alpha = 0.85f)
             }
@@ -138,6 +143,12 @@ data class GamepadLayout(
                     GamepadButton.Start to meta(0.58f, 0.90f),
                     GamepadButton.ThumbL to stickClick(0.31f, 0.87f),
                     GamepadButton.ThumbR to stickClick(0.69f, 0.87f),
+                    // DPAD cross to the right of the left stick,
+                    // mirroring the face-button cluster on the far side.
+                    GamepadButton.DpadUp to dpad(0.14f, 0.32f),
+                    GamepadButton.DpadDown to dpad(0.14f, 0.52f),
+                    GamepadButton.DpadLeft to dpad(0.07f, 0.42f),
+                    GamepadButton.DpadRight to dpad(0.21f, 0.42f),
                 ),
                 sticks = mapOf(
                     GamepadStick.L to stick(0.14f, 0.68f),

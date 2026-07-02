@@ -434,6 +434,23 @@ internal class GamepadState {
             lt != newLt || rt != newRt
         lx = newLx; ly = newLy; rx = newRx; ry = newRy; lt = newLt; rt = newRt
         if (changed) emit()
+        // DPAD hat axes — most controllers surface the cross via
+        // `AXIS_HAT_X` (-1 left, +1 right) and `AXIS_HAT_Y` (-1 up,
+        // +1 down) instead of discrete key events. Translate into
+        // bits 11-14 of the physical mask.
+        val hatX = event.getAxisValue(MotionEvent.AXIS_HAT_X)
+        val hatY = event.getAxisValue(MotionEvent.AXIS_HAT_Y)
+        val dpadMask =
+            (if (hatY < -0.5f) 1 shl 11 else 0) or   // Up
+            (if (hatY > 0.5f) 1 shl 12 else 0) or    // Down
+            (if (hatX < -0.5f) 1 shl 13 else 0) or   // Left
+            (if (hatX > 0.5f) 1 shl 14 else 0)       // Right
+        val dpadBits = (1 shl 11) or (1 shl 12) or (1 shl 13) or (1 shl 14)
+        val newPhysical = (physicalButtons and dpadBits.inv()) or dpadMask
+        if (newPhysical != physicalButtons) {
+            physicalButtons = newPhysical
+            rebuildAndEmit()
+        }
         return true
     }
 
@@ -692,4 +709,6 @@ private fun buttonTint(id: GamepadButton): Color = when (id) {
     GamepadButton.L2, GamepadButton.R2 -> Color(0xFF7C4DFF)   // shoulders / triggers
     GamepadButton.Start, GamepadButton.Select, GamepadButton.Mode -> Color(0xFF9E9E9E)
     GamepadButton.ThumbL, GamepadButton.ThumbR -> Color(0xFF6EC1E4)
+    GamepadButton.DpadUp, GamepadButton.DpadDown,
+    GamepadButton.DpadLeft, GamepadButton.DpadRight -> Color(0xFFB0BEC5)
 }

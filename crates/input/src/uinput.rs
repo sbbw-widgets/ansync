@@ -954,7 +954,31 @@ impl Default for Gamepad {
     }
 }
 
-const GP_BTN_LIST: [Key; 11] = [
+/// Wire button bitmask → uinput button mapping. Index in this array
+/// = bit position in the `GamepadState.buttons` `u32` on the wire.
+///
+///   bit 0  → South / A
+///   bit 1  → East / B
+///   bit 2  → North / Y
+///   bit 3  → West / X
+///   bit 4  → TL / L1
+///   bit 5  → TR / R1
+///   bit 6  → Select
+///   bit 7  → Start
+///   bit 8  → Mode / Home
+///   bit 9  → Thumb L / L3
+///   bit 10 → Thumb R / R3
+///   bit 11 → DPAD Up
+///   bit 12 → DPAD Down
+///   bit 13 → DPAD Left
+///   bit 14 → DPAD Right
+///
+/// DPAD entries use discrete `BTN_DPAD_*` variants rather than the
+/// legacy `HAT0X`/`HAT0Y` axes so games probing the modern SDL2
+/// mapping (which lists DPAD as buttons, not axes) light up. HAT0X/Y
+/// stay declared on the abs setup as vestigial legacy channels — we
+/// never emit values into them.
+const GP_BTN_LIST: [Key; 15] = [
     Key::ButtonSouth,
     Key::ButtonEast,
     Key::ButtonNorth,
@@ -966,6 +990,10 @@ const GP_BTN_LIST: [Key; 11] = [
     Key::ButtonMode,
     Key::ButtonThumbl,
     Key::ButtonThumbr,
+    Key::ButtonDpadUp,
+    Key::ButtonDpadDown,
+    Key::ButtonDpadLeft,
+    Key::ButtonDpadRight,
 ];
 
 #[async_trait]

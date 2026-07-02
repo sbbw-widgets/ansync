@@ -140,10 +140,12 @@ object KeycodeMap {
         KeyEvent.KEYCODE_BUTTON_MODE -> 8
         KeyEvent.KEYCODE_BUTTON_THUMBL -> 9
         KeyEvent.KEYCODE_BUTTON_THUMBR -> 10
-        // L2 / R2 / DPAD do not have a slot in the host uinput
-        // `Gamepad` button list. L2 / R2 are surfaced via analog
-        // triggers (lt / rt) below; DPAD is currently dropped (no
-        // hat-axes in the wire protocol).
+        KeyEvent.KEYCODE_DPAD_UP -> 11
+        KeyEvent.KEYCODE_DPAD_DOWN -> 12
+        KeyEvent.KEYCODE_DPAD_LEFT -> 13
+        KeyEvent.KEYCODE_DPAD_RIGHT -> 14
+        // L2 / R2 are surfaced via analog triggers (lt / rt) below
+        // rather than the button bitmask.
         else -> null
     }
 }
