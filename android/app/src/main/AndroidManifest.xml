@@ -152,15 +152,31 @@
             android:excludeFromRecents="true"
             android:noHistory="true" />
 
+        <!--
+            Unified input surface. Hosts touchpad, keyboard, and virtual
+            gamepad modes behind a shared left-rail mode-switch. The
+            optional `mode` extra (see `InputActivity.EXTRA_MODE`) forces
+            an entry surface; QSTiles set it for touchpad + gamepad
+            shortcuts.
+        -->
         <activity
-            android:name=".TouchpadActivity"
+            android:name=".input.InputActivity"
             android:exported="false"
-            android:configChanges="orientation|screenSize|keyboardHidden" />
+            android:configChanges="orientation|screenSize|keyboardHidden|navigation"
+            android:windowSoftInputMode="adjustNothing|stateHidden" />
 
+        <!--
+            Translucent settings dialog for the input surface. Reached
+            from the rail's config button; adapts its content to the
+            active mode (gamepad layout tuner vs. informational).
+        -->
         <activity
-            android:name=".GamepadActivity"
+            android:name=".input.InputSettingsActivity"
             android:exported="false"
-            android:configChanges="orientation|screenSize|keyboardHidden|navigation" />
+            android:theme="@android:style/Theme.Translucent.NoTitleBar"
+            android:excludeFromRecents="true"
+            android:noHistory="true" />
+
 
         <!--
             Share entry point: registers under the system Share sheet
@@ -297,17 +313,6 @@
             <meta-data
                 android:name="android.service.quicksettings.TOGGLEABLE_TILE"
                 android:value="true" />
-        </service>
-
-        <service
-            android:name=".tile.GamepadTile"
-            android:label="@string/tile_gamepad_label"
-            android:icon="@android:drawable/ic_menu_send"
-            android:exported="true"
-            android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
-            <intent-filter>
-                <action android:name="android.service.quicksettings.action.QS_TILE" />
-            </intent-filter>
         </service>
 
         <service

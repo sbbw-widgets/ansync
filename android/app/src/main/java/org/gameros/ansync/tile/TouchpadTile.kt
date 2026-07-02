@@ -5,14 +5,13 @@ import android.content.Intent
 import android.os.Build
 import android.service.quicksettings.Tile
 import android.service.quicksettings.TileService
-import org.gameros.ansync.TouchpadActivity
+import org.gameros.ansync.input.InputActivity
+import org.gameros.ansync.input.InputMode
 
 /**
- * Tap → open the full-screen [TouchpadActivity]. The activity itself
- * is the overlay that captures MotionEvents and pushes them to the
- * host. There is no on/off state — pressing back inside the activity
- * dismisses it, so we keep the tile in `STATE_INACTIVE` (acts like a
- * stateless shortcut button in the QS shade).
+ * Tap → open the unified [InputActivity] on the touchpad surface. The
+ * activity is a stateless overlay: back-press dismisses, so the tile
+ * stays in `STATE_INACTIVE` as a shortcut button.
  */
 class TouchpadTile : TileService() {
     override fun onStartListening() {
@@ -23,8 +22,9 @@ class TouchpadTile : TileService() {
 
     override fun onClick() {
         super.onClick()
-        val intent = Intent(this, TouchpadActivity::class.java).apply {
+        val intent = Intent(this, InputActivity::class.java).apply {
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            putExtra(InputActivity.EXTRA_MODE, InputMode.Touchpad.wire)
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
             val pi = PendingIntent.getActivity(
