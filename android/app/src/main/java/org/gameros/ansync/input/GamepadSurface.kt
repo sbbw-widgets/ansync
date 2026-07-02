@@ -41,6 +41,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
+import kotlin.math.pow
 import org.gameros.ansync.KeycodeMap
 import org.gameros.ansync.NativeBridge
 import org.gameros.ansync.WireInputMessage
@@ -505,6 +506,8 @@ internal sealed class TouchGrab {
         val cx: Float,
         val cy: Float,
         val outerPx: Float,
+        val deadzone: Float,
+        val curve: Float,
     ) : TouchGrab()
 }
 
@@ -563,7 +566,14 @@ private fun pickGrab(
         val r = with(density) { p.outerRadius.dp.toPx() }
         val dx = x - cx; val dy = y - cy
         if (dx * dx + dy * dy <= r * r) {
-            return TouchGrab.Stick(side, cx, cy, r)
+            return TouchGrab.Stick(
+                side = side,
+                cx = cx,
+                cy = cy,
+                outerPx = r,
+                deadzone = p.deadzone,
+                curve = p.curve,
+            )
         }
     }
     for ((id, p) in layout.buttons) {
@@ -604,9 +614,30 @@ private fun applyStickMove(state: GamepadState, grab: TouchGrab.Stick, x: Float,
     // positive when the stick pushes forward. Flip Y so pushing the
     // finger up (visually) reads as ly ~ -32768 (matches physical
     // stick convention).
-    val nx = dx / grab.outerPx
-    val ny = dy / grab.outerPx
+    val nx = shapeStick(dx / grab.outerPx, grab.deadzone, grab.curve)
+    val ny = shapeStick(dy / grab.outerPx, grab.deadzone, grab.curve)
     state.setStickTouch(grab.side, nx, ny)
+}
+
+/**
+ * Radial deadzone + power response applied per axis.
+ *
+ *   |v| < deadzone   → 0                       (kills jitter at rest)
+ *   |v| >= deadzone  → sign(v) * pow(t, curve) where
+ *                      t = (|v| - deadzone) / (1 - deadzone)
+ *
+ * The rescale keeps the on-ring reading at 1.0 regardless of deadzone
+ * so full deflection still hits `Short.MAX_VALUE` on the wire. `curve
+ * > 1` softens the near-center region — a finger 30 % out reads as
+ * `0.3^curve` deflection, which is what makes the virtual stick
+ * behave less twitchy than raw linear mapping.
+ */
+private fun shapeStick(v: Float, deadzone: Float, curve: Float): Float {
+    val abs = kotlin.math.abs(v)
+    if (abs <= deadzone) return 0f
+    val t = ((abs - deadzone) / (1f - deadzone)).coerceIn(0f, 1f)
+    val shaped = t.toDouble().pow(curve.toDouble()).toFloat()
+    return if (v < 0f) -shaped else shaped
 }
 
 // ── Rendering ────────────────────────────────────────────────────────

@@ -138,10 +138,18 @@ private fun GamepadConfigDialog(ctx: Context, onDismiss: () -> Unit) {
                     outer = p.outerRadius,
                     thumb = p.thumbRadius,
                     alpha = p.alpha,
-                    onChange = { o, t, a ->
+                    deadzone = p.deadzone,
+                    curve = p.curve,
+                    onChange = { o, t, a, dz, cv ->
                         val next = layout.withStick(
                             side,
-                            p.copy(outerRadius = o, thumbRadius = t, alpha = a),
+                            p.copy(
+                                outerRadius = o,
+                                thumbRadius = t,
+                                alpha = a,
+                                deadzone = dz,
+                                curve = cv,
+                            ),
                         )
                         layout = next
                         next.persist(ctx)
@@ -187,7 +195,9 @@ private fun StickRow(
     outer: Float,
     thumb: Float,
     alpha: Float,
-    onChange: (Float, Float, Float) -> Unit,
+    deadzone: Float,
+    curve: Float,
+    onChange: (Float, Float, Float, Float, Float) -> Unit,
 ) {
     Column(
         modifier = Modifier
@@ -202,13 +212,24 @@ private fun StickRow(
         Text(label, color = MaterialTheme.colorScheme.onSurface, style = MaterialTheme.typography.labelLarge)
         LabelledSlider("Base radius", outer, 50f, 140f) { o ->
             val cappedThumb = thumb.coerceAtMost(o - 8f)
-            onChange(o, cappedThumb, alpha)
+            onChange(o, cappedThumb, alpha, deadzone, curve)
         }
         LabelledSlider("Thumb radius", thumb, 20f, 70f) { t ->
-            onChange(outer, t.coerceAtMost(outer - 8f), alpha)
+            onChange(outer, t.coerceAtMost(outer - 8f), alpha, deadzone, curve)
         }
         LabelledSlider("Alpha", alpha, 0.15f, 1f) { a ->
-            onChange(outer, thumb, a)
+            onChange(outer, thumb, a, deadzone, curve)
+        }
+        // Deadzone as a % of the base radius. Anything inside this ring
+        // reads as zero deflection — kills resting-finger jitter.
+        LabelledSlider("Deadzone", deadzone, 0f, 0.35f) { dz ->
+            onChange(outer, thumb, alpha, dz, curve)
+        }
+        // Response curve — > 1 softens the near-center region so the
+        // stick doesn't feel twitchy on small deflections. Lower =
+        // more sensitive near center.
+        LabelledSlider("Response curve", curve, 0.6f, 2.5f) { cv ->
+            onChange(outer, thumb, alpha, deadzone, cv)
         }
     }
 }

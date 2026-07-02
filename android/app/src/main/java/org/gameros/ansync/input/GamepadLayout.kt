@@ -56,6 +56,19 @@ data class ButtonPlacement(
  * Placement of an analog stick. The user drags inside [outerRadius]
  * of the base to deflect the thumb; the delta becomes the `lx/ly`
  * (or `rx/ry`) axis reading.
+ *
+ * [deadzone] (0..1 as fraction of [outerRadius]) suppresses tiny
+ * finger jitter so a resting thumb doesn't emit non-zero axis
+ * values.
+ *
+ * [curve] is the response exponent applied to the normalised
+ * deflection after deadzone removal:
+ *   `output = sign(v) * pow(abs(v_after_deadzone), curve)`
+ * A value of `1.0` gives a linear response — a finger 30 % of the
+ * way to the ring reads as 30 % axis deflection. Values above `1.0`
+ * make the near-center region less sensitive (recommended for the
+ * default virtual stick — full raw values were too twitchy for
+ * fine aim); below `1.0` boosts near-center. Typical range 0.6..2.5.
  */
 data class StickPlacement(
     val cx: Float,
@@ -63,6 +76,8 @@ data class StickPlacement(
     val outerRadius: Float,
     val thumbRadius: Float,
     val alpha: Float,
+    val deadzone: Float = 0.08f,
+    val curve: Float = 1.6f,
 )
 
 data class GamepadLayout(
@@ -97,7 +112,9 @@ data class GamepadLayout(
                     .put("cy", p.cy.toDouble())
                     .put("or", p.outerRadius.toDouble())
                     .put("tr", p.thumbRadius.toDouble())
-                    .put("a", p.alpha.toDouble()),
+                    .put("a", p.alpha.toDouble())
+                    .put("dz", p.deadzone.toDouble())
+                    .put("cv", p.curve.toDouble()),
             )
         }
         root.put("buttons", btns)
@@ -185,6 +202,8 @@ data class GamepadLayout(
                         outerRadius = o.optDouble("or", 80.0).toFloat(),
                         thumbRadius = o.optDouble("tr", 36.0).toFloat(),
                         alpha = o.optDouble("a", 0.8).toFloat().coerceIn(0.1f, 1f),
+                        deadzone = o.optDouble("dz", 0.08).toFloat().coerceIn(0f, 0.4f),
+                        curve = o.optDouble("cv", 1.6).toFloat().coerceIn(0.4f, 3f),
                     )
                 }
             }
