@@ -1,6 +1,7 @@
 [package]
 name = "ansync-camera"
 version = "0.1.0"
+publish = false
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
@@ -21,3 +22,6 @@ v4l = { workspace = true, optional = true }
 [features]
 default = []
 v4l2loopback = ["dep:v4l", "dep:libc"]
+
+[package.metadata.release]
+release = false

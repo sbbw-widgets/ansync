@@ -1,6 +1,7 @@
 [package]
 name = "ansync-input"
 version = "0.1.0"
+publish = false
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
@@ -20,3 +21,6 @@ input-linux = { workspace = true, optional = true }
 [features]
 default = []
 uinput = ["dep:input-linux"]
+
+[package.metadata.release]
+release = false

@@ -1,6 +1,7 @@
 [package]
 name = "ansync-audio"
 version = "0.1.0"
+publish = false
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
@@ -33,3 +34,6 @@ default = ["opus", "cpal-backend"]
 cpal-backend = ["dep:cpal"]
 opus = ["dep:opus-rs"]
 pipewire-backend = ["dep:pipewire", "dep:libspa"]
+
+[package.metadata.release]
+release = false

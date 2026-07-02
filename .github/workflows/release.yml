@@ -45,7 +45,7 @@ jobs:
           echo "version=$ver" >> "$GITHUB_OUTPUT"
 
   bundles:
-    name: Build host bundles (deb/rpm/arch/appimage/flatpak/tar.zst)
+    name: Build host bundles
     runs-on: ubuntu-latest
     needs: resolve
     timeout-minutes: 120

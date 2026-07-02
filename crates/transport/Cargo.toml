@@ -1,6 +1,7 @@
 [package]
 name = "ansync-transport"
 version = "0.1.0"
+publish = false
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
@@ -32,3 +33,6 @@ quic = ["dep:quinn", "dep:rustls", "dep:rustls-pemfile", "dep:rcgen", "dep:x509-
 ansync-proto.workspace = true
 postcard.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+
+[package.metadata.release]
+release = false

@@ -1,6 +1,7 @@
 [package]
 name = "ansync-crypto"
 version = "0.1.0"
+publish = false
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
@@ -17,3 +18,6 @@ sha2.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+
+[package.metadata.release]
+release = false

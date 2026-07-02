@@ -1,6 +1,7 @@
 [package]
 name = "ansync-clipboard"
 version = "0.1.0"
+publish = false
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
@@ -25,3 +26,6 @@ wayland = [
     "dep:wayland-client",
     "dep:wayland-protocols-wlr",
 ]
+
+[package.metadata.release]
+release = false

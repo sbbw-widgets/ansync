@@ -1,6 +1,7 @@
 [package]
 name = "ansync-daemon-core"
 version = "0.1.0"
+publish = false
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
@@ -32,3 +33,6 @@ directories.workspace = true
 zbus.workspace = true
 libc.workspace = true
 sha2.workspace = true
+
+[package.metadata.release]
+release = false

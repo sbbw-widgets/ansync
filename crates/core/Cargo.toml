@@ -1,6 +1,7 @@
 [package]
 name = "ansync-core"
 version = "0.1.0"
+publish = false
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
@@ -11,3 +12,6 @@ description = "ansync — shared core types (DeviceId, Capabilities, Permissions
 serde.workspace = true
 thiserror.workspace = true
 bitflags.workspace = true
+
+[package.metadata.release]
+release = false

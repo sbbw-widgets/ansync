@@ -1,6 +1,7 @@
 [package]
 name = "ansync-permissions"
 version = "0.1.0"
+publish = false
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
@@ -17,3 +18,6 @@ thiserror.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+
+[package.metadata.release]
+release = false
