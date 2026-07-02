@@ -80,7 +80,8 @@
             ProtectHome=read-only
             PrivateTmp=true
             NoNewPrivileges=true
-            ReadWritePaths=%h/.local/share/ansync %h/.config/ansync %t/ansync
+            RuntimeDirectory=ansync
+            ReadWritePaths=-%h/.local/share/ansync -%h/.config/ansync -%h/.cache/ansync
 
             [Install]
             WantedBy=default.target

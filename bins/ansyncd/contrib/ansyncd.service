@@ -18,7 +18,11 @@ ProtectSystem=strict
 ProtectHome=read-only
 PrivateTmp=true
 NoNewPrivileges=true
-ReadWritePaths=%h/.local/share/ansync %h/.config/ansync %t/ansync
+# systemd creates /run/user/<uid>/ansync pre-sandbox; without this
+# the ReadWritePaths mount step fails with status=226/NAMESPACE.
+RuntimeDirectory=ansync
+# `-` = tolerate missing on fresh install (daemon lazy-creates them).
+ReadWritePaths=-%h/.local/share/ansync -%h/.config/ansync -%h/.cache/ansync
 
 [Install]
 WantedBy=default.target

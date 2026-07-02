@@ -96,21 +96,41 @@ in
       wantedBy = [ "default.target" ];
       after = [ "graphical-session.target" ];
 
+      # Cap the restart loop so a persistent misconfiguration (missing
+      # XDG dirs, permission denial, corrupted identity.key) doesn't
+      # thrash the process manager — systemd will stop the unit after
+      # 5 restarts inside 30s and require a manual `systemctl --user
+      # reset-failed ansyncd` to try again.
+      startLimitBurst = 5;
+      startLimitIntervalSec = 30;
+
       serviceConfig = {
         Type = "simple";
         ExecStart = "${ansyncPkg}/bin/ansyncd";
         Restart = "on-failure";
         RestartSec = 2;
 
+        # systemd creates `%t/ansync` (`/run/user/<uid>/ansync`) with
+        # mode 0700 before the sandbox is built and adds it to the
+        # implicit ReadWritePaths, so the mount-namespace setup no
+        # longer fails with `/run/user/1000/ansync: No such file or
+        # directory` (status=226/NAMESPACE).
+        RuntimeDirectory = "ansync";
+
         # Same sandboxing knobs the standalone unit uses.
         NoNewPrivileges = true;
         ProtectSystem = "strict";
         ProtectHome = "read-only";
+
+        # `-` prefix = tolerate missing paths. On a fresh install the
+        # daemon creates `~/.local/share/ansync/{identity.key,peers/}`
+        # + `~/.config/ansync/` + `~/.cache/ansync/` lazily on first
+        # run; without the prefix systemd fails the namespace step
+        # before ExecStart ever runs.
         ReadWritePaths = [
-          "%t/ansync"
-          "%h/.config/ansync"
-          "%h/.local/share/ansync"
-          "%h/.cache/ansync"
+          "-%h/.config/ansync"
+          "-%h/.local/share/ansync"
+          "-%h/.cache/ansync"
         ];
 
         # The mDNS + QUIC listener bind to multicast + the LAN; the
