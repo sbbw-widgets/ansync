@@ -968,17 +968,14 @@ impl Default for Gamepad {
 ///   bit 8  → Mode / Home
 ///   bit 9  → Thumb L / L3
 ///   bit 10 → Thumb R / R3
-///   bit 11 → DPAD Up
-///   bit 12 → DPAD Down
-///   bit 13 → DPAD Left
-///   bit 14 → DPAD Right
 ///
-/// DPAD entries use discrete `BTN_DPAD_*` variants rather than the
-/// legacy `HAT0X`/`HAT0Y` axes so games probing the modern SDL2
-/// mapping (which lists DPAD as buttons, not axes) light up. HAT0X/Y
-/// stay declared on the abs setup as vestigial legacy channels — we
-/// never emit values into them.
-const GP_BTN_LIST: [Key; 15] = [
+/// Bits 11-14 are DPAD Up/Down/Left/Right — NOT in this list. The
+/// xpad (Xbox 360) kernel driver surfaces the DPAD via `ABS_HAT0X` /
+/// `ABS_HAT0Y` and that's the fingerprint SDL2 / Steam Input match
+/// on. Emitting `BTN_DPAD_*` alongside works for browser Gamepad API
+/// (joydev-based) but Steam ignores it. Bits 11-14 are translated
+/// into HAT axis values inside `send()` below.
+const GP_BTN_LIST: [Key; 11] = [
     Key::ButtonSouth,
     Key::ButtonEast,
     Key::ButtonNorth,
@@ -990,11 +987,12 @@ const GP_BTN_LIST: [Key; 15] = [
     Key::ButtonMode,
     Key::ButtonThumbl,
     Key::ButtonThumbr,
-    Key::ButtonDpadUp,
-    Key::ButtonDpadDown,
-    Key::ButtonDpadLeft,
-    Key::ButtonDpadRight,
 ];
+
+const DPAD_BIT_UP: u32 = 11;
+const DPAD_BIT_DOWN: u32 = 12;
+const DPAD_BIT_LEFT: u32 = 13;
+const DPAD_BIT_RIGHT: u32 = 14;
 
 #[async_trait]
 impl VirtualInputDevice for Gamepad {
@@ -1044,11 +1042,18 @@ impl VirtualInputDevice for Gamepad {
                 lt,
                 rt,
             } => {
-                let mut events = Vec::with_capacity(GP_BTN_LIST.len() + 7);
+                let mut events = Vec::with_capacity(GP_BTN_LIST.len() + 9);
                 for (idx, btn) in GP_BTN_LIST.iter().enumerate() {
                     let pressed = ((buttons >> idx) & 0x1) as i32;
                     events.push(raw(EventKind::Key, *btn as u16, pressed));
                 }
+                // DPAD → HAT axes. Simultaneous opposite presses cancel
+                // (matches xpad behaviour + avoids stuck axis values
+                // when the wire packet somehow reports both).
+                let hat_x = ((buttons >> DPAD_BIT_RIGHT) & 0x1) as i32
+                    - ((buttons >> DPAD_BIT_LEFT) & 0x1) as i32;
+                let hat_y = ((buttons >> DPAD_BIT_DOWN) & 0x1) as i32
+                    - ((buttons >> DPAD_BIT_UP) & 0x1) as i32;
                 events.extend_from_slice(&[
                     raw(EventKind::Absolute, AbsoluteAxis::X as u16, lx as i32),
                     raw(EventKind::Absolute, AbsoluteAxis::Y as u16, ly as i32),
@@ -1056,6 +1061,8 @@ impl VirtualInputDevice for Gamepad {
                     raw(EventKind::Absolute, AbsoluteAxis::RY as u16, ry as i32),
                     raw(EventKind::Absolute, AbsoluteAxis::Z as u16, lt as i32),
                     raw(EventKind::Absolute, AbsoluteAxis::RZ as u16, rt as i32),
+                    raw(EventKind::Absolute, AbsoluteAxis::Hat0X as u16, hat_x),
+                    raw(EventKind::Absolute, AbsoluteAxis::Hat0Y as u16, hat_y),
                     syn_report(),
                 ]);
                 write_events(h, &events)
