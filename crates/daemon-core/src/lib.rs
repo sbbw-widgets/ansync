@@ -1202,7 +1202,6 @@ async fn handle_connection(
         .expect("audio inbound tx poisoned") = None;
     stats_handle.abort();
     heartbeat_handle.abort();
-    dbus_state.set_latency(&peer_id, 0);
     if conn_still_current {
         if let Err(e) = Device::emit_state_changed(
             &dbus_conn,
@@ -1355,10 +1354,6 @@ async fn heartbeat_loop(
         }
     }
 
-    dbus_state.set_latency(&peer_id, 0);
-    if let Err(e) = Device::emit_latency_changed(&dbus_conn, &peer_id).await {
-        debug!(%peer_id, error = %e, "heartbeat: emit latency=0 on exit failed");
-    }
 }
 
 /// Reactive camera provisioning: read the `CameraStreamInit` header

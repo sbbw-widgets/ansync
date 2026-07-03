@@ -170,14 +170,9 @@ impl DaemonState {
     }
 
     /// Store the latest heartbeat RTT sample (ms) for `device`.
-    /// Passing `0` removes the entry (used on disconnect).
+    /// Connection status is orthogonal — use `Device.State` for that.
     pub fn set_latency(&self, device: &DeviceId, ms: u32) {
-        let mut g = self.latency_ms.lock().expect("latency poisoned");
-        if ms == 0 {
-            g.remove(device);
-        } else {
-            g.insert(device.clone(), ms);
-        }
+        self.latency_ms.lock().expect("latency poisoned").insert(device.clone(), ms);
     }
 
     /// Return the last RTT sample for `device`, or 0 if not available.
