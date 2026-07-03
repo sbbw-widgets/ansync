@@ -336,7 +336,7 @@ class AnsyncCompanionService : Service() {
                 }
                 val text = "${ev.name} · $pct%"
                 val builder = NotificationCompat.Builder(this, CHANNEL_ID)
-                    .setSmallIcon(android.R.drawable.stat_sys_upload)
+                    .setSmallIcon(R.drawable.ic_upload)
                     .setContentTitle(title)
                     .setContentText(text)
                     .setOnlyAlertOnce(true)
@@ -351,7 +351,7 @@ class AnsyncCompanionService : Service() {
                     val total = ev.batchFiles
                     val summary = if (total > 1) "Sent $total files to PC" else "Sent ${ev.name}"
                     val done = NotificationCompat.Builder(this, CHANNEL_ID)
-                        .setSmallIcon(android.R.drawable.stat_sys_upload_done)
+                        .setSmallIcon(R.drawable.ic_check)
                         .setContentTitle(summary)
                         .setOnlyAlertOnce(true)
                         .setAutoCancel(true)
@@ -371,7 +371,7 @@ class AnsyncCompanionService : Service() {
                 val title = "Receiving ${ev.name}"
                 val text = "$pct%"
                 val builder = NotificationCompat.Builder(this, CHANNEL_ID)
-                    .setSmallIcon(android.R.drawable.stat_sys_download)
+                    .setSmallIcon(R.drawable.ic_download)
                     .setContentTitle(title)
                     .setContentText(text)
                     .setOnlyAlertOnce(true)
@@ -467,7 +467,7 @@ class AnsyncCompanionService : Service() {
                 val n = NotificationCompat.Builder(this@AnsyncCompanionService, CHANNEL_ID)
                     .setContentTitle("File received from $host")
                     .setContentText(file.name)
-                    .setSmallIcon(android.R.drawable.stat_sys_download_done)
+                    .setSmallIcon(R.drawable.ic_check)
                     .setContentIntent(pi)
                     .setAutoCancel(true)
                     .build()
@@ -489,7 +489,7 @@ class AnsyncCompanionService : Service() {
                 val n = NotificationCompat.Builder(this@AnsyncCompanionService, CHANNEL_ID)
                     .setContentTitle("Received ${paths.size} files from $host")
                     .setContentText(sample)
-                    .setSmallIcon(android.R.drawable.stat_sys_download_done)
+                    .setSmallIcon(R.drawable.ic_check)
                     .setContentIntent(pi)
                     .setAutoCancel(true)
                     .build()
@@ -512,7 +512,7 @@ class AnsyncCompanionService : Service() {
         val n = NotificationCompat.Builder(this, GRANT_CHANNEL_ID)
             .setContentTitle("Open link from host?")
             .setContentText(url)
-            .setSmallIcon(android.R.drawable.ic_menu_share)
+            .setSmallIcon(R.drawable.ic_share)
             .setPriority(NotificationCompat.PRIORITY_HIGH)
             .setContentIntent(pi)
             .setAutoCancel(true)
@@ -861,7 +861,7 @@ class AnsyncCompanionService : Service() {
         val n = NotificationCompat.Builder(this, GRANT_CHANNEL_ID)
             .setContentTitle("ansync wants to mirror your screen")
             .setContentText("Tap to grant — the host is waiting")
-            .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
+            .setSmallIcon(R.drawable.ic_ansync)
             .setPriority(NotificationCompat.PRIORITY_HIGH)
             .setContentIntent(pending)
             .setAutoCancel(true)
@@ -1020,7 +1020,7 @@ class AnsyncCompanionService : Service() {
         private fun buildNotification(svc: AnsyncCompanionService): Notification {
             val ctx: Context = svc
             val builder = NotificationCompat.Builder(ctx, CHANNEL_ID)
-                .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
+                .setSmallIcon(R.drawable.ic_ansync)
                 .setOngoing(true)
                 .setShowWhen(false)
             val active = mutableListOf<String>()
@@ -1034,7 +1034,7 @@ class AnsyncCompanionService : Service() {
                 val stop = Intent(ctx, AnsyncCompanionService::class.java)
                     .setAction(ACTION_STOP_CAPTURE)
                 val pi = PendingIntent.getService(ctx, 10, stop, flags)
-                builder.addAction(android.R.drawable.ic_media_pause, "Stop mirror", pi)
+                builder.addAction(R.drawable.ic_stop, "Stop mirror", pi)
             }
             val audioRouter = svc.audio
             if (audioRouter != null) {
@@ -1044,14 +1044,14 @@ class AnsyncCompanionService : Service() {
                         val stop = Intent(ctx, AnsyncCompanionService::class.java)
                             .setAction(ACTION_STOP_MIC_SHARE)
                         val pi = PendingIntent.getService(ctx, 11, stop, flags)
-                        builder.addAction(android.R.drawable.ic_media_pause, "Stop mic share", pi)
+                        builder.addAction(R.drawable.ic_stop, "Stop mic share", pi)
                     }
                     WireAudioControl.Direction.HostToDevice -> {
                         active.add("PC audio")
                         val stop = Intent(ctx, AnsyncCompanionService::class.java)
                             .setAction(ACTION_STOP_AUDIO_SINK)
                         val pi = PendingIntent.getService(ctx, 12, stop, flags)
-                        builder.addAction(android.R.drawable.ic_media_pause, "Stop PC audio", pi)
+                        builder.addAction(R.drawable.ic_stop, "Stop PC audio", pi)
                     }
                 }
             }
@@ -1060,7 +1060,7 @@ class AnsyncCompanionService : Service() {
                 val stop = Intent(ctx, AnsyncCompanionService::class.java)
                     .setAction(ACTION_STOP_CAMERA)
                 val pi = PendingIntent.getService(ctx, 13, stop, flags)
-                builder.addAction(android.R.drawable.ic_media_pause, "Stop camera", pi)
+                builder.addAction(R.drawable.ic_stop, "Stop camera", pi)
             }
             val streamLine = if (active.isEmpty()) {
                 "Idle — paired host can request streams"

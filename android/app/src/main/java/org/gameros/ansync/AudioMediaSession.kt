@@ -5,7 +5,6 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
-import android.graphics.BitmapFactory
 import android.media.AudioAttributes
 import android.media.AudioFocusRequest
 import android.media.AudioManager
@@ -197,18 +196,12 @@ class AudioMediaSession(private val svc: AnsyncCompanionService) {
             WireAudioControl.Direction.HostToDevice -> "PC audio → phone"
         }
         val builder = NotificationCompat.Builder(svc, CHANNEL_ID)
-            .setSmallIcon(android.R.drawable.ic_btn_speak_now)
+            .setSmallIcon(R.drawable.ic_mic)
             .setContentTitle(title)
             .setContentText("ansync companion")
             .setOngoing(true)
             .setShowWhen(false)
             .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
-            .setLargeIcon(
-                BitmapFactory.decodeResource(
-                    svc.resources,
-                    android.R.drawable.ic_btn_speak_now,
-                ),
-            )
 
         // `androidx.media.app.NotificationCompat.MediaStyle` ships with
         // the legacy AndroidX-media surface and only accepts the
@@ -233,14 +226,14 @@ class AudioMediaSession(private val svc: AnsyncCompanionService) {
         when (direction) {
             WireAudioControl.Direction.DeviceToHost -> {
                 builder.addAction(
-                    android.R.drawable.ic_media_pause,
+                    R.drawable.ic_stop,
                     "Stop mic",
                     PendingIntent.getService(svc, 30, stopMicIntent, flags),
                 )
             }
             WireAudioControl.Direction.HostToDevice -> {
                 builder.addAction(
-                    android.R.drawable.ic_media_pause,
+                    R.drawable.ic_stop,
                     "Stop PC audio",
                     PendingIntent.getService(svc, 31, stopSinkIntent, flags),
                 )

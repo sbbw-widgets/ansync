@@ -54,7 +54,7 @@ class PairingReceiver : BroadcastReceiver() {
         val n = NotificationCompat.Builder(context, CHANNEL_ID)
             .setContentTitle("Pair with $hostName?")
             .setContentText("Tap to finish pairing the ansync host.")
-            .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
+            .setSmallIcon(R.drawable.ic_ansync)
             .setPriority(NotificationCompat.PRIORITY_HIGH)
             .setCategory(NotificationCompat.CATEGORY_RECOMMENDATION)
             .setContentIntent(pi)

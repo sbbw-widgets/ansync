@@ -5,7 +5,6 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
-import android.graphics.BitmapFactory
 import android.media.MediaMetadata
 import android.media.session.MediaSession
 import android.media.session.PlaybackState
@@ -127,18 +126,12 @@ class MirrorMediaSession(
             PendingIntent.FLAG_UPDATE_CURRENT
         }
         val builder = NotificationCompat.Builder(svc, CHANNEL_ID)
-            .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
+            .setSmallIcon(R.drawable.ic_mirror)
             .setContentTitle("Mirroring to $hostLabel")
             .setContentText("ansync companion")
             .setOngoing(true)
             .setShowWhen(false)
             .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
-            .setLargeIcon(
-                BitmapFactory.decodeResource(
-                    svc.resources,
-                    android.R.drawable.stat_sys_data_bluetooth,
-                ),
-            )
 
         val compatToken = MediaSessionCompat.Token.fromToken(sess.sessionToken)
         val mediaStyle = MediaStyle.MediaStyle()
@@ -148,7 +141,7 @@ class MirrorMediaSession(
         val stopIntent = Intent(svc, AnsyncCompanionService::class.java)
             .setAction(AnsyncCompanionService.ACTION_STOP_CAPTURE)
         builder.addAction(
-            android.R.drawable.ic_media_pause,
+            R.drawable.ic_stop,
             "Stop",
             PendingIntent.getService(svc, 40, stopIntent, flags),
         )

@@ -78,7 +78,7 @@
 
     <application
         android:label="@string/app_name"
-        android:icon="@android:drawable/sym_def_app_icon"
+        android:icon="@mipmap/ic_launcher"
         android:allowBackup="false"
         android:supportsRtl="true"
         android:theme="@android:style/Theme.Material.Light.NoActionBar"
@@ -271,7 +271,7 @@
         <service
             android:name=".tile.MirrorTile"
             android:label="@string/tile_mirror_label"
-            android:icon="@android:drawable/stat_sys_data_bluetooth"
+            android:icon="@drawable/ic_mirror"
             android:exported="true"
             android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
             <intent-filter>
@@ -282,7 +282,7 @@
         <service
             android:name=".tile.TouchpadTile"
             android:label="@string/tile_touchpad_label"
-            android:icon="@android:drawable/ic_menu_compass"
+            android:icon="@drawable/ic_touchpad"
             android:exported="true"
             android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
             <intent-filter>
@@ -293,7 +293,7 @@
         <service
             android:name=".tile.MicShareTile"
             android:label="@string/tile_mic_label"
-            android:icon="@android:drawable/ic_btn_speak_now"
+            android:icon="@drawable/ic_mic"
             android:exported="true"
             android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
             <intent-filter>
@@ -304,7 +304,7 @@
         <service
             android:name=".tile.CameraTile"
             android:label="@string/tile_camera_label"
-            android:icon="@android:drawable/ic_menu_camera"
+            android:icon="@drawable/ic_camera"
             android:exported="true"
             android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
             <intent-filter>
@@ -318,7 +318,7 @@
         <service
             android:name=".tile.ShareTile"
             android:label="@string/tile_share_label"
-            android:icon="@android:drawable/ic_menu_share"
+            android:icon="@drawable/ic_share"
             android:exported="true"
             android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
             <intent-filter>

@@ -162,7 +162,7 @@ object SetupNotif {
         }
         val tapPi = PendingIntent.getActivity(ctx, next.ordinal, tapIntent, flags)
         val n = NotificationCompat.Builder(ctx, CHANNEL)
-            .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
+            .setSmallIcon(R.drawable.ic_ansync)
             .setContentTitle(next.title)
             .setContentText("Step ${doneCount + 1} of $total · tap to continue")
             .setStyle(NotificationCompat.BigTextStyle().bigText(next.body))
