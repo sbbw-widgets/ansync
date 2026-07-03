@@ -121,6 +121,10 @@ pub struct DaemonState {
     /// widgets can paint a presence dot before the companion's
     /// `HostDialer` finishes its dance with the QUIC server.
     pub reachable: Arc<StdMutex<HashMap<DeviceId, std::net::SocketAddr>>>,
+    /// Last heartbeat RTT sample per peer in milliseconds. Updated by
+    /// `daemon-core::heartbeat_loop` on every Pong; cleared to 0 on
+    /// disconnect. Exposed as `Device.LatencyMs` D-Bus property.
+    pub latency_ms: Arc<StdMutex<HashMap<DeviceId, u32>>>,
 }
 
 impl DaemonState {
@@ -139,6 +143,7 @@ impl DaemonState {
             connectivity: Arc::new(StdMutex::new(HashMap::new())),
             listen_endpoints: Arc::new(StdMutex::new(Vec::new())),
             reachable: Arc::new(StdMutex::new(HashMap::new())),
+            latency_ms: Arc::new(StdMutex::new(HashMap::new())),
         }
     }
 
@@ -162,5 +167,25 @@ impl DaemonState {
     pub fn set_conn_state(&self, device: &DeviceId, next: ConnState) -> ConnState {
         let mut guard = self.connectivity.lock().expect("connectivity poisoned");
         guard.insert(device.clone(), next).unwrap_or_default()
+    }
+
+    /// Store the latest heartbeat RTT sample (ms) for `device`.
+    /// Passing `0` removes the entry (used on disconnect).
+    pub fn set_latency(&self, device: &DeviceId, ms: u32) {
+        let mut g = self.latency_ms.lock().expect("latency poisoned");
+        if ms == 0 {
+            g.remove(device);
+        } else {
+            g.insert(device.clone(), ms);
+        }
+    }
+
+    /// Return the last RTT sample for `device`, or 0 if not available.
+    pub fn get_latency(&self, device: &DeviceId) -> u32 {
+        self.latency_ms
+            .lock()
+            .ok()
+            .and_then(|g| g.get(device).copied())
+            .unwrap_or(0)
     }
 }

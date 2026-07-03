@@ -821,10 +821,52 @@ async fn streams_accept_loop(
                 let tx = url_in_tx.clone();
                 tokio::spawn(url_in_loop(stream, (*tx).clone()));
             }
+            StreamKind::Heartbeat => {
+                tokio::spawn(heartbeat_echo_loop(stream));
+            }
             other => {
                 warn!("streams_accept_loop: dropping unexpected stream {other:?}");
                 drop(stream);
             }
+        }
+    }
+}
+
+/// Reflect every `HeartbeatMessage::Ping` from the host back as a
+/// `HeartbeatMessage::Pong` with the same `seq` and `ts_ms`. The host
+/// measures RTT from `ts_ms` and closes the connection when no pong
+/// arrives within 10 s.
+async fn heartbeat_echo_loop(mut stream: QuicStream) {
+    loop {
+        let bytes = match stream.recv().await {
+            Ok(b) => b,
+            Err(ansync_transport::TransportError::Closed) => return,
+            Err(ansync_transport::TransportError::TimedOut) => return,
+            Err(e) => {
+                warn!("heartbeat_echo_loop: recv failed: {e}");
+                return;
+            }
+        };
+        let pong = match postcard::from_bytes::<ansync_proto::HeartbeatMessage>(&bytes) {
+            Ok(ansync_proto::HeartbeatMessage::Ping { seq, ts_ms }) => {
+                ansync_proto::HeartbeatMessage::Pong { seq, ts_ms }
+            }
+            Ok(other) => {
+                warn!("heartbeat_echo_loop: unexpected message {other:?}");
+                continue;
+            }
+            Err(e) => {
+                warn!("heartbeat_echo_loop: decode failed: {e}");
+                continue;
+            }
+        };
+        let out = match postcard::to_allocvec(&pong) {
+            Ok(b) => b,
+            Err(e) => { warn!("heartbeat_echo_loop: encode failed: {e}"); continue; }
+        };
+        if let Err(e) = stream.send(out.into()).await {
+            info!("heartbeat_echo_loop: send failed (host gone): {e}");
+            return;
         }
     }
 }

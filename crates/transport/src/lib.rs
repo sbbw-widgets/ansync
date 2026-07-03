@@ -66,6 +66,13 @@ pub enum StreamKind {
     /// drops the stream. Receiver decides (per platform) whether to
     /// open silently or prompt — see `ansync_proto::UrlMessage`.
     Url,
+    /// Long-lived bidi ping/pong stream opened by the host immediately
+    /// after the Hello exchange. Host writes `HeartbeatMessage::Ping`
+    /// every 5 s; companion echoes `HeartbeatMessage::Pong`. Host
+    /// measures RTT and detects connection loss within 10 s of the
+    /// missed pong. The daemon exposes the last RTT sample as the
+    /// `LatencyMs` D-Bus property on the `Device` interface.
+    Heartbeat,
 }
 
 #[async_trait]

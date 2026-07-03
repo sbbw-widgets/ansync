@@ -33,7 +33,7 @@ use ansync_pairing::PeerStore;
 use perms_backend::PeerStorePermissions;
 use ansync_proto::{
     AudioCodec, AudioDirection, AudioStreamInit, CameraStreamInit, ClipboardMessage,
-    ControlMessage, Envelope, Hello, InputMessage, Message, NotificationMessage,
+    ControlMessage, Envelope, HeartbeatMessage, Hello, InputMessage, Message, NotificationMessage,
     PROTOCOL_VERSION, UrlMessage, VideoCodec as ProtoVideoCodec,
 };
 use ansync_transport::pinning::TrustedPeers;
@@ -1032,6 +1032,12 @@ async fn handle_connection(
         peer_id.clone(),
         input_rx_counter.clone(),
     ));
+    let heartbeat_handle = tokio::spawn(heartbeat_loop(
+        conn_arc.clone(),
+        peer_id.clone(),
+        dbus_conn.clone(),
+        dbus_state.clone(),
+    ));
 
     loop {
         let (kind, stream) = match conn_arc.accept().await {
@@ -1195,6 +1201,8 @@ async fn handle_connection(
         .lock()
         .expect("audio inbound tx poisoned") = None;
     stats_handle.abort();
+    heartbeat_handle.abort();
+    dbus_state.set_latency(&peer_id, 0);
     if conn_still_current {
         if let Err(e) = Device::emit_state_changed(
             &dbus_conn,
@@ -1260,6 +1268,96 @@ async fn stats_telemetry_loop(
             input_rx = dinput,
             "quic stats"
         );
+    }
+}
+
+/// Application-layer heartbeat. Opens `StreamKind::Heartbeat` outbound,
+/// sends a `Ping` every 5 s, and awaits the companion's `Pong` within
+/// 10 s. On success, updates `DaemonState::latency_ms` and emits
+/// `Device.LatencyMs` PropertiesChanged. On Pong timeout, closes the
+/// QUIC connection so `handle_connection`'s accept loop sees `Closed`
+/// and triggers the normal disconnect path within a bounded window.
+async fn heartbeat_loop(
+    conn: Arc<QuicConnection>,
+    peer_id: DeviceId,
+    dbus_conn: Arc<zbus::Connection>,
+    dbus_state: Arc<DaemonState>,
+) {
+    let mut stream = match conn.open(StreamKind::Heartbeat).await {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(%peer_id, error = %e, "heartbeat: failed to open stream");
+            return;
+        }
+    };
+
+    let mut seq: u32 = 0;
+    // First tick fires immediately; skip it so the companion has a
+    // moment to register its echo loop before we send the first Ping.
+    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5));
+    ticker.tick().await;
+
+    loop {
+        ticker.tick().await;
+        seq = seq.wrapping_add(1);
+        let ts_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        let ping = HeartbeatMessage::Ping { seq, ts_ms };
+        let bytes = match postcard::to_allocvec(&ping) {
+            Ok(b) => b,
+            Err(e) => { warn!(%peer_id, error = %e, "heartbeat: encode failed"); continue; }
+        };
+        if let Err(e) = stream.send(bytes.into()).await {
+            info!(%peer_id, error = %e, "heartbeat: ping send failed (conn dying)");
+            break;
+        }
+
+        let raw = match tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            stream.recv(),
+        )
+        .await
+        {
+            Ok(Ok(b)) => b,
+            Ok(Err(e)) => {
+                info!(%peer_id, error = %e, "heartbeat: pong recv failed");
+                break;
+            }
+            Err(_elapsed) => {
+                warn!(%peer_id, "heartbeat: pong timeout — closing connection");
+                let _ = conn.close("heartbeat timeout").await;
+                break;
+            }
+        };
+
+        match postcard::from_bytes::<HeartbeatMessage>(&raw) {
+            Ok(HeartbeatMessage::Pong { seq: pong_seq, ts_ms: pong_ts }) => {
+                if pong_seq != seq {
+                    warn!(%peer_id, expected = seq, got = pong_seq, "heartbeat: seq mismatch (ignored)");
+                    continue;
+                }
+                let rtt_ms = (std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64)
+                    .saturating_sub(pong_ts) as u32;
+                debug!(%peer_id, rtt_ms, "heartbeat RTT");
+                dbus_state.set_latency(&peer_id, rtt_ms);
+                if let Err(e) = Device::emit_latency_changed(&dbus_conn, &peer_id).await {
+                    debug!(%peer_id, error = %e, "heartbeat: emit latency failed");
+                }
+            }
+            Ok(other) => warn!(%peer_id, "heartbeat: unexpected message {other:?}"),
+            Err(e) => warn!(%peer_id, error = %e, "heartbeat: decode pong failed"),
+        }
+    }
+
+    dbus_state.set_latency(&peer_id, 0);
+    if let Err(e) = Device::emit_latency_changed(&dbus_conn, &peer_id).await {
+        debug!(%peer_id, error = %e, "heartbeat: emit latency=0 on exit failed");
     }
 }
 

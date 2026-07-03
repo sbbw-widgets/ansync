@@ -84,6 +84,16 @@ impl Device {
         String::new()
     }
 
+    /// Last heartbeat round-trip time in milliseconds. Updated by the
+    /// daemon's `heartbeat_loop` on every Pong from the companion.
+    /// Reads 0 when the peer is disconnected or no sample has been
+    /// received yet. Consumers can watch `PropertiesChanged` on this
+    /// interface to get sub-5-second latency updates.
+    #[zbus(property)]
+    async fn latency_ms(&self) -> u32 {
+        self.state.get_latency(&self.id)
+    }
+
     /// Bring up host → device audio sink. The daemon opens a
     /// `StreamKind::Audio` outbound, encodes host PipeWire capture
     /// with Opus, and pushes it to the peer's speaker.
@@ -264,6 +274,21 @@ impl Device {
         )
         .await?;
         Ok(())
+    }
+
+    /// Emit `PropertiesChanged` for the `LatencyMs` property on a peer's
+    /// D-Bus object. No-op when the peer has no registered interface.
+    pub async fn emit_latency_changed(
+        conn: &zbus::Connection,
+        device: &DeviceId,
+    ) -> zbus::Result<()> {
+        let path = crate::path_device(device);
+        let object_path = zbus::zvariant::ObjectPath::try_from(path.as_str())
+            .map_err(|e| zbus::Error::Failure(format!("bad path {path}: {e}")))?;
+        let Ok(iface) = conn.object_server().interface::<_, Device>(object_path).await else {
+            return Ok(());
+        };
+        iface.get().await.latency_ms_changed(iface.signal_emitter()).await
     }
 
     /// Emit `StreamStateChanged(kind, active)` on `Device` for a peer.

@@ -38,6 +38,7 @@ fn stream_kind_tag(kind: StreamKind) -> u8 {
         StreamKind::Notifications => 0x09,
         StreamKind::Hello => 0x0a,
         StreamKind::Url => 0x0b,
+        StreamKind::Heartbeat => 0x0c,
     }
 }
 
@@ -53,6 +54,7 @@ fn stream_kind_from_tag(tag: u8) -> Result<StreamKind, TransportError> {
         0x09 => Ok(StreamKind::Notifications),
         0x0a => Ok(StreamKind::Hello),
         0x0b => Ok(StreamKind::Url),
+        0x0c => Ok(StreamKind::Heartbeat),
         _ => Err(TransportError::Handshake(format!("unknown stream tag {tag:#x}"))),
     }
 }
@@ -138,12 +140,19 @@ fn default_provider() -> Arc<CryptoProvider> {
 /// keep-alive ping keeps connections live across normal user pauses.
 fn tuned_transport_config() -> Arc<quinn::TransportConfig> {
     let mut cfg = quinn::TransportConfig::default();
+    // Idle timeout lowered to 30 s so a network partition or silent
+    // phone crash is detected within one heartbeat cycle (5 s Ping +
+    // 10 s Pong wait) plus one QUIC retransmit window. The application-
+    // layer heartbeat fires first in practice; QUIC timeout is the
+    // backstop.
     cfg.max_idle_timeout(Some(
-        std::time::Duration::from_secs(120)
+        std::time::Duration::from_secs(30)
             .try_into()
-            .expect("120s fits in VarInt"),
+            .expect("30s fits in VarInt"),
     ));
-    cfg.keep_alive_interval(Some(std::time::Duration::from_secs(15)));
+    // Keep-alive at 8 s (< 30/2) so a live-but-idle connection never
+    // trips the idle timer between heartbeat Pings.
+    cfg.keep_alive_interval(Some(std::time::Duration::from_secs(8)));
     Arc::new(cfg)
 }
 

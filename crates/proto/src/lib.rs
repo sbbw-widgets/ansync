@@ -250,3 +250,15 @@ pub enum NotificationMessage {
     Posted { id: u64, app: String, title: String, body: String },
     Removed { id: u64 },
 }
+
+/// Carried on `StreamKind::Heartbeat`. The host opens the stream and
+/// sends `Ping` every 5 s; the companion echoes each ping as a `Pong`
+/// immediately. `ts_ms` is the sender's Unix-epoch millisecond
+/// timestamp embedded in the Ping and reflected unchanged in the Pong
+/// so the host can compute RTT = now_ms − pong.ts_ms without needing
+/// synchronised clocks.
+#[derive(Debug, Serialize, Deserialize)]
+pub enum HeartbeatMessage {
+    Ping { seq: u32, ts_ms: u64 },
+    Pong { seq: u32, ts_ms: u64 },
+}
