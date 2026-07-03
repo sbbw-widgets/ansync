@@ -1135,6 +1135,13 @@ async fn handle_connection(
                 let action_tx = dbus_state.actions.clone();
                 tokio::spawn(control_inbound_loop(stream, pid, action_tx));
             }
+            StreamKind::Heartbeat => {
+                // Host opens the Heartbeat stream outbound in `heartbeat_loop`;
+                // the companion echoes pongs on that same stream. If the peer
+                // somehow opens one toward us, drop it — we have nothing to echo.
+                debug!(%peer_id, "unexpected inbound Heartbeat stream from peer; dropping");
+                drop(stream);
+            }
         }
     }
     // NOTE: the per-peer InputSession is owned by `InputRegistry` and
