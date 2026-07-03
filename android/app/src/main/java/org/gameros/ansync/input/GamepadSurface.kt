@@ -603,28 +603,34 @@ private fun applyGrabUp(state: GamepadState, grab: TouchGrab) {
 }
 
 private fun applyStickMove(state: GamepadState, grab: TouchGrab.Stick, x: Float, y: Float) {
-    var dx = x - grab.cx
-    var dy = y - grab.cy
+    val dx = x - grab.cx
+    val dy = y - grab.cy
     val dist = kotlin.math.sqrt(dx * dx + dy * dy)
-    if (dist > grab.outerPx) {
-        val k = grab.outerPx / dist
-        dx *= k; dy *= k
+    if (dist <= 0f) {
+        state.setStickTouch(grab.side, 0f, 0f)
+        return
     }
-    // Y-down in Android canvas coords; XInput convention has Y-up
-    // positive when the stick pushes forward. Flip Y so pushing the
-    // finger up (visually) reads as ly ~ -32768 (matches physical
-    // stick convention).
-    val nx = shapeStick(dx / grab.outerPx, grab.deadzone, grab.curve)
-    val ny = shapeStick(dy / grab.outerPx, grab.deadzone, grab.curve)
-    state.setStickTouch(grab.side, nx, ny)
+    // Radial magnitude in [0, 1]; anything past the ring reads as full
+    // deflection instead of over-shooting the axis range.
+    val mag = (dist / grab.outerPx).coerceIn(0f, 1f)
+    val shaped = shapeMagnitude(mag, grab.deadzone, grab.curve)
+    // Preserve the raw touch direction; scale the unit vector by the
+    // shaped magnitude so cardinals and diagonals both reach 1.0 on
+    // the ring. Doing deadzone + curve on the magnitude (not per axis)
+    // is what makes the tester's response a circle instead of a
+    // 4-petal flower. Y stays inverted by Android's canvas convention —
+    // finger up = negative dy = negative ly (XInput "push forward").
+    val ux = dx / dist
+    val uy = dy / dist
+    state.setStickTouch(grab.side, ux * shaped, uy * shaped)
 }
 
 /**
- * Radial deadzone + power response applied per axis.
+ * Radial deadzone + power response applied to the stick magnitude.
  *
- *   |v| < deadzone   → 0                       (kills jitter at rest)
- *   |v| >= deadzone  → sign(v) * pow(t, curve) where
- *                      t = (|v| - deadzone) / (1 - deadzone)
+ *   m < deadzone   → 0                       (kills jitter at rest)
+ *   m >= deadzone  → pow(t, curve) where
+ *                    t = (m - deadzone) / (1 - deadzone)
  *
  * The rescale keeps the on-ring reading at 1.0 regardless of deadzone
  * so full deflection still hits `Short.MAX_VALUE` on the wire. `curve
@@ -632,12 +638,10 @@ private fun applyStickMove(state: GamepadState, grab: TouchGrab.Stick, x: Float,
  * `0.3^curve` deflection, which is what makes the virtual stick
  * behave less twitchy than raw linear mapping.
  */
-private fun shapeStick(v: Float, deadzone: Float, curve: Float): Float {
-    val abs = kotlin.math.abs(v)
-    if (abs <= deadzone) return 0f
-    val t = ((abs - deadzone) / (1f - deadzone)).coerceIn(0f, 1f)
-    val shaped = t.toDouble().pow(curve.toDouble()).toFloat()
-    return if (v < 0f) -shaped else shaped
+private fun shapeMagnitude(mag: Float, deadzone: Float, curve: Float): Float {
+    if (mag <= deadzone) return 0f
+    val t = ((mag - deadzone) / (1f - deadzone)).coerceIn(0f, 1f)
+    return t.toDouble().pow(curve.toDouble()).toFloat()
 }
 
 // ── Rendering ────────────────────────────────────────────────────────
