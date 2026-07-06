@@ -66,6 +66,16 @@ in
         rules in a separate module.
       '';
     };
+
+    downloadDir = lib.mkOption {
+      type = lib.types.str;
+      default = "%h/Downloads/ansync";
+      description = ''
+        Directory where files received from Android are saved.
+        Supports systemd specifiers (%h = home dir). Must be
+        writable by the daemon user.
+      '';
+    };
   };
 
   config = lib.mkIf cfg.enable {
@@ -106,7 +116,7 @@ in
 
       serviceConfig = {
         Type = "simple";
-        ExecStart = "${ansyncPkg}/bin/ansyncd";
+        ExecStart = "${ansyncPkg}/bin/ansyncd --download-dir ${cfg.downloadDir}";
         Restart = "on-failure";
         RestartSec = 2;
 
@@ -120,18 +130,6 @@ in
         # Same sandboxing knobs the standalone unit uses.
         NoNewPrivileges = true;
         ProtectSystem = "strict";
-        ProtectHome = "read-only";
-
-        # `-` prefix = tolerate missing paths. On a fresh install the
-        # daemon creates `~/.local/share/ansync/{identity.key,peers/}`
-        # + `~/.config/ansync/` + `~/.cache/ansync/` lazily on first
-        # run; without the prefix systemd fails the namespace step
-        # before ExecStart ever runs.
-        ReadWritePaths = [
-          "-%h/.config/ansync"
-          "-%h/.local/share/ansync"
-          "-%h/.cache/ansync"
-        ];
 
         # The mDNS + QUIC listener bind to multicast + the LAN; the
         # daemon doesn't need privileged ports.
