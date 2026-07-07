@@ -9,6 +9,8 @@ other. All over Wi-Fi, no cables once paired.
 
 It's what scrcpy could be if it grew up.
 
+https://github.com/user-attachments/assets/7722df7e-6e8f-4c5f-bea3-2a899e8a4062
+
 ---
 
 ## What you can do with it
