@@ -1,15 +1,10 @@
 //! Native (Rust) half of the ansync companion.
 //!
 //! Exposes a small JNI surface that the Kotlin `AnsyncCompanionService`
-//! calls into. Internally owns a `tokio` runtime + a `quinn` QUIC
+//! calls into. Internally owns a `tokio` runtime + a ZUDP (Noise XX over UDP)
 //! client to the paired host. Wire format is identical to the host
 //! (`ansync_proto`) so the daemon's `StreamKind::Input` /
 //! `StreamKind::Video` accept loop just works.
-//!
-//! Step 7d-2 wires the real `quinn` dial + per-direction streams:
-//! the companion *sends* Video, *receives* Input. Reverse-input
-//! frames land on an `mpsc::UnboundedSender` and Kotlin pulls them
-//! via `nativePollInputMessage`.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -65,7 +60,7 @@ use ansync_proto::{
     InputMessage, Message, NotificationMessage, PROTOCOL_VERSION, UrlMessage,
 };
 use ansync_transport::{
-    Connection, QuicConnection, QuicStream, QuicTransport, Stream as _, StreamKind,
+    Connection, PeerResolver, ZudpConnection, ZudpServer, ZudpStream, Stream as _, StreamKind,
 };
 use bytes::Bytes;
 use jni::JNIEnv;
@@ -238,30 +233,30 @@ impl PermissionsStore for PermissivePermissions {
 struct ActiveSession {
     /// Held purely for its drop-side teardown — the connection
     /// closes when this is taken.
-    conn: Arc<QuicConnection>,
+    conn: Arc<ZudpConnection>,
     /// Outbound device→host Video stream. Lazy-opened on the first
     /// [`Java_org_gameros_ansync_NativeBridge_nativeSendVideoChunk`]
     /// after each QSTile arm. Dropping the guard closes the QUIC
     /// stream, which is exactly what the daemon uses as the signal to
     /// tear the mirror window down. Reopens on the next capture.
-    video_stream: Arc<AsyncMutex<Option<QuicStream>>>,
+    video_stream: Arc<AsyncMutex<Option<ZudpStream>>>,
     /// Outbound device→host Input stream. Lazy-opened on first
     /// `nativeSendInputMessage` call so the wire is only used when
     /// the user actually drives the touchpad activity.
-    outbound_input: Arc<AsyncMutex<Option<QuicStream>>>,
+    outbound_input: Arc<AsyncMutex<Option<ZudpStream>>>,
     /// Receiver side of the reverse-input pump. `Mutex<>` so Kotlin
     /// can call `nativePollInputMessage` from any thread without
     /// reading-while-spawning races against the recv task.
     input_rx: Arc<AsyncMutex<UnboundedReceiver<Vec<u8>>>>,
     /// Outbound device→host Camera stream. Lazy-opened on first
     /// `nativeSendCameraChunk` call after the QSTile arms capture.
-    outbound_camera: Arc<AsyncMutex<Option<QuicStream>>>,
+    outbound_camera: Arc<AsyncMutex<Option<ZudpStream>>>,
     /// Inbound `ControlMessage::StartAudioSink` / `StopAudioSink`.
     /// Encoded as tag-binary blobs for the Kotlin polling loop.
     audio_ctrl_rx: Arc<AsyncMutex<UnboundedReceiver<Vec<u8>>>>,
     /// Outbound device→host Audio stream for mic forwarding.
     /// Lazy-opened on the first `nativeSendAudioChunk` (device-side).
-    outbound_audio: Arc<AsyncMutex<Option<QuicStream>>>,
+    outbound_audio: Arc<AsyncMutex<Option<ZudpStream>>>,
     /// Stateful Opus encoder for the outbound mic stream. Lazy-built
     /// alongside `outbound_audio`. `OpusVoip` profile (32 kbps + FEC)
     /// is the right shape for speech — host renders the decoded PCM on
@@ -494,8 +489,41 @@ pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativeOpenConnection
     };
 
     let identity_for_hello = IdentityKeypair::from_seed(*identity.seed_bytes());
-    let transport = QuicTransport::new(identity);
-    let conn = match runtime().block_on(transport.connect(addr, expected_server)) {
+    // Convert the stored Ed25519 pubkey to X25519 montgomery form for the Noise
+    // handshake. The pairing flow stores Ed25519 keys; ZUDP uses X25519.
+    let peer_x25519 = match ansync_transport::zudp::ed25519_pubkey_to_x25519(&expected_server) {
+        Some(k) => k,
+        None => {
+            error!("nativeOpenConnection: invalid Ed25519 pubkey for X25519 conversion");
+            return jni::sys::JNI_FALSE;
+        }
+    };
+    let peer_identity = match ansync_crypto::PeerIdentity::from_bytes(expected_server) {
+        Ok(id) => id,
+        Err(e) => {
+            error!("nativeOpenConnection: invalid peer identity: {e:?}");
+            return jni::sys::JNI_FALSE;
+        }
+    };
+    // Single-peer resolver: the companion knows exactly which host it dialled.
+    struct SinglePeerResolver {
+        x25519: [u8; 32],
+        identity: ansync_crypto::PeerIdentity,
+    }
+    impl PeerResolver for SinglePeerResolver {
+        fn resolve(&self, x25519_key: &[u8; 32]) -> Option<ansync_crypto::PeerIdentity> {
+            if *x25519_key == self.x25519 {
+                Some(self.identity.clone())
+            } else {
+                None
+            }
+        }
+    }
+    let resolver: std::sync::Arc<dyn PeerResolver> = std::sync::Arc::new(SinglePeerResolver {
+        x25519: peer_x25519,
+        identity: peer_identity,
+    });
+    let conn = match runtime().block_on(ZudpServer::connect(addr, peer_x25519, &identity, resolver)) {
         Ok(c) => c,
         Err(e) => {
             error!("nativeOpenConnection: dial {addr}: {e}");
@@ -627,16 +655,14 @@ pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativeIsConnected<'l
     }
 }
 
-/// Periodic per-session QUIC stats. Mirror of the daemon-side loop in
+/// Periodic per-session transport stats. Mirror of the daemon-side loop in
 /// `ansync-daemon-core::stats_telemetry_loop`. Exits when the last
-/// strong `Arc<QuicConnection>` is dropped (session torn down).
+/// strong `Arc<ZudpConnection>` is dropped (session torn down).
 /// Tagged at log-level `Debug` — gate with
 /// `RUST_LOG=ansync_companion_native=debug` to surface in logcat.
-async fn stats_telemetry_loop(conn: std::sync::Weak<QuicConnection>) {
+async fn stats_telemetry_loop(conn: std::sync::Weak<ZudpConnection>) {
     let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
     tick.tick().await;
-    let mut prev_sent: u64 = 0;
-    let mut prev_lost: u64 = 0;
     let mut prev_input: u64 = 0;
     let mut prev_audio_tx_pkts: u64 = 0;
     let mut prev_audio_tx_bytes: u64 = 0;
@@ -646,18 +672,6 @@ async fn stats_telemetry_loop(conn: std::sync::Weak<QuicConnection>) {
         tick.tick().await;
         let Some(conn) = conn.upgrade() else {
             return;
-        };
-        let s = conn.stats();
-        let sent = s.path.sent_packets;
-        let lost = s.path.lost_packets;
-        let dsent = sent.saturating_sub(prev_sent);
-        let dlost = lost.saturating_sub(prev_lost);
-        prev_sent = sent;
-        prev_lost = lost;
-        let loss_pct = if dsent == 0 {
-            0.0
-        } else {
-            (dlost as f64 / dsent as f64) * 100.0
         };
         let input_total = INPUT_TX_COUNT.load(Ordering::Relaxed);
         let dinput = input_total.saturating_sub(prev_input);
@@ -682,13 +696,8 @@ async fn stats_telemetry_loop(conn: std::sync::Weak<QuicConnection>) {
         let dec_fail = AUDIO_RX_DECODE_FAIL.load(Ordering::Relaxed);
 
         debug!(
-            "quic stats: rtt={}ms sent={} lost={} loss={:.2}% cwnd={} black_holes={} input_tx={} audio_tx_pkts={} audio_tx_kbps={:.1} audio_rx_pkts={} audio_rx_kbps={:.1} enc_fail={} dec_fail={}",
+            "transport stats: rtt={}ms input_tx={} audio_tx_pkts={} audio_tx_kbps={:.1} audio_rx_pkts={} audio_rx_kbps={:.1} enc_fail={} dec_fail={}",
             conn.rtt().as_millis() as u64,
-            dsent,
-            dlost,
-            loss_pct,
-            s.path.cwnd,
-            s.path.black_holes_detected,
             dinput,
             datx_pkts,
             atx_kbps,
@@ -701,7 +710,7 @@ async fn stats_telemetry_loop(conn: std::sync::Weak<QuicConnection>) {
 }
 
 async fn streams_accept_loop(
-    conn: Arc<QuicConnection>,
+    conn: Arc<ZudpConnection>,
     host_id: DeviceId,
     download_dir: PathBuf,
     input_inbound_tx: Arc<UnboundedSender<Vec<u8>>>,
@@ -719,7 +728,7 @@ async fn streams_accept_loop(
     // graceful Closed or a hard error — flips the global liveness
     // flag and unblocks HostDialer's poll. Drop = transport gone.
     //
-    // Carries our own `Arc<QuicConnection>` so the Drop side can
+    // Carries our own `Arc<ZudpConnection>` so the Drop side can
     // distinguish "we're the live session" from "we've been
     // superseded by a fresh `nativeOpenConnection`". Two
     // `streams_accept_loop` tasks can be alive at the same time when
@@ -727,7 +736,7 @@ async fn streams_accept_loop(
     // shutdown; without this check the LATER drop wins and the global
     // `CONNECTED` flag flips false despite a working session.
     struct ConnGuard {
-        conn: Arc<QuicConnection>,
+        conn: Arc<ZudpConnection>,
     }
     impl Drop for ConnGuard {
         fn drop(&mut self) {
@@ -836,7 +845,7 @@ async fn streams_accept_loop(
 /// `HeartbeatMessage::Pong` with the same `seq` and `ts_ms`. The host
 /// measures RTT from `ts_ms` and closes the connection when no pong
 /// arrives within 10 s.
-async fn heartbeat_echo_loop(mut stream: QuicStream) {
+async fn heartbeat_echo_loop(mut stream: ZudpStream) {
     loop {
         let bytes = match stream.recv().await {
             Ok(b) => b,
@@ -871,7 +880,7 @@ async fn heartbeat_echo_loop(mut stream: QuicStream) {
     }
 }
 
-async fn url_in_loop(mut stream: QuicStream, tx: UnboundedSender<String>) {
+async fn url_in_loop(mut stream: ZudpStream, tx: UnboundedSender<String>) {
     let bytes = match stream.recv().await {
         Ok(b) => b,
         Err(e) => {
@@ -942,7 +951,7 @@ impl<'a> Cursor<'a> {
 /// surface is audio-sink: PC → phone declaring "I am about to send
 /// audio". Every other stream is phone-initiated and needs no
 /// preamble.
-async fn control_recv_loop(mut stream: QuicStream, audio_tx: UnboundedSender<Vec<u8>>) {
+async fn control_recv_loop(mut stream: ZudpStream, audio_tx: UnboundedSender<Vec<u8>>) {
     loop {
         let bytes = match stream.recv().await {
             Ok(b) => b,
@@ -987,7 +996,7 @@ async fn control_recv_loop(mut stream: QuicStream, audio_tx: UnboundedSender<Vec
 /// packet each (`OpusAudio` / `OpusVoip` — decode to PCM before
 /// forwarding to Kotlin). Kotlin always sees raw PCM ready to feed
 /// `AudioTrack`.
-async fn audio_in_loop(mut stream: QuicStream, tx: UnboundedSender<Vec<u8>>) {
+async fn audio_in_loop(mut stream: ZudpStream, tx: UnboundedSender<Vec<u8>>) {
     let header_bytes = match stream.recv().await {
         Ok(b) => b,
         Err(_) => return,
@@ -1045,7 +1054,7 @@ async fn audio_in_loop(mut stream: QuicStream, tx: UnboundedSender<Vec<u8>>) {
 }
 
 async fn clipboard_in_loop(
-    mut stream: QuicStream,
+    mut stream: ZudpStream,
     tx: UnboundedSender<String>,
     blob_tx: UnboundedSender<(String, Vec<u8>)>,
 ) {
@@ -1088,7 +1097,7 @@ async fn clipboard_in_loop(
 /// the daemon refresh its `PeerStore.name` cache without waiting for
 /// the next pair.
 async fn send_hello(
-    conn: &QuicConnection,
+    conn: &ZudpConnection,
     identity: &IdentityKeypair,
     device_name: &str,
 ) -> Result<(), ansync_transport::TransportError> {
@@ -1119,14 +1128,13 @@ async fn send_hello(
     })?;
     let mut stream = conn.open(StreamKind::Hello).await?;
     stream.send(Bytes::from(bytes)).await?;
-    let _ = stream.finish().await;
     Ok(())
 }
 
 /// Drain the host's Hello frame off a freshly accepted Hello stream
 /// and stash the name so Kotlin can surface it on the paired-host
 /// card.
-async fn hello_in_loop(mut stream: QuicStream, slot: Arc<Mutex<Option<String>>>) {
+async fn hello_in_loop(mut stream: ZudpStream, slot: Arc<Mutex<Option<String>>>) {
     let bytes = match stream.recv().await {
         Ok(b) => b,
         Err(e) => {
@@ -1152,7 +1160,7 @@ async fn hello_in_loop(mut stream: QuicStream, slot: Arc<Mutex<Option<String>>>)
     }
 }
 
-async fn input_recv_loop(mut stream: QuicStream, tx: UnboundedSender<Vec<u8>>) {
+async fn input_recv_loop(mut stream: ZudpStream, tx: UnboundedSender<Vec<u8>>) {
     loop {
         match stream.recv().await {
             Ok(bytes) => {
@@ -1566,7 +1574,7 @@ pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativeSendInputMessa
             .send(bytes::Bytes::from(postcard_bytes))
             .await;
         // Stream died — clear the slot so the next call can reopen on
-        // the same QuicConnection. Without this, every subsequent
+        // the same ZudpConnection. Without this, every subsequent
         // input event silently fails because we keep handing out the
         // dead stream. Symptom = cursor freezes after one transient
         // network blip even though the QUIC conn is otherwise fine.
@@ -1742,7 +1750,6 @@ pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativeSendStopAudioS
     let result = runtime().block_on(async move {
         let mut stream = conn.open(StreamKind::Control).await?;
         stream.send(Bytes::from(bytes)).await?;
-        let _ = stream.finish().await;
         Ok::<(), ansync_transport::TransportError>(())
     });
     match result {

@@ -49,12 +49,6 @@ ansync-transport = { path = "../crates/transport" }
 # NDK cross-compile works without a system libopus.
 ansync-audio = { path = "../crates/audio", default-features = false, features = ["opus"] }
 
-# QUIC client mirrors the host's `quinn` + `rustls` stack — same
-# wire bytes, zero compat work. `default-features = false` keeps
-# native-tls / native-roots out of the link; pinning is custom.
-quinn = { version = "0.11", default-features = false, features = ["rustls", "runtime-tokio", "ring"] }
-rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
-rcgen = { version = "0.13", default-features = false, features = ["crypto", "ring", "pem"] }
 bytes = "1"
 postcard = { version = "1", features = ["alloc"] }
 thiserror = "2"

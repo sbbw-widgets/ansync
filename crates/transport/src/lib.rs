@@ -1,9 +1,8 @@
 //! Transport abstraction.
 //!
-//! Default backend (Step 2): QUIC over `quinn` + `rustls`, with a custom
-//! certificate verifier that pins to the peer's Ed25519 identity. The
-//! root store is intentionally empty — PKI is replaced by Trust-On-First-
-//! Use during pairing, persisted in the local trust store.
+//! Default backend: ZUDP (encrypted UDP via Noise XX). The `Connection` and
+//! `Stream` traits are deliberately backend-agnostic so tests or future
+//! backends can swap in cleanly.
 
 use std::net::SocketAddr;
 
@@ -11,16 +10,9 @@ use ansync_crypto::PeerIdentity;
 use async_trait::async_trait;
 use bytes::Bytes;
 
-#[cfg(feature = "quic")]
-pub mod pinning;
-#[cfg(feature = "quic")]
-pub mod quic;
+pub mod zudp;
 
-#[cfg(feature = "quic")]
-pub use quic::{QuicConnection, QuicServer, QuicStream, QuicTransport};
-
-#[cfg(feature = "quic")]
-pub use quinn::ConnectionStats;
+pub use zudp::{ZudpConnection, ZudpServer, ZudpStream};
 
 #[derive(Debug, thiserror::Error)]
 pub enum TransportError {
@@ -42,8 +34,7 @@ pub enum TransportError {
     Io(#[from] std::io::Error),
 }
 
-/// Logical stream kinds multiplexed on a single QUIC connection.
-/// One QUIC bidirectional stream per kind, opened on demand.
+/// Logical stream kinds multiplexed over a single ZUDP connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamKind {
     Control,
@@ -56,23 +47,33 @@ pub enum StreamKind {
     Notifications,
     /// One-shot greeting stream. First and only frame is an
     /// `ansync_proto::Envelope` carrying `Message::Hello`. Both sides
-    /// open one immediately after the QUIC handshake completes so the
+    /// open one immediately after the connection is established so the
     /// peer's human-readable name + capability bitmap are refreshed
     /// each session without relying on whatever was stamped during
     /// pairing.
     Hello,
     /// One-shot "open this URL" stream. Opener writes a single
     /// postcard `Envelope { Message::Url(UrlMessage) }` frame and
-    /// drops the stream. Receiver decides (per platform) whether to
-    /// open silently or prompt — see `ansync_proto::UrlMessage`.
+    /// drops the stream.
     Url,
     /// Long-lived bidi ping/pong stream opened by the host immediately
     /// after the Hello exchange. Host writes `HeartbeatMessage::Ping`
     /// every 5 s; companion echoes `HeartbeatMessage::Pong`. Host
     /// measures RTT and detects connection loss within 10 s of the
-    /// missed pong. The daemon exposes the last RTT sample as the
-    /// `LatencyMs` D-Bus property on the `Device` interface.
+    /// missed pong.
     Heartbeat,
+}
+
+/// Resolves an X25519 static public key (as exposed by a completed Noise XX
+/// handshake) to an ansync [`PeerIdentity`].
+///
+/// Implementations typically iterate the `PeerStore`, converting each stored
+/// Ed25519 pubkey to its montgomery form and comparing.
+pub trait PeerResolver: Send + Sync + 'static {
+    /// Look up the ansync identity for the given X25519 static key.
+    ///
+    /// Returns `None` if no paired peer matches.
+    fn resolve(&self, x25519_key: &[u8; 32]) -> Option<PeerIdentity>;
 }
 
 #[async_trait]

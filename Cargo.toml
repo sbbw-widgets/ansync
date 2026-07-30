@@ -78,13 +78,10 @@ ed25519-dalek = { version = "2", features = ["rand_core", "serde", "pkcs8"] }
 x25519-dalek = { version = "2", features = ["serde", "static_secrets"] }
 snow = "0.9"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
-rustls-pemfile = "2"
 rand_core = "0.6"
-rcgen = { version = "0.13", default-features = false, features = ["crypto", "ring", "pem"] }
-x509-parser = "0.16"
 
 # Transport
-quinn = { version = "0.11", default-features = false, features = ["rustls", "runtime-tokio", "ring"] }
+zudp = { path = "../zudp", default-features = false, features = ["security", "discovery"] }
 
 # Discovery
 mdns-sd = "0.13"

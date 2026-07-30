@@ -36,9 +36,9 @@ use ansync_proto::{
     ControlMessage, Envelope, HeartbeatMessage, Hello, InputMessage, Message, NotificationMessage,
     PROTOCOL_VERSION, UrlMessage, VideoCodec as ProtoVideoCodec,
 };
-use ansync_transport::pinning::TrustedPeers;
+
 use ansync_transport::{
-    Connection, QuicConnection, QuicServer, QuicStream, QuicTransport, Stream as _, StreamKind,
+    Connection, PeerResolver, ZudpConnection, ZudpServer, ZudpStream, Stream as _, StreamKind,
 };
 use ansync_video::{DecodedFrame, HostDecoder, PixelFormat, VideoCodec, VideoDecoder};
 
@@ -177,14 +177,16 @@ impl Daemon {
         let pubkey = identity.public().as_bytes();
         let mdns = MdnsDiscovery::new(pubkey)?;
 
-        // Bind QUIC before mDNS so we know the real port to announce.
-        let transport = QuicTransport::new(identity.clone());
-        let trust: Arc<dyn TrustedPeers> = Arc::new(PeerStoreTrust {
+        // Bind ZUDP server before mDNS so we know the real port to announce.
+        let resolver: Arc<dyn PeerResolver> = Arc::new(PeerStoreResolver {
             peers: peers.clone(),
         });
-        let server = transport.bind_any(self.config.listen_addr, trust)?;
-        let listen = server.local_addr()?;
-        info!(addr = %listen, "QUIC server bound");
+        let server = ZudpServer::bind(self.config.listen_addr, &identity, resolver)
+            .await
+            .map_err(|e| DaemonError::Transport(e))?;
+        // ZudpServer does not expose local_addr yet; use the configured addr.
+        let listen = self.config.listen_addr;
+        info!(addr = %listen, "ZUDP server bound");
 
         let local_endpoints: Vec<(String, u16)> = enumerate_lan_ipv4()
             .into_iter()
@@ -302,24 +304,32 @@ impl Daemon {
 /// store on every handshake — cheap because the store is small and
 /// reads are filesystem-cached.
 #[derive(Debug)]
-struct PeerStoreTrust {
+struct PeerStoreResolver {
     peers: PeerStore,
 }
 
-impl TrustedPeers for PeerStoreTrust {
-    fn is_trusted(&self, pubkey: &[u8; 32]) -> bool {
+impl PeerResolver for PeerStoreResolver {
+    fn resolve(&self, x25519_key: &[u8; 32]) -> Option<ansync_crypto::PeerIdentity> {
+        use ansync_transport::zudp::ed25519_pubkey_to_x25519;
         match self.peers.list() {
-            Ok(list) => list.iter().any(|p| &p.pubkey == pubkey),
+            Ok(list) => list.into_iter().find_map(|p| {
+                let peer_x25519 = ed25519_pubkey_to_x25519(&p.pubkey)?;
+                if peer_x25519 == *x25519_key {
+                    ansync_crypto::PeerIdentity::from_bytes(p.pubkey).ok()
+                } else {
+                    None
+                }
+            }),
             Err(e) => {
-                warn!(error = %e, "PeerStore::list failed during TLS verify");
-                false
+                warn!(error = %e, "PeerStore::list failed during peer resolution");
+                None
             }
         }
     }
 }
 
 struct AcceptCtx {
-    server: QuicServer,
+    server: ZudpServer,
     peers: PeerStore,
     permissions: Arc<dyn ansync_permissions::PermissionsStore>,
     factory: Arc<dyn InputDeviceFactory>,
@@ -408,7 +418,7 @@ pub struct MirrorEntry {
     /// `Some` while the peer is connected. `action_loop` reads this
     /// to open an outbound Input stream on ShowScreen. Cleared by
     /// `handle_connection` on disconnect.
-    pub conn: StdMutex<Option<Arc<QuicConnection>>>,
+    pub conn: StdMutex<Option<Arc<ZudpConnection>>>,
     /// `Some` while a mirror subprocess for this peer is alive.
     /// `video_stream_loop` writes inbound encoded chunks here so the
     /// renderer subprocess can decode them; on `None` the chunks are
@@ -539,7 +549,7 @@ pub struct CameraEntry {
     /// decoder feed loop.
     handle: StdMutex<Option<tokio::task::JoinHandle<()>>>,
     /// Bridges the per-peer `StreamKind::Camera` accept handler (which
-    /// owns the QuicStream) to the decode → sink loop. Set when
+    /// owns the ZudpStream) to the decode → sink loop. Set when
     /// StartCamera arrives, cleared on StopCamera. The accept handler
     /// pushes raw encoded packets here.
     frame_tx: StdMutex<Option<tokio::sync::mpsc::UnboundedSender<bytes::Bytes>>>,
@@ -934,7 +944,7 @@ async fn accept_loop(ctx: AcceptCtx) {
 }
 
 async fn handle_connection(
-    conn: QuicConnection,
+    conn: ZudpConnection,
     peers: PeerStore,
     permissions: Arc<dyn ansync_permissions::PermissionsStore>,
     factory: Arc<dyn InputDeviceFactory>,
@@ -1229,13 +1239,13 @@ async fn handle_connection(
     Ok(())
 }
 
-/// Periodic per-peer QUIC stats. Runs alongside `handle_connection`,
+/// Periodic per-peer transport stats. Runs alongside `handle_connection`,
 /// aborted by the join handle when the parent loop exits. Output is
 /// `debug!` so default journald stays quiet; flip on with
 /// `RUST_LOG=ansync_daemon_core=debug` to diagnose packet-loss /
 /// rtt regressions reported as "cursor feels heavy" or "Conn cycle".
 async fn stats_telemetry_loop(
-    conn: Arc<QuicConnection>,
+    conn: Arc<ZudpConnection>,
     peer_id: DeviceId,
     input_rx_counter: Arc<std::sync::atomic::AtomicU64>,
 ) {
@@ -1243,36 +1253,17 @@ async fn stats_telemetry_loop(
     // Skip the very first tick (fires immediately) — first useful
     // sample needs at least one keep-alive RTT.
     tick.tick().await;
-    let mut prev_sent: u64 = 0;
-    let mut prev_lost: u64 = 0;
     let mut prev_input: u64 = 0;
     loop {
         tick.tick().await;
-        let s = conn.stats();
-        let sent = s.path.sent_packets;
-        let lost = s.path.lost_packets;
-        let dsent = sent.saturating_sub(prev_sent);
-        let dlost = lost.saturating_sub(prev_lost);
-        prev_sent = sent;
-        prev_lost = lost;
-        let loss_pct = if dsent == 0 {
-            0.0
-        } else {
-            (dlost as f64 / dsent as f64) * 100.0
-        };
         let input_total = input_rx_counter.load(std::sync::atomic::Ordering::Relaxed);
         let dinput = input_total.saturating_sub(prev_input);
         prev_input = input_total;
         debug!(
             %peer_id,
             rtt_ms = conn.rtt().as_millis() as u64,
-            sent = dsent,
-            lost = dlost,
-            loss_pct = format!("{loss_pct:.2}"),
-            cwnd = s.path.cwnd,
-            black_holes = s.path.black_holes_detected,
             input_rx = dinput,
-            "quic stats"
+            "transport stats"
         );
     }
 }
@@ -1284,7 +1275,7 @@ async fn stats_telemetry_loop(
 /// QUIC connection so `handle_connection`'s accept loop sees `Closed`
 /// and triggers the normal disconnect path within a bounded window.
 async fn heartbeat_loop(
-    conn: Arc<QuicConnection>,
+    conn: Arc<ZudpConnection>,
     peer_id: DeviceId,
     dbus_conn: Arc<zbus::Connection>,
     dbus_state: Arc<DaemonState>,
@@ -1370,7 +1361,7 @@ async fn heartbeat_loop(
 /// Permission gate is enforced up front — if `CameraVideo` is off
 /// for this peer we drop the stream without a sink registration.
 async fn camera_stream_loop(
-    mut stream: QuicStream,
+    mut stream: ZudpStream,
     entry: Arc<CameraEntry>,
     peer_id: DeviceId,
     permissions: Arc<dyn ansync_permissions::PermissionsStore>,
@@ -1522,7 +1513,7 @@ async fn camera_stream_loop(
 /// envelope, drop the stream. The peer side reads it via
 /// `hello_inbound_loop`.
 async fn send_hello(
-    conn: &QuicConnection,
+    conn: &ZudpConnection,
     peer_id: &DeviceId,
     identity: &IdentityKeypair,
     device_name: &str,
@@ -1543,9 +1534,6 @@ async fn send_hello(
         .map_err(|e| DaemonError::Startup(format!("encode Hello: {e}")))?;
     let mut stream = conn.open(StreamKind::Hello).await?;
     stream.send(bytes::Bytes::from(bytes)).await?;
-    // Closing the send half tells the peer "no more frames coming".
-    // quinn drops the rest on connection close.
-    let _ = stream.finish().await;
     debug!(%peer_id, "outbound Hello sent");
     Ok(())
 }
@@ -1554,7 +1542,7 @@ async fn send_hello(
 /// `action_loop` that needs to ask the companion to do something
 /// without opening a long-lived stream.
 async fn send_control(
-    conn: &QuicConnection,
+    conn: &ZudpConnection,
     message: ControlMessage,
 ) -> Result<(), DaemonError> {
     let env = Envelope {
@@ -1565,14 +1553,13 @@ async fn send_control(
         .map_err(|e| DaemonError::Startup(format!("encode Control: {e}")))?;
     let mut stream = conn.open(StreamKind::Control).await?;
     stream.send(bytes::Bytes::from(bytes)).await?;
-    let _ = stream.finish().await;
     Ok(())
 }
 
 /// Consume the single Hello frame from a freshly accepted inbound
 /// stream and refresh `StoredPeer.name` if the peer's self-reported
 /// name has changed since pairing.
-async fn hello_inbound_loop(mut stream: QuicStream, peer_id: DeviceId, peers: PeerStore) {
+async fn hello_inbound_loop(mut stream: ZudpStream, peer_id: DeviceId, peers: PeerStore) {
     let bytes = match stream.recv().await {
         Ok(b) => b,
         Err(e) => {
@@ -1635,7 +1622,7 @@ async fn hello_inbound_loop(mut stream: QuicStream, peer_id: DeviceId, peers: Pe
 /// stamp it into the host Wayland clipboard, gated by
 /// `Permission::ClipboardIn`.
 async fn clipboard_inbound_loop(
-    mut stream: QuicStream,
+    mut stream: ZudpStream,
     peer_id: DeviceId,
     permissions: Arc<dyn ansync_permissions::PermissionsStore>,
     sync: ClipboardSync,
@@ -1689,7 +1676,7 @@ async fn clipboard_inbound_loop(
 }
 
 async fn notification_inbound_loop(
-    mut stream: QuicStream,
+    mut stream: ZudpStream,
     peer_id: DeviceId,
     permissions: Arc<dyn ansync_permissions::PermissionsStore>,
     dbus_conn: Arc<zbus::Connection>,
@@ -1703,12 +1690,7 @@ async fn notification_inbound_loop(
                 return;
             }
         };
-    // Companion opens a fresh QUIC stream per notification (see
-    // `send_notification` on the device side — the stream is dropped
-    // after `send`). So the daemon expects exactly ONE frame here;
-    // anything after that would be a protocol error. Reading in a
-    // loop floods the journal with `early eof` warnings as quinn
-    // surfaces each finished stream's FIN to us.
+    // Companion sends exactly ONE frame per notification then drops the stream.
     let bytes = match stream.recv().await {
         Ok(b) => b,
         Err(ansync_transport::TransportError::Closed)
@@ -1982,7 +1964,7 @@ async fn audio_render_loop(
 }
 
 async fn audio_pump_loop(
-    mut stream: QuicStream,
+    mut stream: ZudpStream,
     mut source: BoxedSource,
     mut encoder: OpusEncoderWrap,
     peer_id: DeviceId,
@@ -2026,7 +2008,7 @@ async fn audio_pump_loop(
 }
 
 async fn audio_inbound_loop(
-    mut stream: QuicStream,
+    mut stream: ZudpStream,
     entry: Arc<AudioEntry>,
     peer_id: DeviceId,
     permissions: Arc<dyn ansync_permissions::PermissionsStore>,
@@ -2389,7 +2371,7 @@ fn i420_to_nv12(frame: &DecodedFrame) -> bytes::Bytes {
 }
 
 async fn input_writer_loop(
-    mut stream: QuicStream,
+    mut stream: ZudpStream,
     mut rx: UnboundedReceiver<InputMessage>,
     peer_id: DeviceId,
 ) {
@@ -2410,7 +2392,7 @@ async fn input_writer_loop(
 }
 
 async fn video_stream_loop(
-    mut stream: QuicStream,
+    mut stream: ZudpStream,
     entry: Arc<MirrorEntry>,
     peer_id: DeviceId,
     mirrors: Arc<MirrorRegistry>,
@@ -2494,7 +2476,7 @@ async fn video_stream_loop(
 }
 
 async fn files_stream_loop(
-    mut stream: QuicStream,
+    mut stream: ZudpStream,
     peer_id: DeviceId,
     peer_name: String,
     permissions: Arc<dyn ansync_permissions::PermissionsStore>,
@@ -2679,7 +2661,7 @@ impl InboundCoalescer {
 /// `StartAudioSink` is never sent phone → PC (senders initiate on
 /// their own side), so we log-and-drop if it shows up.
 async fn control_inbound_loop(
-    mut stream: QuicStream,
+    mut stream: ZudpStream,
     peer_id: DeviceId,
     action_tx: Option<UnboundedSender<DaemonAction>>,
 ) {
@@ -2723,7 +2705,7 @@ async fn control_inbound_loop(
 }
 
 async fn url_inbound_loop(
-    mut stream: QuicStream,
+    mut stream: ZudpStream,
     peer_id: DeviceId,
     peer_name: String,
     permissions: Arc<dyn ansync_permissions::PermissionsStore>,
@@ -3056,7 +3038,7 @@ fn spawn_share_notif(peer_name: &str, summary: &str, body: &str) {
 }
 
 async fn input_stream_loop(
-    mut stream: QuicStream,
+    mut stream: ZudpStream,
     session: Arc<Mutex<InputSession>>,
     rx_counter: Arc<std::sync::atomic::AtomicU64>,
 ) {
