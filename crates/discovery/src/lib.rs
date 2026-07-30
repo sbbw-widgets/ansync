@@ -1,8 +1,7 @@
 //! LAN device discovery abstraction.
 //!
-//! Default backend (Step 3): mDNS via `mdns-sd`, advertised under the
-//! service type `_ansync._udp.local.`. The trait lets us slot a relay /
-//! NAT-traversal backend in later without touching call sites.
+//! Backend: zudp Probe/Beacon frames. The `Discovery` trait lets us slot
+//! a relay / NAT-traversal backend in later without touching call sites.
 
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -10,21 +9,30 @@ use std::pin::Pin;
 use ansync_core::{Capabilities, DeviceId, DeviceName};
 use async_trait::async_trait;
 use futures::Stream;
+use serde::{Deserialize, Serialize};
 
-#[cfg(feature = "mdns")]
-pub mod mdns;
+pub mod zudp_backend;
+pub use zudp_backend::ZudpDiscovery;
 
-#[cfg(feature = "mdns")]
-pub use mdns::MdnsDiscovery;
+/// App-ID string used for all ansync Probe/Beacon frames.
+pub const APP_ID: &str = "ansync";
 
-pub const SERVICE_TYPE: &str = "_ansync._udp.local.";
+/// Metadata broadcast in a Beacon frame.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnsyncBeacon {
+    /// Full Ed25519 public key (32 bytes). First 16 bytes → DeviceId.
+    pub pubkey: [u8; 32],
+    pub name: String,
+    /// Raw `Capabilities` bitflags.
+    pub caps: u32,
+}
 
-/// Keys used in the mDNS TXT record. Listed here so call sites don't
-/// hard-code them.
-pub mod txt {
-    pub const ID: &str = "id";
-    pub const NAME: &str = "name";
-    pub const CAPS: &str = "caps";
+impl AnsyncBeacon {
+    pub fn device_id(&self) -> DeviceId {
+        let mut id = [0u8; 16];
+        id.copy_from_slice(&self.pubkey[..16]);
+        DeviceId(id)
+    }
 }
 
 #[derive(Debug, Clone)]

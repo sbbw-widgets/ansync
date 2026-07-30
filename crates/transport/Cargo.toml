@@ -20,7 +20,7 @@ tracing.workspace = true
 ed25519-dalek.workspace = true
 parking_lot = "0.12"
 
-zudp = { path = "../../../zudp", default-features = false, features = ["security", "discovery"] }
+zudp.workspace = true
 
 [dev-dependencies]
 ansync-proto.workspace = true

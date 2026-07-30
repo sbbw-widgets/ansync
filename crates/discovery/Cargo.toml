@@ -6,7 +6,7 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "ansync — LAN device discovery (mDNS)"
+description = "ansync — LAN device discovery (zudp Probe/Beacon)"
 
 [dependencies]
 ansync-core.workspace = true
@@ -17,12 +17,7 @@ thiserror.workspace = true
 futures.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-
-mdns-sd = { workspace = true, optional = true }
-
-[features]
-default = ["mdns"]
-mdns = ["dep:mdns-sd"]
+zudp.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }

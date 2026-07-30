@@ -23,7 +23,7 @@ use ansync_clipboard::{ClipboardBackend, ClipboardContent, WaylandClipboard};
 use ansync_core::{Capabilities, DeviceId, DeviceName, Permission};
 use ansync_crypto::IdentityKeypair;
 use ansync_dbus::{ConnState, DaemonAction, DaemonState, Device, serve};
-use ansync_discovery::{Discovery, MdnsDiscovery};
+use ansync_discovery::{Discovery, ZudpDiscovery};
 use ansync_files::{
     AutoAcceptPolicy, Direction as TransferDirection, ProgressEvent, ProgressFn, receive_file,
     send_file,
@@ -175,7 +175,7 @@ impl Daemon {
             Arc::new(PeerStorePermissions::new(peers.clone()));
 
         let pubkey = identity.public().as_bytes();
-        let mdns = MdnsDiscovery::new(pubkey)?;
+        let discovery = ZudpDiscovery::new(*pubkey);
 
         // Bind ZUDP server before mDNS so we know the real port to announce.
         let resolver: Arc<dyn PeerResolver> = Arc::new(PeerStoreResolver {
@@ -234,9 +234,9 @@ impl Daemon {
         ));
 
         let device_name = DeviceName(self.config.device_name.clone());
-        mdns.announce(&device_name, listen.port(), self.config.capabilities)
+        discovery.announce(&device_name, listen.port(), self.config.capabilities)
             .await?;
-        info!(name = %device_name, port = listen.port(), "mDNS announce active");
+        info!(name = %device_name, port = listen.port(), "discovery announce active");
 
         let factory: Arc<dyn InputDeviceFactory> = match self.config.input_backend {
             InputBackend::Uinput => Arc::new(UinputFactory),
@@ -286,8 +286,8 @@ impl Daemon {
         mem_stats_handle.abort();
         watcher_handle.abort();
         clip_watcher_handle.abort();
-        if let Err(e) = mdns.stop_announce().await {
-            warn!(error = %e, "mDNS stop_announce failed");
+        if let Err(e) = discovery.stop_announce().await {
+            warn!(error = %e, "discovery stop_announce failed");
         }
         drop(dbus_conn_arc);
         info!("daemon shut down");
