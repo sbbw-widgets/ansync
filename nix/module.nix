@@ -102,22 +102,31 @@ in
     # enable ansyncd`.
     systemd.user.services.ansyncd = {
       description = "ansync daemon (Android ↔ Linux integration)";
-      wantedBy = [ "default.target" ];
-      after = [ "graphical-session.target" ];
+      wantedBy = [ "graphical-session.target" ];
+      # network-online.target: zudp discovery broadcasts need a real LAN IP —
+      # without it the Beacon response comes from the wrong interface and the
+      # companion can't dial back. pipewire.socket: audio backend init at
+      # startup; without it the first connection silently skips audio.
+      after = [
+        "graphical-session.target"
+        "network-online.target"
+        "pipewire.socket"
+      ];
+      wants = [ "network-online.target" "pipewire.socket" ];
 
-      # Cap the restart loop so a persistent misconfiguration (missing
-      # XDG dirs, permission denial, corrupted identity.key) doesn't
-      # thrash the process manager — systemd will stop the unit after
-      # 5 restarts inside 30s and require a manual `systemctl --user
-      # reset-failed ansyncd` to try again.
+      # Persistent misconfigurations (bad identity, missing XDG dirs) should
+      # not thrash the process manager.  Transient failures (net not up yet,
+      # pipewire slow start) are handled by the Restart policy below.
       startLimitBurst = 5;
-      startLimitIntervalSec = 30;
+      startLimitIntervalSec = 60;
 
       serviceConfig = {
         Type = "simple";
         ExecStart = "${ansyncPkg}/bin/ansyncd --download-dir ${cfg.downloadDir}";
+        # on-failure + 3 s back-off covers the transient window where the
+        # network or pipewire socket appears after the unit fires.
         Restart = "on-failure";
-        RestartSec = 2;
+        RestartSec = 3;
 
         # systemd creates `%t/ansync` (`/run/user/<uid>/ansync`) with
         # mode 0700 before the sandbox is built and adds it to the
