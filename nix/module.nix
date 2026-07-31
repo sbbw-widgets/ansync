@@ -49,7 +49,7 @@ in
       type = lib.types.port;
       default = 47215;
       description = ''
-        UDP port the QUIC server binds to. The default matches
+        UDP port the zudp data server binds to. The default matches
         `DaemonConfig.listen_addr` in the daemon — only override
         if you also pass `--listen 0.0.0.0:<port>` to ansyncd.
       '';
@@ -59,11 +59,10 @@ in
       type = lib.types.bool;
       default = true;
       description = ''
-        Open the firewall for the QUIC server port and mDNS (5353).
-        Without this, the companion's connection attempts and the
-        peer-discovery announce/browse both die at the kernel without
-        reaching the daemon. Disable only if you manage firewall
-        rules in a separate module.
+        Open the firewall for the zudp data port and the zudp
+        discovery port (7701). Without both, the companion cannot
+        reach the daemon and Probe/Beacon discovery is silently
+        dropped. Disable only if you manage firewall rules elsewhere.
       '';
     };
 
@@ -90,12 +89,12 @@ in
     # Install the udev rule + companion APK directory.
     services.udev.packages = [ ansyncPkg ];
 
-    # Open the QUIC server port + mDNS so the companion can reach
-    # the daemon and resolve its announce. Without 47215 the inbound
-    # QUIC INITIAL is dropped and the device stays Disconnected
-    # forever from the GUI's perspective.
+    # Data port: inbound zudp connections from the companion.
+    # Discovery port 7701: zudp Probe/Beacon LAN broadcast — companion
+    # sends a Probe and the daemon responds with a Beacon carrying its
+    # address + metadata. Without 7701 auto-discovery is silently dead.
     networking.firewall = lib.mkIf cfg.openFirewall {
-      allowedUDPPorts = [ cfg.quicPort 5353 ];
+      allowedUDPPorts = [ cfg.quicPort 7701 ];
     };
 
     # The daemon's systemd user unit ships inside the package; this
@@ -131,8 +130,8 @@ in
         NoNewPrivileges = true;
         ProtectSystem = "strict";
 
-        # The mDNS + QUIC listener bind to multicast + the LAN; the
-        # daemon doesn't need privileged ports.
+        # zudp data + discovery listeners bind to LAN ports >1024;
+        # no elevated capabilities needed.
         AmbientCapabilities = [ ];
         CapabilityBoundingSet = [ ];
         PrivateDevices = false;
