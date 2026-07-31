@@ -79,7 +79,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 rand_core = "0.6"
 
 # Transport
-zudp = { version = "0.3.2", default-features = false, features = ["security", "discovery", "serde"] }
+zudp = { version = "0.3.3", default-features = false, features = ["security", "discovery", "serde"] }
 
 # Discovery — zudp Probe/Beacon replaces mDNS
 

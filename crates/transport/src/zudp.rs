@@ -220,6 +220,9 @@ impl ZudpServer {
 
     /// Connect to a remote peer as a client.
     ///
+    /// Completes the Noise XX handshake before returning — the connection is
+    /// encrypted and ready to send on return.
+    ///
     /// # Errors
     /// Returns `Err` on I/O failure or handshake timeout.
     pub async fn connect(
@@ -229,23 +232,11 @@ impl ZudpServer {
         resolver: Arc<dyn PeerResolver>,
     ) -> Result<ZudpConnection, TransportError> {
         let keypair = identity_to_noise_keypair(identity);
-        let socket: ZudpSocket<RawBytes> = Zudp::default()
+        let conn: zudp::ZudpConn<RawBytes> = Zudp::default()
             .port(0)
             .security(keypair)
             .pin_remote_key(peer_x25519_pubkey)
-            .listen()
-            .await
-            .map_err(|e| TransportError::Io(std::io::Error::other(e.to_string())))?;
-
-        // Trigger the Noise handshake to that specific peer.
-        // We use the ZudpSender to send the first message; the connection
-        // is established once the handshake completes.
-        // For the client path we build a dedicated connection.
-        let conn_socket = zudp::Zudp::default()
-            .port(0)
-            .security(identity_to_noise_keypair(identity))
-            .pin_remote_key(peer_x25519_pubkey)
-            .connect::<RawBytes>(addr)
+            .connect(addr)
             .await
             .map_err(|e| TransportError::Io(std::io::Error::other(e.to_string())))?;
 
@@ -253,12 +244,13 @@ impl ZudpServer {
             .resolve(&peer_x25519_pubkey)
             .ok_or(TransportError::IdentityMismatch)?;
 
-        let sender = socket.sender();
+        let sender = conn.sender();
+        let peer_addr = conn.peer();
         let (close_tx, _close_rx) = watch::channel(false);
         let (new_stream_tx, new_stream_rx) = mpsc::unbounded_channel();
 
         let inner = Arc::new(ConnInner {
-            peer_addr: addr,
+            peer_addr,
             peer_id,
             sender,
             stream_txs: Mutex::new(HashMap::new()),
@@ -267,8 +259,7 @@ impl ZudpServer {
             close_tx,
         });
 
-        // Spawn the client-side inbound demux task.
-    tokio::spawn(client_demux_task(conn_socket, inner.clone()));
+        tokio::spawn(client_demux_task(conn, inner.clone()));
 
         Ok(ZudpConnection {
             inner,
