@@ -184,8 +184,7 @@ impl Daemon {
         let server = ZudpServer::bind(self.config.listen_addr, &identity, resolver)
             .await
             .map_err(|e| DaemonError::Transport(e))?;
-        // ZudpServer does not expose local_addr yet; use the configured addr.
-        let listen = self.config.listen_addr;
+        let listen = server.local_addr();
         info!(addr = %listen, "ZUDP server bound");
 
         let local_endpoints: Vec<(String, u16)> = enumerate_lan_ipv4()

@@ -1,9 +1,7 @@
-//! Cryptographic identity and handshake primitives.
+//! Cryptographic identity primitives.
 //!
-//! Each peer owns a long-term Ed25519 identity stored on disk. Sessions
-//! layer on top: rustls authenticates the QUIC channel by pinning the
-//! peer's Ed25519 pubkey, and Noise XX provides a second independent set
-//! of session keys for media-stream framing.
+//! Each peer owns a long-term Ed25519 identity stored on disk. The Noise XX
+//! handshake and session keys are handled by the `zudp` transport layer.
 
 use std::fs;
 use std::io::{ErrorKind, Write};
@@ -13,10 +11,8 @@ use std::path::Path;
 use ansync_core::DeviceId;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 
-pub mod noise;
 pub mod pair_pin;
 
-pub use noise::{NoiseError, NoiseTransport, NoiseXxSession, Role};
 pub use pair_pin::{PinRole, generate_pin, pair_pin_confirm, verify_pin_confirm};
 
 #[derive(Debug, thiserror::Error)]
@@ -25,8 +21,6 @@ pub enum CryptoError {
     InvalidIdentity,
     #[error("identity file size: expected 32 bytes, got {0}")]
     InvalidIdentitySize(usize),
-    #[error("noise: {0}")]
-    Noise(#[from] NoiseError),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 }

@@ -164,6 +164,7 @@ impl Connection for ZudpConnection {
 
 /// Listening server that accepts inbound [`ZudpConnection`]s.
 pub struct ZudpServer {
+    local_addr: SocketAddr,
     conn_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<ZudpConnection>>>,
     _shutdown: tokio::sync::oneshot::Sender<()>,
 }
@@ -188,12 +189,17 @@ impl ZudpServer {
             .await
             .map_err(|e| TransportError::Io(std::io::Error::other(e.to_string())))?;
 
+        let local_addr = socket
+            .local_addr()
+            .map_err(|e| TransportError::Io(std::io::Error::other(e.to_string())))?;
+
         let (conn_tx, conn_rx) = mpsc::channel::<ZudpConnection>(64);
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
         tokio::spawn(server_demux_task(socket, resolver, conn_tx, shutdown_rx));
 
         Ok(Self {
+            local_addr,
             conn_rx: Arc::new(tokio::sync::Mutex::new(conn_rx)),
             _shutdown: shutdown_tx,
         })
@@ -271,17 +277,9 @@ impl ZudpServer {
     }
 
     /// Local address this server is bound to.
-    ///
-    /// # Errors
-    /// Returns `Err` if the OS cannot retrieve the socket's local address.
-    pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
-        // We stored the bind addr during construction; for ZUDP it's always
-        // available through the accept path. Return an unspecified sentinel
-        // here — callers should prefer passing the addr at construction time.
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "local_addr: store the addr at construction time instead",
-        ))
+    #[must_use]
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local_addr
     }
 }
 

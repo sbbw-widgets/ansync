@@ -6,13 +6,11 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "ansync — Ed25519 identities and Noise XX session handshake"
+description = "ansync — Ed25519 identities and PIN-based pairing"
 
 [dependencies]
 ansync-core.workspace = true
 ed25519-dalek.workspace = true
-x25519-dalek.workspace = true
-snow.workspace = true
 rand_core.workspace = true
 sha2.workspace = true
 serde.workspace = true

@@ -75,8 +75,6 @@ toml = "0.8"
 
 # Crypto
 ed25519-dalek = { version = "2", features = ["rand_core", "serde", "pkcs8"] }
-x25519-dalek = { version = "2", features = ["serde", "static_secrets"] }
-snow = "0.9"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rand_core = "0.6"
 
