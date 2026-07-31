@@ -175,7 +175,7 @@ impl Daemon {
             Arc::new(PeerStorePermissions::new(peers.clone()));
 
         let pubkey = identity.public().as_bytes();
-        let discovery = ZudpDiscovery::new(*pubkey);
+        let discovery = ZudpDiscovery::new(pubkey);
 
         // Bind ZUDP server before mDNS so we know the real port to announce.
         let resolver: Arc<dyn PeerResolver> = Arc::new(PeerStoreResolver {
