@@ -545,16 +545,10 @@ pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativeOpenConnection
         x25519: peer_x25519,
         identity: peer_identity,
     });
-    let our_x25519 = {
-        let signing = identity.signing();
-        let scalar = signing.to_scalar().to_bytes();
-        hex_encode(&scalar)
-    };
     info!(
-        "nativeOpenConnection: dialing {addr} | peer_ed25519={} peer_x25519={} our_x25519={}",
+        "nativeOpenConnection: dialing {addr} | peer_ed25519={} peer_x25519={}",
         hex_encode(&expected_server),
         hex_encode(&peer_x25519),
-        our_x25519,
     );
     let conn = match runtime().block_on(ZudpServer::connect(addr, peer_x25519, &identity, resolver)) {
         Ok(c) => c,

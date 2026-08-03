@@ -472,12 +472,15 @@ async fn route_packet(
 /// Convert an ansync `IdentityKeypair` (Ed25519) into a ZUDP `Keypair`
 /// (X25519 montgomery form) for the Noise XX handshake.
 ///
-/// The derivation is: Ed25519 seed → `SigningKey` → `to_scalar().to_bytes()`
-/// for the private part; `verifying_key().to_montgomery().to_bytes()` for the
-/// public part.
+/// Uses `to_scalar_bytes()` (raw SHA-512(seed)[:32]) for the private part
+/// so that x25519-dalek's clamping step produces the key that corresponds
+/// to `verifying_key().to_montgomery()`.  `to_scalar()` would be wrong
+/// here: it reduces mod the Ed25519 group order, producing bytes that
+/// x25519-dalek re-clamps to a completely different scalar and a mismatched
+/// public key.
 pub fn identity_to_noise_keypair(identity: &ansync_crypto::IdentityKeypair) -> zudp::Keypair {
     let signing = identity.signing();
-    let private = signing.to_scalar().to_bytes();
+    let private = signing.to_scalar_bytes();
     let public = signing.verifying_key().to_montgomery().to_bytes();
     zudp::Keypair { public, private }
 }
