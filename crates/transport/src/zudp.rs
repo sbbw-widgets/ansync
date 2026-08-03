@@ -232,13 +232,17 @@ impl ZudpServer {
         resolver: Arc<dyn PeerResolver>,
     ) -> Result<ZudpConnection, TransportError> {
         let keypair = identity_to_noise_keypair(identity);
-        let conn: zudp::ZudpConn<RawBytes> = Zudp::default()
-            .port(0)
-            .security(keypair)
-            .pin_remote_key(peer_x25519_pubkey)
-            .connect(addr)
-            .await
-            .map_err(|e| TransportError::Io(std::io::Error::other(e.to_string())))?;
+        let conn: zudp::ZudpConn<RawBytes> = tokio::time::timeout(
+            Duration::from_secs(10),
+            Zudp::default()
+                .port(0)
+                .security(keypair)
+                .pin_remote_key(peer_x25519_pubkey)
+                .connect(addr),
+        )
+        .await
+        .map_err(|_| TransportError::Io(std::io::Error::other("Noise XX handshake timed out after 10 s — peer unreachable or key mismatch")))?
+        .map_err(|e| TransportError::Io(std::io::Error::other(e.to_string())))?;
 
         let peer_id = resolver
             .resolve(&peer_x25519_pubkey)
