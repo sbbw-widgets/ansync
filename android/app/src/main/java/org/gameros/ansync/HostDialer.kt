@@ -76,14 +76,26 @@ class HostDialer(private val ctx: Context) {
         val cb = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
                 Log.i(TAG, "network up: $network — kicking dialer")
+                // Cancel any stale retries / fallback delays that accumulated
+                // while we were offline so they don't interfere with the
+                // fresh dial we're about to post.
+                handler.removeCallbacksAndMessages(null)
                 connected = false
                 backoffMs = INITIAL_BACKOFF_MS
                 publishSearchingIfPaired()
                 handler.post(::dialOnce)
+                handler.postDelayed(livenessProbe, LIVENESS_INTERVAL_MS)
             }
             override fun onLost(network: Network) {
                 Log.i(TAG, "network lost: $network — pausing dialer")
+                // Cancel all pending dials/retries immediately so we don't
+                // keep pounding a dead network and ratcheting up the backoff.
+                handler.removeCallbacksAndMessages(null)
                 connected = false
+                backoffMs = INITIAL_BACKOFF_MS
+                discovery?.stop()
+                discovery = null
+                handler.postDelayed(livenessProbe, LIVENESS_INTERVAL_MS)
                 publish(HostStatus.NoNetwork)
             }
         }
