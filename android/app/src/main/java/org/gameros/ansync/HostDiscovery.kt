@@ -1,26 +1,20 @@
 package org.gameros.ansync
 
-import android.content.Context
-import android.net.nsd.NsdManager
-import android.net.nsd.NsdServiceInfo
-import android.net.wifi.WifiManager
+import android.os.Handler
+import android.os.HandlerThread
 import android.util.Log
-import java.net.Inet6Address
 import java.net.InetAddress
 
 /**
- * Companion-side mDNS browse for `_ansync._udp.local.` services.
- * Mirrors the host's announcement format from `ansync_discovery`:
+ * Companion-side device discovery using zudp Probe/Beacon frames.
  *
- *   TXT records:
- *     id   = <ed25519 pubkey hex, 64 chars>
- *     name = <device name>
- *     caps = <u32 hex bitfield>
+ * The host daemon announces via `zudp::Discovery::advertise` on port 7701.
+ * The native side scans via `zudp::Discovery::scan_stream` and accumulates
+ * results in a static slot. We poll that slot via [NativeBridge.nativePollDiscovery]
+ * on a background thread and surface results as [DiscoveredHost] objects.
  *
- * Surfaces a `List<DiscoveredHost>` via callback so the
- * auto-reconnect worker (U4c) can re-dial as soon as the paired
- * host's mDNS record appears (e.g. after the device returns from
- * airplane mode or roams Wi-Fi).
+ * Surfaces a `List<DiscoveredHost>` via callback so the auto-reconnect
+ * worker can redial as soon as the paired host appears on the LAN.
  */
 data class DiscoveredHost(
     val name: String,
@@ -29,118 +23,69 @@ data class DiscoveredHost(
     val pubkeyHex: String,
 )
 
-class HostDiscovery(private val ctx: Context) {
-    private val nsd: NsdManager = ctx.getSystemService(Context.NSD_SERVICE) as NsdManager
-    private val wifi: WifiManager = ctx.applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
-    private var listener: NsdManager.DiscoveryListener? = null
-    private var multicastLock: WifiManager.MulticastLock? = null
-    private val state: MutableMap<String, DiscoveredHost> = mutableMapOf()
+class HostDiscovery {
+    private val handlerThread = HandlerThread("ansync-discovery").also { it.start() }
+    private val handler = Handler(handlerThread.looper)
+    @Volatile private var running = false
+    @Volatile private var onChange: ((List<DiscoveredHost>) -> Unit)? = null
 
     fun start(onChange: (List<DiscoveredHost>) -> Unit) {
-        if (listener != null) return
-        // mDNS multicast packets are dropped by the Wi-Fi stack
-        // unless an app has an active MulticastLock. This is the
-        // canonical Android pattern for any mDNS / Bonjour browser.
-        multicastLock = wifi.createMulticastLock("ansync-discovery").apply {
-            setReferenceCounted(false)
-            acquire()
-        }
-        val l = object : NsdManager.DiscoveryListener {
-            override fun onStartDiscoveryFailed(serviceType: String, errorCode: Int) {
-                Log.w(TAG, "onStartDiscoveryFailed: $errorCode")
-            }
-            override fun onStopDiscoveryFailed(serviceType: String, errorCode: Int) {
-                Log.w(TAG, "onStopDiscoveryFailed: $errorCode")
-            }
-            override fun onDiscoveryStarted(serviceType: String) {
-                Log.i(TAG, "discovery started for $serviceType")
-            }
-            override fun onDiscoveryStopped(serviceType: String) {
-                Log.i(TAG, "discovery stopped for $serviceType")
-            }
-            override fun onServiceFound(info: NsdServiceInfo) {
-                nsd.resolveService(info, object : NsdManager.ResolveListener {
-                    override fun onResolveFailed(serviceInfo: NsdServiceInfo, errorCode: Int) {
-                        Log.w(TAG, "resolve failed for ${serviceInfo.serviceName}: $errorCode")
-                    }
-                    override fun onServiceResolved(resolved: NsdServiceInfo) {
-                        val attrs = resolved.attributes ?: emptyMap()
-                        Log.i(
-                            TAG,
-                            "resolved ${resolved.serviceName}; attrs=${attrs.keys}; " +
-                                "host=${resolved.host?.hostAddress}; port=${resolved.port}",
-                        )
-                        val pubkey = attrs["id"]?.let { String(it) }
-                        if (pubkey == null) {
-                            Log.w(TAG, "resolved ${resolved.serviceName} but no 'id' TXT attr")
-                            return
-                        }
-                        val name = attrs["name"]?.let { String(it) } ?: resolved.serviceName
-                        val host = resolved.host
-                        if (host == null) {
-                            Log.w(TAG, "resolved ${resolved.serviceName} but no host address")
-                            return
-                        }
-                        if (!isDialableAddress(host)) {
-                            Log.i(
-                                TAG,
-                                "skip ${resolved.serviceName}: undialable address ${host.hostAddress}",
-                            )
-                            return
-                        }
-                        Log.i(
-                            TAG,
-                            "added host '$name' @ ${host.hostAddress}:${resolved.port} pubkey=${pubkey.take(16)}…",
-                        )
-                        synchronized(state) {
-                            state[pubkey] = DiscoveredHost(
-                                name = name,
-                                address = host,
-                                port = resolved.port,
-                                pubkeyHex = pubkey,
-                            )
-                            onChange(state.values.toList())
-                        }
-                    }
-                })
-            }
-            override fun onServiceLost(info: NsdServiceInfo) {
-                synchronized(state) {
-                    val gone = state.entries.firstOrNull { it.value.name == info.serviceName }?.key
-                    gone?.let { state.remove(it) }
-                    onChange(state.values.toList())
-                }
-            }
-        }
-        nsd.discoverServices(SERVICE_TYPE, NsdManager.PROTOCOL_DNS_SD, l)
-        listener = l
+        if (running) return
+        this.onChange = onChange
+        running = true
+        NativeBridge.nativeStartDiscoveryScan()
+        handler.post(pollRunnable)
+        Log.i(TAG, "zudp discovery scan started")
     }
 
     fun stop() {
-        listener?.let { runCatching { nsd.stopServiceDiscovery(it) } }
-        listener = null
-        multicastLock?.runCatching { release() }
-        multicastLock = null
-        synchronized(state) { state.clear() }
+        running = false
+        handler.removeCallbacks(pollRunnable)
+        handlerThread.quitSafely()
+        NativeBridge.nativeStopDiscoveryScan()
+        onChange = null
+        Log.i(TAG, "zudp discovery scan stopped")
+    }
+
+    private val pollRunnable = object : Runnable {
+        override fun run() {
+            if (!running) return
+            val raw = try {
+                NativeBridge.nativePollDiscovery()
+            } catch (t: Throwable) {
+                Log.w(TAG, "nativePollDiscovery threw", t)
+                ""
+            }
+            val hosts = mutableListOf<DiscoveredHost>()
+            for (line in raw.split('\n')) {
+                if (line.isBlank()) continue
+                val parts = line.split('|')
+                if (parts.size < 4) continue
+                val name = parts[0]
+                val pubkeyHex = parts[1]
+                val ip = parts[2]
+                val port = parts[3].toIntOrNull() ?: continue
+                val addr = runCatching { InetAddress.getByName(ip) }.getOrNull() ?: continue
+                if (!isDialableAddress(addr)) continue
+                hosts += DiscoveredHost(name = name, address = addr, port = port, pubkeyHex = pubkeyHex)
+            }
+            if (hosts.isNotEmpty()) {
+                try { onChange?.invoke(hosts) } catch (t: Throwable) {
+                    Log.w(TAG, "onChange threw", t)
+                }
+            }
+            if (running) handler.postDelayed(this, POLL_INTERVAL_MS)
+        }
     }
 
     companion object {
         private const val TAG = "ansync.discovery"
-        // The host announces under `_ansync._udp` per
-        // ansync_discovery::ANNOUNCE_TYPE. NsdManager wants the
-        // trailing dot.
-        private const val SERVICE_TYPE = "_ansync._udp."
+        private const val POLL_INTERVAL_MS = 1_500L
 
-        /** Reject addresses that are unreachable from a phone on Wi-Fi:
-         *  loopback (only valid to the host process itself), wildcard
-         *  any-address, and IPv6 link-local (`fe80::/10` — requires a
-         *  scope-id; QUIC dial against `fe80::…%wlan0` hangs ~4s before
-         *  failing). Anycast / multicast literals can't be daemon
-         *  endpoints either. */
         internal fun isDialableAddress(addr: InetAddress): Boolean {
             if (addr.isLoopbackAddress || addr.isAnyLocalAddress) return false
             if (addr.isMulticastAddress) return false
-            if (addr is Inet6Address && addr.isLinkLocalAddress) return false
+            if (addr is java.net.Inet6Address && addr.isLinkLocalAddress) return false
             return true
         }
     }

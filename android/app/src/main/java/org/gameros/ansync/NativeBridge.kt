@@ -287,4 +287,21 @@ object NativeBridge {
 
     /** Stop the always-on WiFi pair listener. Idempotent. */
     external fun nativeWifiPairListenerStop()
+
+    /**
+     * Start a background zudp Probe/Beacon scan. Discovered hosts accumulate
+     * in native state; poll via [nativePollDiscovery]. Idempotent.
+     */
+    external fun nativeStartDiscoveryScan()
+
+    /**
+     * Stop the background discovery scan and clear cached results. Idempotent.
+     */
+    external fun nativeStopDiscoveryScan()
+
+    /**
+     * Return the current list of discovered hosts as a newline-separated
+     * string. Each line: `name|pubkeyHex|ip|port`. Empty string when none.
+     */
+    external fun nativePollDiscovery(): String
 }

@@ -10,12 +10,12 @@ import android.os.HandlerThread
 import android.util.Log
 
 /**
- * Keeps a live QUIC dial to the paired host. Watches the system
+ * Keeps a live ZUDP dial to the paired host. Watches the system
  * connectivity callbacks; whenever a Wi-Fi / Ethernet network comes
- * up we (re)try [HostDiscovery] until the host's mDNS record appears
- * with a matching pubkey, then call
+ * up we (re)try [HostDiscovery] (zudp Probe/Beacon) until the host
+ * appears with a matching pubkey, then call
  * [NativeBridge.nativeOpenConnection]. Dial failures back off
- * exponentially; mDNS handles the case where the host changed IP.
+ * exponentially; zudp discovery handles the case where the host changed IP.
  *
  * This is what makes "phone unlocks → screen mirrors automatically"
  * work without the user opening anything. The class is owned by
@@ -38,7 +38,7 @@ sealed interface HostStatus {
     data object NotPaired : HostStatus
     /** No Wi-Fi / Ethernet up — dialer is parked. */
     data object NoNetwork : HostStatus
-    /** Network is up, dialer is browsing mDNS or retrying. */
+    /** Network is up, dialer is scanning (zudp Probe/Beacon) or retrying. */
     data class Searching(val hostName: String) : HostStatus
     /** Dial succeeded; QUIC session opened against [hostName]. */
     data class Connected(val hostName: String) : HostStatus
@@ -182,18 +182,18 @@ class HostDialer(private val ctx: Context) {
         }
         publishSearchingIfPaired()
         // Start (or re-start) discovery; the callback fires the dial
-        // once the paired host's mDNS record is seen.
+        // once the paired host's zudp beacon is seen.
         if (discovery == null) {
-            val d = HostDiscovery(ctx)
+            val d = HostDiscovery()
             d.start { hosts ->
                 tryDial(hosts, hex)
             }
             discovery = d
         }
         // Schedule a direct-dial fallback against the addresses we
-        // persisted at pair time. Wi-Fi AP isolation / hotspot
-        // subnets drop mDNS multicast, so without this we'd sit
-        // forever on `discovery started` with nothing to match.
+        // persisted at pair time. Covers subnets where UDP broadcast
+        // doesn't reach (AP isolation, VPN, hotspot) so we don't sit
+        // forever waiting for a beacon that never arrives.
         handler.postDelayed({ tryDirectFallback(hex) }, FALLBACK_DELAY_MS)
     }
 

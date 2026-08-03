@@ -41,6 +41,9 @@ pub struct DiscoveredDevice {
     pub name: DeviceName,
     pub addr: SocketAddr,
     pub capabilities: Capabilities,
+    /// Full Ed25519 public key (32 bytes). Hex-encode to match against the
+    /// paired host's `PREF_HOST_PUBKEY_HEX` stored during cable pairing.
+    pub pubkey: [u8; 32],
 }
 
 #[derive(Debug, thiserror::Error)]

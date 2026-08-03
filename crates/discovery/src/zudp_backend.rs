@@ -97,6 +97,7 @@ fn beacon_to_device(addr: SocketAddr, beacon: AnsyncBeacon) -> Option<Discovered
     Some(DiscoveredDevice {
         id: beacon.device_id(),
         name: DeviceName(beacon.name),
+        pubkey: beacon.pubkey,
         addr,
         capabilities: caps,
     })

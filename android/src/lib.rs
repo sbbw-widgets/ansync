@@ -45,6 +45,7 @@ fn mark_connected(state: bool) {
 
 use ansync_core::{Capabilities, DeviceId, DeviceName, DevicePermissions, Permission};
 use ansync_crypto::IdentityKeypair;
+use ansync_discovery::Discovery as _;
 use ansync_files::{
     AutoAcceptPolicy, Direction as TransferDirection, ProgressEvent, ProgressFn, receive_file,
     send_file,
@@ -97,6 +98,27 @@ static WIFI_PAIR: OnceLock<Mutex<Option<WifiPairSlot>>> = OnceLock::new();
 
 fn wifi_pair_slot() -> &'static Mutex<Option<WifiPairSlot>> {
     WIFI_PAIR.get_or_init(|| Mutex::new(None))
+}
+
+/// Hosts seen by the most recent zudp Probe/Beacon scan. Updated by the
+/// background scan task; polled by `nativePollDiscovery`.
+static SCAN_HOSTS: OnceLock<Mutex<Vec<ScannedHost>>> = OnceLock::new();
+/// Background scan task handle. `None` when not scanning.
+static SCAN_TASK: OnceLock<Mutex<Option<tokio::task::JoinHandle<()>>>> = OnceLock::new();
+
+fn scan_hosts_slot() -> &'static Mutex<Vec<ScannedHost>> {
+    SCAN_HOSTS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn scan_task_slot() -> &'static Mutex<Option<tokio::task::JoinHandle<()>>> {
+    SCAN_TASK.get_or_init(|| Mutex::new(None))
+}
+
+struct ScannedHost {
+    name: String,
+    pubkey_hex: String,
+    ip: String,
+    port: u16,
 }
 
 struct WifiPairSlot {
@@ -2777,6 +2799,95 @@ pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativeWifiPairListen
     if let Some(s) = slot.take() {
         s.task.abort();
         info!("wifi pair listener on :{} stopped", s.port);
+    }
+}
+
+/// Start a background zudp Probe/Beacon scan. Discovered hosts accumulate
+/// in `SCAN_HOSTS`; poll via `nativePollDiscovery`. Idempotent.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativeStartDiscoveryScan(
+    _env: JNIEnv,
+    _class: JClass,
+) {
+    let mut task_slot = scan_task_slot().lock().expect("scan task mutex poisoned");
+    if task_slot.is_some() {
+        return;
+    }
+    scan_hosts_slot().lock().expect("scan hosts mutex poisoned").clear();
+    let handle = runtime().spawn(async move {
+        use ansync_discovery::ZudpDiscovery;
+        let discovery = ZudpDiscovery::new([0u8; 32]);
+        let mut stream = match discovery.browse() {
+            Ok(s) => s,
+            Err(e) => {
+                error!("nativeStartDiscoveryScan: browse failed: {e}");
+                return;
+            }
+        };
+        use futures::StreamExt as _;
+        while let Some(dev) = stream.next().await {
+            let host = ScannedHost {
+                name: dev.name.0.clone(),
+                pubkey_hex: hex_encode(&dev.pubkey),
+                ip: dev.addr.ip().to_string(),
+                port: dev.addr.port(),
+            };
+            info!(
+                "discovery: found '{}' @ {}:{} pubkey={}…",
+                host.name,
+                host.ip,
+                host.port,
+                &host.pubkey_hex[..8],
+            );
+            let mut hosts = scan_hosts_slot().lock().expect("scan hosts mutex poisoned");
+            // Upsert by pubkey so duplicate beacons don't pile up.
+            if let Some(existing) = hosts.iter_mut().find(|h| h.pubkey_hex == host.pubkey_hex) {
+                *existing = host;
+            } else {
+                hosts.push(host);
+            }
+        }
+    });
+    *task_slot = Some(handle);
+}
+
+/// Stop the background zudp discovery scan. Idempotent.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativeStopDiscoveryScan(
+    _env: JNIEnv,
+    _class: JClass,
+) {
+    if let Some(handle) = scan_task_slot()
+        .lock()
+        .expect("scan task mutex poisoned")
+        .take()
+    {
+        handle.abort();
+    }
+    scan_hosts_slot().lock().expect("scan hosts mutex poisoned").clear();
+}
+
+/// Return the current list of discovered hosts as a newline-separated
+/// string. Each line: `name|pubkeyHex|ip|port`. Returns an empty string
+/// when no hosts have been seen yet.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_gameros_ansync_NativeBridge_nativePollDiscovery<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+) -> jni::sys::jstring {
+    let hosts = scan_hosts_slot().lock().expect("scan hosts mutex poisoned");
+    let encoded: String = hosts
+        .iter()
+        .map(|h| format!("{}|{}|{}|{}", h.name, h.pubkey_hex, h.ip, h.port))
+        .collect::<Vec<_>>()
+        .join("\n");
+    drop(hosts);
+    match env.new_string(encoded) {
+        Ok(s) => s.into_raw(),
+        Err(e) => {
+            error!("nativePollDiscovery: env.new_string failed: {e}");
+            std::ptr::null_mut()
+        }
     }
 }
 
