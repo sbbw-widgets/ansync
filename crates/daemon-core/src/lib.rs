@@ -2460,11 +2460,18 @@ async fn video_stream_loop(
             .clone();
         if let Some(tx) = sender {
             if tx.send(bytes).is_err() {
-                // Renderer subprocess died or was closed by the user.
-                // Drop the sender so a future MirrorStreamAppeared
-                // re-bootstraps from scratch.
+                // Renderer subprocess died. Clear slot and exit: dropping
+                // ZudpStream resets the stream so Android's drain loop sees
+                // an error and stops. InboundGuard fires MirrorStreamGone.
                 *entry.video_tx.lock().expect("video_tx slot poisoned") = None;
+                info!(%peer_id, "renderer channel dead — closing inbound video stream");
+                return;
             }
+        } else if first_chunk_seen {
+            // video_tx was nulled by on_exit hook after renderer died;
+            // exit for the same reason as above.
+            info!(%peer_id, "renderer gone — closing inbound video stream");
+            return;
         }
         if last_stat.elapsed() >= std::time::Duration::from_secs(5) {
             debug!(%peer_id, chunks = chunks_since_log / 5, "video stream stats");
