@@ -42,6 +42,11 @@ pub enum StreamKind {
     Audio,
     Files,
     Input,
+    /// Daemon → companion reverse input: mouse / keyboard events from
+    /// the mirror renderer window that the companion replays via
+    /// `dispatchGesture`. Separate from [`StreamKind::Input`] (companion
+    /// → daemon) to avoid routing collisions in the per-stream demux.
+    ReverseInput,
     Camera,
     Clipboard,
     Notifications,

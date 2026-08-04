@@ -777,14 +777,14 @@ async fn handle_mirror_stream_appeared(
     }
     let conn = entry.conn.lock().expect("conn slot poisoned").clone();
     let input_tx = if let Some(conn) = conn {
-        match conn.open(StreamKind::Input).await {
+        match conn.open(StreamKind::ReverseInput).await {
             Ok(stream) => {
                 let (tx, rx) = unbounded_channel::<InputMessage>();
                 tokio::spawn(input_writer_loop(stream, rx, device.clone()));
                 Some(tx)
             }
             Err(e) => {
-                warn!(%device, error = %e, "open outbound Input stream failed; window view-only");
+                warn!(%device, error = %e, "open outbound ReverseInput stream failed; window view-only");
                 None
             }
         }
@@ -1149,6 +1149,11 @@ async fn handle_connection(
                 // the companion echoes pongs on that same stream. If the peer
                 // somehow opens one toward us, drop it — we have nothing to echo.
                 debug!(%peer_id, "unexpected inbound Heartbeat stream from peer; dropping");
+                drop(stream);
+            }
+            StreamKind::ReverseInput => {
+                // Daemon → companion direction only; companion never opens this.
+                debug!(%peer_id, "unexpected inbound ReverseInput stream; dropping");
                 drop(stream);
             }
         }

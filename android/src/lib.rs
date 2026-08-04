@@ -797,11 +797,10 @@ async fn streams_accept_loop(
             }
         };
         match kind {
-            StreamKind::Input => {
-                // Host opened an Input stream to push host→device
-                // events. Drain into the same mpsc that
-                // `nativePollInputMessage` reads from so the
-                // AccessibilityService replays them.
+            StreamKind::ReverseInput => {
+                // Host opened a ReverseInput stream to push host→device
+                // events (mirror window mouse/kb → companion gesture).
+                // Drain into the mpsc that `nativePollInputMessage` reads.
                 let tx = input_inbound_tx.clone();
                 tokio::spawn(input_recv_loop(stream, (*tx).clone()));
             }
